@@ -125,7 +125,8 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       if (!composed.ok) throw new Error(`compose failed: ${composed.status} ${await composed.text()}`);
       const song = await composed.arrayBuffer();
       const silent = await stub.fetch(`http://compose/files/${input.jobId}/silent.mp4`);
-      if (!silent.ok) throw new Error(`compose silent copy failed: ${silent.status}`);
+      // Read or cancel every body: an unread one keeps the container's in-flight count up and it never sleeps.
+      if (!silent.ok) throw new Error(`compose silent copy failed: ${silent.status} ${await silent.text()}`);
       return { song, silent: await silent.arrayBuffer() };
     },
     async faces(input) {
@@ -190,7 +191,7 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       if (!response.ok) throw new Error(`patch failed: ${response.status} ${await response.text()}`);
       const song = await response.arrayBuffer();
       const silent = await stub.fetch(`http://compose/files/${input.name}/silent.mp4`);
-      if (!silent.ok) throw new Error(`patch silent copy failed: ${silent.status}`);
+      if (!silent.ok) throw new Error(`patch silent copy failed: ${silent.status} ${await silent.text()}`);
       return { song, silent: await silent.arrayBuffer() };
     },
   };

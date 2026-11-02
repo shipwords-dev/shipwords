@@ -262,7 +262,32 @@ function sendFile(res, file, size) {
   createReadStream(file).pipe(res);
 }
 
+// The process stops itself rather than trusting the platform to stop it: sleepAfter in @cloudflare/containers can renew
+// forever (an unread response body keeps its in-flight count up; re-creating an evicted Durable Object resets the timer),
+// and a running instance bills memory whether or not it works. Calls within one job step come seconds apart, while
+// waits on the upstream model between repair rounds take 75 s or more, so a minute idle means the step is done.
+// The lifetime cap ends even a stuck process; a request cut off by it fails its Workflow step, which retries on a fresh instance.
+const IDLE_EXIT_MS = Number(process.env.IDLE_EXIT_MS) || 60_000;
+const MAX_LIFETIME_MS = Number(process.env.MAX_LIFETIME_MS) || 10 * 60_000;
+let inFlight = 0;
+let idleTimer;
+const armIdleExit = () => {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => process.exit(0), IDLE_EXIT_MS);
+};
+armIdleExit();
+setTimeout(() => process.exit(0), MAX_LIFETIME_MS);
+
 createServer(async (req, res) => {
+  // Health probes are not work and must not keep the instance alive.
+  if (req.url !== '/health') {
+    inFlight++;
+    clearTimeout(idleTimer);
+    // close fires both when the response finishes and when the caller goes away.
+    res.on('close', () => {
+      if (--inFlight === 0) armIdleExit();
+    });
+  }
   try {
     if (req.method === 'POST' && req.url === '/compose') {
       const song = await compose(req);
@@ -299,5 +324,5 @@ createServer(async (req, res) => {
 }).listen(8080);
 
 // Node runs as PID 1 here, and PID 1 ignores SIGTERM unless it has a handler: without this, the stop signal sent after
-// sleepAfter does nothing and the instance keeps billing memory for hours. Stop only comes with no request in flight.
+// sleepAfter does nothing and the instance keeps billing memory for hours. The idle exit above is the primary stop.
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => process.exit(0));
