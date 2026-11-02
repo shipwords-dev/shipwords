@@ -9,10 +9,20 @@ import models from './models.server';
 // Worker entry: pages and API go to TanStack Start, plus the Workflow class for generation jobs and the compose container.
 export const GenerationWorkflow = defineGenerationWorkflow(models, site);
 
-/** Effect video compose (ffmpeg), image in packages/jobs/compose; one instance per jobId, sleeps after a few idle minutes. */
+/**
+ * Effect video compose (ffmpeg), image in packages/jobs/compose; one instance per jobId.
+ * The container process stops itself after 60 idle seconds or 10 minutes from start (server.mjs); sleepAfter here is not relied on.
+ */
 export class ComposeContainer extends Container {
   override defaultPort = 8080;
   override sleepAfter = '5m';
+
+  override async onActivityExpired() {
+    // The SDK invokes this only after in-flight requests finish. Old images may
+    // ignore SIGTERM as PID 1, so release the VM instead of only sending a signal.
+    await this.destroy();
+    console.log('Compose container destroyed after idle timeout');
+  }
 
   // biome-ignore lint/complexity/noBannedTypes: matches the Container base class constructor signature
   constructor(ctx: DurableObjectState<{}>, env: Env) {

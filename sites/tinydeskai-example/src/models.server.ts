@@ -21,6 +21,9 @@ const WHO = {
 } as const;
 type Seat = keyof typeof WHO;
 
+/** Face occlusion, off by default: when on, prep draws grey boxes and the video prompt asks to rebuild the features. */
+const FACE_OCCLUSION = false;
+
 /**
  * The prompt follows the tested run: start with Edit @video_1 (written as Reference it becomes reference-to-video), replace each person,
  * then keep motion, expressions, lip sync, camera, cuts and duration frame by frame. The engine names images @image1; Kling 4.0 wants @image_1 and Yir rejects the wrong name.
@@ -41,6 +44,9 @@ function editPrompt(images: Readonly<Record<string, string>>) {
     ...swaps,
     'The lead singer appears only in the close-up shot; the wide band shots show only the keyboard player and the two backing singers, so do not add the lead singer or any other new character to them.',
     "A performer replaced with a dog or another animal becomes that animal completely, with its fur, face and paws; every visible hand of that performer, including raised hands, clapping hands, hands on the keyboard and hands partly outside the frame edges, becomes the animal's furry paws with no human fingers or skin.",
+    FACE_OCCLUSION
+      ? 'Each reference photo is a three-view strip whose panels each have part of the face covered by a grey box; reconstruct the complete, symmetric, natural facial features of each replaced performer from the three panels, keeping the face exactly consistent with the photo, hyper-realistic skin texture, and stable and consistent across frames with no flicker.'
+      : 'Keep the facial features of each replaced performer exactly consistent with their reference photo, with natural skin texture and stable and consistent features across frames with no flicker.',
     `Each replaced performer keeps the original person's position, pose, head direction, gestures, facial expressions and mouth movements frame by frame, and wears the clothes from their own photo.${others}`,
     'Keep everything else unchanged: the room, the shelves, the instruments, the microphones, the camera cuts, the camera movement, the lighting, the timing and the video duration.',
     'Keep the audio exactly identical to the original video. Do not add any new sounds.',
@@ -69,13 +75,17 @@ function repairPrompt(slots: readonly string[]) {
 const CLIP = 'assets/tinydesk/full-17s.mp4';
 
 /**
- * Photo prep: GPT Image 2.5 first turns each upload into a clean single-subject, front-facing, waist-up photo, then Kling gets that.
- * Screenshots, crops of group photos, big jersey logos and tiny images made swaps fail; on 16 photos that had failed, all four kinds came out fixed,
- * likeness kept and celebrity photos not refused. The animal wording is added because the stage starts with dogs (the animal version is untested).
- * If prep is refused or fails, the original photo is used.
+ * Each photo first becomes a horizontal three-view strip (front, left and right profile); if prep is refused or fails, the original photo is used.
+ * FACE_OCCLUSION is off by default and keeps every feature visible; when on, each view hides a different part and the video prompt asks to rebuild them.
+ * Occlusion only suits people: eyes, nose and mouth boxes don't apply to animals.
  */
-const PREP =
-  'Make a clean reference photo of the main person or animal in this image. Keep exactly the same individual: the same face and features, skin tone or fur, age, hairstyle and facial hair, with natural skin or fur texture. Waist-up, facing the camera, the whole head and shoulders in frame, the face large and in focus. Only this one subject: remove any other people or animals and their arms or hands, phone status bars, app interface, captions, stickers and watermarks. Keep their own clothes, but plain, with no logos, letters, numbers or team marks. Plain light wall background, soft daylight, realistic photo.';
+const PREP = [
+  'Make a horizontal reference strip of the main person in this image, divided into three equal side-by-side panels of the same subject: left panel in left profile, middle panel facing straight on, right panel in right profile. Keep exactly the same individual in every panel: the same face and features, skin tone, age, hairstyle and facial hair, with natural skin texture. Head and shoulders, the face large and in focus in each panel.',
+  FACE_OCCLUSION
+    ? 'Draw one solid flat mid-grey (RGB 127,127,127) rectangle over part of the face in every panel, so no single panel shows a complete face: on the left panel cover the left eye and the mouth, leaving the nose and right eye visible; on the middle panel cover the nose and the mouth, leaving both eyes visible; on the right panel cover the right eye and the nose, leaving the mouth and left eye visible. Across the three panels both eyes, the nose and the mouth are each visible at least once.'
+    : 'Keep the face fully visible in each view, with no boxes, masks or added occlusion.',
+  'Only this one subject: remove any other people or animals and their arms or hands, phone status bars, app interface, captions, stickers and watermarks. Keep their own clothes, but plain, with no logos, letters, numbers or team marks. Plain light wall background, soft daylight, realistic photos, no text, labels or borders.',
+].join(' ');
 
 export default serverModels(catalog, {
   'tiny-desk': {
@@ -94,7 +104,7 @@ export default serverModels(catalog, {
         .effect!.slots.map((slot) => ({ ...slot, prep: PREP })),
       prep: {
         upstreamModel: 'openai/gpt-image-2.5-sunburst',
-        parameters: { resolution: '1K', aspect_ratio: '3:4' },
+        parameters: { resolution: '1K', aspect_ratio: '16:9' },
         maxCost: '0.02',
       },
       segments: [
