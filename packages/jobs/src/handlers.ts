@@ -153,7 +153,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
     models,
 
     /** POST /api/jobs */
-    async create(request: Request): Promise<Response> {
+    async create(request: Request, options?: { idempotencyKey: string }): Promise<Response> {
       const body = await readJson<CreateBody>(request);
       const model = models.find((m) => m.id === body?.modelId);
       if (!body || !model) return errorResponse(400, 'unknown_model');
@@ -186,8 +186,44 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
           inputJson = JSON.stringify(input);
         }
       }
-      const jobId = newId('job');
       const user = await core.getUser(request);
+      if (options && (!user || !/^[a-zA-Z0-9:_-]{1,200}$/.test(options.idempotencyKey)))
+        return errorResponse(400, 'invalid_idempotency_key');
+      const jobId = options
+        ? `job_${Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([user!.id, options.idempotencyKey])))), (b) => b.toString(16).padStart(2, '0')).join('')}`
+        : newId('job');
+
+      // Only the server supplies this key. A lost response must not create another debit or reset a terminal job.
+      async function resume(job: JobRow): Promise<Response> {
+        if (
+          job.userId !== user?.id ||
+          job.modelId !== model!.id ||
+          job.prompt !== prompt ||
+          job.inputJson !== inputJson
+        )
+          return errorResponse(409, 'idempotency_conflict');
+        job = await healStale(job);
+        // The runner's deadline is anchored to creation, not dispatch. Never start expired work.
+        // Keep ambiguous submissions through the existing grace period before stale healing refunds them.
+        if (job.status === 'queued' && Date.now() < job.createdAt + model!.timeoutMinutes * 60_000) {
+          try {
+            await env().GENERATION_WORKFLOW.create({ id: job.id, params: { jobId: job.id } });
+          } catch {
+            try {
+              // create can time out after accepting the task, or race another retry of this request.
+              await (await env().GENERATION_WORKFLOW.get(job.id)).status();
+            } catch {
+              // Keep the debit and queued row: retry the same key, or let stale-job healing settle it.
+              return errorResponse(503, 'dispatch_pending');
+            }
+          }
+        }
+        return json({ job: publicJob((await loadJob(core.db, job.id))!, baseURL()) }, { status: 200 });
+      }
+      if (options) {
+        const existing = await loadJob(core.db, jobId);
+        if (existing) return resume(existing);
+      }
 
       if (user) {
         const cost = creditsFor(model, parameters);
@@ -210,7 +246,8 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
               [core.db.insert(jobs).values(row)],
             );
           } else {
-            await core.db.insert(jobs).values(row);
+            if (options) await core.db.insert(jobs).values(row).onConflictDoNothing();
+            else await core.db.insert(jobs).values(row);
           }
         } catch (error) {
           if (error instanceof InsufficientCreditsError) {
@@ -222,6 +259,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
           throw error;
         }
         const job = (await loadJob(core.db, jobId))!;
+        if (options) return resume(job);
         return (await dispatch(job)) ?? json({ job: publicJob(job, baseURL()) }, { status: 201 });
       }
 
