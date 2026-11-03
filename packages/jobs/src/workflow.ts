@@ -60,10 +60,15 @@ const STEP_RETRIES = { retries: { limit: 5, delay: '10 seconds', backoff: 'expon
 
 /**
  * Sites export it from the Worker entry: export const GenerationWorkflow = defineGenerationWorkflow(models, site);
- * When site is passed and EMAIL is bound, signed-in users get an email when a job succeeds or fails.
+ * When site is passed and EMAIL is bound, signed-in users get an email when a job succeeds or fails;
+ * a site whose jobs are only stages of a larger result passes `{ emails: false }` to keep those mails out.
  * workflows[].class_name in wrangler.jsonc must use the same name.
  */
-export function defineGenerationWorkflow(models: readonly ModelDefinition[], site?: SiteConfig) {
+export function defineGenerationWorkflow(
+  models: readonly ModelDefinition[],
+  site?: SiteConfig,
+  options: { emails?: boolean } = {},
+) {
   return class GenerationWorkflow extends WorkflowEntrypoint<JobsEnv, { jobId: string }> {
     override async run(event: Readonly<WorkflowEvent<{ jobId: string }>>, step: WorkflowStep) {
       const env = this.env;
@@ -83,7 +88,7 @@ export function defineGenerationWorkflow(models: readonly ModelDefinition[], sit
                 : {}),
             // Served by the site's /files route (handlers.ts file), the same origin the upload URLs use.
             ...(baseURL ? { fileUrl: (key: string) => `${baseURL}/files/${key}` } : {}),
-            ...(site && env.EMAIL && env.EMAIL_FROM
+            ...(site && options.emails !== false && env.EMAIL && env.EMAIL_FROM
               ? {
                   notify: emailOnFinish({
                     db,
