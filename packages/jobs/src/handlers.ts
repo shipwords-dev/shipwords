@@ -26,6 +26,7 @@ import {
   referenceRoleOf,
   sanitizeParameters,
 } from './models';
+import { r2Response } from './r2-range';
 import { type JobRow, jobs } from './schema';
 import { createAdapters, type JobsEnv } from './workflow';
 
@@ -380,7 +381,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
     },
 
     /** GET /files/<key>: read outputs and uploads from R2. Keys contain a random ID and can't be enumerated. */
-    async file(_request: Request, key: string): Promise<Response> {
+    async file(request: Request, key: string): Promise<Response> {
       // assets/ holds site-provided assets (effect reference videos etc.); file names are chosen by the site, read-only.
       if (
         !/^(jobs\/job_[a-z0-9]+\/(\d+\.[a-z0-9]+|repair-[a-z0-9_-]+-\d+\.mp4)|uploads\/up_[a-z0-9]+\.(png|jpg|webp)|assets\/[a-z0-9][a-z0-9/_-]*\.(mp4|mp3|png|jpg|webp))$/.test(
@@ -396,13 +397,13 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
       const status = jobId ? (await loadJob(core.db, jobId))?.status : null;
       if (jobId && status !== (key.includes('/repair-') ? 'submitted' : 'succeeded'))
         return errorResponse(404, 'not_found');
-      const object = await env().OUTPUTS.get(key);
-      if (!object) return errorResponse(404, 'not_found');
+      const head = await env().OUTPUTS.head(key);
+      if (!head) return errorResponse(404, 'not_found');
       const headers = new Headers();
-      object.writeHttpMetadata(headers);
-      headers.set('etag', object.httpEtag);
+      head.writeHttpMetadata(headers);
       headers.set('cache-control', 'public, max-age=31536000, immutable');
-      return new Response(object.body, { headers });
+      // Byte ranges: iPhone Safari needs 206 to play stored videos.
+      return (await r2Response(env().OUTPUTS, key, request, headers)) ?? errorResponse(404, 'not_found');
     },
   };
 }
