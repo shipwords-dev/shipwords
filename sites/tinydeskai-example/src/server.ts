@@ -2,16 +2,17 @@ import { Container } from '@cloudflare/containers';
 import { proxyRybbit } from '@shipwords/core/analytics';
 import { defineGenerationWorkflow } from '@shipwords/jobs/workflow';
 import handler from '@tanstack/react-start/server-entry';
+import { serveVideo, VIDEO_PATH } from '~/lib/video-range';
 import { paraglideMiddleware } from '~/paraglide/server.js';
 import site from '../site.config';
 import models from './models.server';
 
-// Worker entry: pages and API go to TanStack Start, plus the Workflow class for generation jobs and the compose container.
+// Worker 入口：页面和 API 交给 TanStack Start，另外导出生成任务的 Workflow 类和拼接容器。
 export const GenerationWorkflow = defineGenerationWorkflow(models, site);
 
 /**
- * Effect video compose (ffmpeg), image in packages/jobs/compose; one instance per jobId.
- * The container process stops itself after 60 idle seconds or 10 minutes from start (server.mjs); sleepAfter here is not relied on.
+ * 特效成片拼接（ffmpeg），镜像在 packages/jobs/compose；按 jobId 取实例。
+ * 停机靠容器进程自己：空闲 60 秒或启动满 10 分钟就退出（server.mjs），不依赖这里的 sleepAfter。
  */
 export class ComposeContainer extends Container {
   override defaultPort = 8080;
@@ -24,11 +25,11 @@ export class ComposeContainer extends Container {
     console.log('Compose container destroyed after idle timeout');
   }
 
-  // biome-ignore lint/complexity/noBannedTypes: matches the Container base class constructor signature
+  // biome-ignore lint/complexity/noBannedTypes: 与 Container 基类构造函数签名一致
   constructor(ctx: DurableObjectState<{}>, env: Env) {
     super(ctx, env);
-    // With durable_object scheduling the image and instance type must be passed to start(); @cloudflare/containers 0.3.7 does not, so add them here.
-    // Local dev runs no containers (no images), so leave it unchanged.
+    // 账号只能用 durable_object 调度：镜像和规格要在 start() 时指定，@cloudflare/containers 0.3.7 不传，这里补上。
+    // 本地 dev 不开容器（images 不存在），保持原样。
     const container = ctx.container as
       | (NonNullable<DurableObjectState['container']> & { images?: Record<string, unknown> })
       | undefined;
@@ -41,10 +42,17 @@ export class ComposeContainer extends Container {
 
 export default {
   async fetch(request, env) {
-    // Rybbit stats go through /stats/ on this site and are forwarded to the collector here.
+    // run_worker_first 把 /media 整个目录交给 Worker：视频切片（206），封面照常从静态资源取。
+    const url = new URL(request.url);
+    if (url.pathname.startsWith('/media/')) {
+      return VIDEO_PATH.test(url.pathname) && ['GET', 'HEAD'].includes(request.method)
+        ? serveVideo(request, env.STATIC)
+        : env.STATIC.fetch(request);
+    }
+    // Rybbit 统计走本站 /stats/，由这里转发到采集地址。
     const stats = await proxyRybbit(request, env.RYBBIT_UPSTREAM);
     if (stats) return stats;
-    // Only local dev picks the locale from a cookie (Chinese review); production is English only and passes requests straight to TanStack Start.
+    // 本地 dev 才按 cookie 取语言（中文审稿）；线上只有英文，请求原样交给 TanStack Start。
     return import.meta.env.DEV
       ? paraglideMiddleware(request, () => handler.fetch(request))
       : handler.fetch(request);

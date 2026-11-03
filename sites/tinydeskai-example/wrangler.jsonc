@@ -8,6 +8,8 @@
   "observability": { "enabled": true },
   "upload_source_maps": true,
   // Add your domain before deploying: "routes": [{ "pattern": "your-domain.com", "custom_domain": true }],
+  // Sample videos go through the Worker so Range requests get 206 (iPhone Safari won't play otherwise), see src/lib/video-range.ts.
+  "assets": { "binding": "STATIC", "run_worker_first": ["/media/*"] },
   "vars": {
     "EMAIL_FROM": "noreply@tinydeskai.example.com",
     // Rybbit collector URL, used only inside the Worker (/stats/* proxy); leave empty to disable.
