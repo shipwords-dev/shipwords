@@ -1,8 +1,8 @@
 import { safeRelativePath } from '@shipwords/core/http';
 import { useAccount, waitForOrder } from '@shipwords/core/react/account';
+import { track } from '@shipwords/core/react/track';
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
-import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import models from '../../../site.models';
 

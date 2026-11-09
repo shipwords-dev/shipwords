@@ -1,16 +1,17 @@
 import { analyticsScripts } from '@shipwords/core/analytics';
 import { captureAttribution } from '@shipwords/core/react/attribution';
+import { promptGoogleOneTap } from '@shipwords/core/react/google-identity';
+import { identify } from '@shipwords/core/react/track';
 import { createRootRoute, HeadContent, Link, Outlet, Scripts } from '@tanstack/react-router';
 import { type ReactNode, useEffect } from 'react';
 import { authClient } from '~/lib/auth';
 import { getPublicConfig } from '~/lib/public-config';
-import { identify } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { getLocale, setLocale } from '~/paraglide/runtime.js';
 import { AccountDialog, AccountLink } from '~/site/account';
 import { SUPPORT_EMAIL } from '~/site/legal';
 import { PricingDialog, PricingLink } from '~/site/pricing';
-import { openSignIn, promptGoogleOneTap, SignInDialog } from '~/site/sign-in';
+import { openSignIn, SignInDialog } from '~/site/sign-in';
 import appCss from '~/site/styles.css?url';
 import site from '../../site.config';
 
@@ -77,8 +78,8 @@ function Layout() {
   useEffect(() => {
     // Show Google One Tap when signed out; skipped when Google is not configured.
     if (session.isPending || session.data || !config.googleClientId) return;
-    promptGoogleOneTap(config.googleClientId);
-  }, [session.isPending, session.data, config.googleClientId]);
+    promptGoogleOneTap(auth, config.googleClientId);
+  }, [auth, session.isPending, session.data, config.googleClientId]);
 
   useEffect(() => {
     if (user?.id) identify(user.id);

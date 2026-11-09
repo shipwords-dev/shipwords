@@ -1,4 +1,5 @@
 import { ApiError } from '@shipwords/core/react/account';
+import { track } from '@shipwords/core/react/track';
 import {
   acceptsUpload,
   type PublicJob,
@@ -17,7 +18,6 @@ import {
   useState,
 } from 'react';
 import { authClient } from '~/lib/auth';
-import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { openAccount } from '~/site/account';
 import { PhoneHandoff } from '~/site/phone-upload';

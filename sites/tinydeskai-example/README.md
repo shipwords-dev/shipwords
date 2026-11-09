@@ -9,6 +9,7 @@
 - **Generation** (`site.models.ts` for the name, price and slots; `src/models.server.ts` for the rest): an effect model. Each photo is first cleaned up by GPT Image 2.5 into a single-subject, front-facing, waist-up shot (the original is used if that fails). Kling 4.0 in edit mode then takes the whole 17.7-second clip plus the photos and replaces those people in one pass (about $3.06 at 720p); seats still showing a dog are sent as dog photos, cleared seats keep the original coaches. The compose container (`packages/jobs/compose`, ffmpeg) checks each swapped seat for a leftover original face (and the lead close-up for likeness to the photo); misses are re-rendered shot by shot with Pruna p-video-replace, up to 5 rounds, and the version with the fewest misses is delivered. Once Kling has charged, a missed swap or a failed check no longer refunds the credits; they come back only when no video can be made (the render or compose fails). Compose then re-aligns the output to the original cut points and mixes the song back in, delivering a version with the song and a silent one.
 - **Pages**: tool home page, tutorial, template page, meme explainer, free page, pricing, policies; FAQ and structured data on each.
 - **Flow**: sign in (Google or email code), buy credits, generate. No guest trial and no signup bonus.
+- **Rybbit funnel**: photo_added → generate_click → sign_in_open → sign_in → generate_started → (insufficient_credits →) pricing_open → checkout_start → payment_confirmed → generate_started → video_ready → video_download.
 
 ## Media is not in the repo
 

@@ -1,10 +1,10 @@
+import { track } from '@shipwords/core/react/track';
 import { pageHead } from '@shipwords/core/seo';
 import { creditsFor, sanitizeParameters } from '@shipwords/jobs/models';
 import { type PublicJob, UPLOAD_ACCEPT, uploadReference, useGeneration } from '@shipwords/jobs/react';
 import { createFileRoute, getRouteApi } from '@tanstack/react-router';
 import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { authClient } from '~/lib/auth';
-import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { Plans, PricingLink } from '~/site/pricing';
 import { openSignIn } from '~/site/sign-in';

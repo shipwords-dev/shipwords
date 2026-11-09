@@ -1,9 +1,9 @@
 import { useCheckout } from '@shipwords/core/react/account';
+import { track } from '@shipwords/core/react/track';
 import type { Product } from '@shipwords/core/site';
 import { getRouteApi, Link } from '@tanstack/react-router';
 import { type MouseEvent, type ReactNode, useEffect, useRef } from 'react';
 import { authClient } from '~/lib/auth';
-import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { openSignIn } from '~/site/sign-in';
 import site from '../../site.config';

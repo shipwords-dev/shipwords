@@ -1,7 +1,5 @@
-// Rybbit custom events. Generic funnel (in order); each site adds or drops steps as needed:
-//   generate_click → sign_in_open → sign_in → pricing_open → checkout_start → payment_confirmed
-//   → generate_started → result_ready → result_download
-// Simple clicks use the data-rybbit-event attribute and are collected by the Rybbit script; this file only handles events that carry state.
+// Rybbit custom events, headless. Each site lists its own funnel (event names) where it calls track().
+// Simple clicks use the data-rybbit-event attribute and are collected by the Rybbit script; this only handles events that carry state.
 // The script loads with defer: earlier events are queued and flushed once it loads. Local dev never loads it, so events stay queued.
 
 type Props = Record<string, string | number | boolean>;

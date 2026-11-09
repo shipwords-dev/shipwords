@@ -1,7 +1,9 @@
+import { useEmailOtp } from '@shipwords/core/react/email-otp';
+import { renderGoogleButton } from '@shipwords/core/react/google-identity';
+import { track } from '@shipwords/core/react/track';
 import { getRouteApi } from '@tanstack/react-router';
-import { type FormEvent, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { authClient } from '~/lib/auth';
-import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 
 // Sign-in dialog: Google button (Google's own popup, no page navigation, stage photos stay) + email code.
@@ -18,68 +20,6 @@ export function openSignIn(then?: () => void, source = 'nav') {
 }
 
 const root = getRouteApi('__root__');
-
-type Gsi = {
-  initialize(options: Record<string, unknown>): void;
-  renderButton(container: HTMLElement, options: Record<string, unknown>): void;
-  prompt(): void;
-  cancel(): void;
-};
-
-// The Google script initializes once per site: the One Tap prompt on load and the dialog button share one callback,
-// otherwise a later initialize wipes the earlier rendered button. The idToken goes to better-auth's one-tap callback to create the session.
-let gsiReady: Promise<Gsi> | null = null;
-let afterGoogle: (ok: boolean) => void = () => undefined;
-
-function googleIdentity(clientId: string): Promise<Gsi> {
-  gsiReady ??= loadGsi().then((gsi) => {
-    gsi.initialize({
-      client_id: clientId,
-      ux_mode: 'popup',
-      cancel_on_tap_outside: true,
-      itp_support: true,
-      callback: async ({ credential }: { credential: string }) => {
-        const auth = authClient(clientId);
-        const result = await auth.$fetch('/one-tap/callback', {
-          method: 'POST',
-          body: { idToken: credential },
-        });
-        if (!result.error) auth.$store.notify('$sessionSignal');
-        track(result.error ? 'sign_in_failed' : 'sign_in', { method: 'google' });
-        afterGoogle(!result.error);
-      },
-    });
-    return gsi;
-  });
-  gsiReady.catch(() => {
-    gsiReady = null;
-  });
-  return gsiReady;
-}
-
-/** Shows Google One Tap to signed-out visitors; on success it only refreshes the session, no navigation. */
-export function promptGoogleOneTap(clientId: string) {
-  void googleIdentity(clientId)
-    .then((gsi) => gsi.prompt())
-    .catch(() => undefined);
-}
-
-function loadGsi(): Promise<Gsi> {
-  const existing = (window as { google?: { accounts?: { id?: Gsi } } }).google?.accounts?.id;
-  if (existing) return Promise.resolve(existing);
-  return new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = 'https://accounts.google.com/gsi/client?hl=en';
-    script.async = true;
-    script.onload = () => {
-      const gsi = (window as { google?: { accounts?: { id?: Gsi } } }).google?.accounts?.id;
-      if (gsi) resolve(gsi);
-      else reject(new Error('Google Identity Services did not load'));
-    };
-    script.onerror = () => reject(new Error('Google Identity Services did not load'));
-    document.head.appendChild(script);
-  });
-}
 
 export function SignInDialog() {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -130,11 +70,11 @@ export function SignInPanel({ onDone }: { onDone: () => void }) {
   const config = root.useLoaderData();
   const auth = authClient(config.googleClientId);
   const google = useRef<HTMLDivElement>(null);
-  const [email, setEmail] = useState('');
-  const [otp, setOtp] = useState('');
-  const [step, setStep] = useState<'email' | 'code'>('email');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const otp = useEmailOtp(auth, {
+    onSignedIn: onDone,
+    messages: { sendFailed: m.common_sign_in_send_failed, invalidCode: m.common_sign_in_invalid_code },
+  });
+  const { setError } = otp;
   const done = useRef(onDone);
   done.current = onDone;
 
@@ -143,55 +83,28 @@ export function SignInPanel({ onDone }: { onDone: () => void }) {
     const clientId = config.googleClientId;
     const container = google.current;
     if (!clientId || !container) return;
-    let cancelled = false;
-    afterGoogle = (ok) => {
-      if (ok) done.current();
-      else setError(m.common_sign_in_google_failed());
-    };
-    void googleIdentity(clientId)
-      .then((gsi) => {
-        if (cancelled) return;
-        gsi.cancel();
-        gsi.renderButton(container, {
-          type: 'standard',
-          theme: 'filled_black',
-          size: 'large',
-          text: 'continue_with',
-          shape: 'pill',
-          width: 300,
-          locale: 'en',
-        });
-      })
-      .catch(() => setError(m.common_sign_in_google_unavailable()));
-    return () => {
-      cancelled = true;
-      afterGoogle = () => undefined;
-    };
-  }, [config.googleClientId]);
-
-  async function sendCode(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError(null);
-    const result = await auth.emailOtp.sendVerificationOtp({ email, type: 'sign-in' });
-    setBusy(false);
-    if (result.error) setError(result.error.message ?? m.common_sign_in_send_failed());
-    else {
-      track('sign_in_code_sent');
-      setStep('code');
-    }
-  }
-
-  async function verify(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError(null);
-    const result = await auth.signIn.emailOtp({ email, otp });
-    setBusy(false);
-    track(result.error ? 'sign_in_failed' : 'sign_in', { method: 'email' });
-    if (result.error) setError(result.error.message ?? m.common_sign_in_invalid_code());
-    else onDone();
-  }
+    return renderGoogleButton(
+      auth,
+      clientId,
+      container,
+      {
+        type: 'standard',
+        theme: 'filled_black',
+        size: 'large',
+        text: 'continue_with',
+        shape: 'pill',
+        width: 300,
+        locale: 'en',
+      },
+      {
+        onResult: (ok) => {
+          if (ok) done.current();
+          else setError(m.common_sign_in_google_failed());
+        },
+        onUnavailable: () => setError(m.common_sign_in_google_unavailable()),
+      },
+    );
+  }, [auth, config.googleClientId, setError]);
 
   return (
     <div className="sign-in">
@@ -201,45 +114,45 @@ export function SignInPanel({ onDone }: { onDone: () => void }) {
           <p className="or mono">{m.common_sign_in_or_email()}</p>
         </>
       )}
-      {step === 'email' ? (
-        <form onSubmit={sendCode}>
+      {otp.step === 'email' ? (
+        <form onSubmit={otp.sendCode}>
           <label>
             {m.common_sign_in_email()}
             <input
               type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              value={otp.email}
+              onChange={(e) => otp.setEmail(e.target.value)}
               required
               autoComplete="email"
             />
           </label>
-          <button type="submit" className="primary" disabled={busy}>
-            {busy ? m.common_sign_in_sending() : m.common_sign_in_send_code()}
+          <button type="submit" className="primary" disabled={otp.busy}>
+            {otp.busy ? m.common_sign_in_sending() : m.common_sign_in_send_code()}
           </button>
         </form>
       ) : (
-        <form onSubmit={verify}>
-          <p>{m.common_sign_in_code_sent({ email })}</p>
+        <form onSubmit={otp.verify}>
+          <p>{m.common_sign_in_code_sent({ email: otp.email })}</p>
           <label>
             {m.common_sign_in_code()}
             <input
               inputMode="numeric"
               pattern="[0-9]{6}"
-              value={otp}
-              onChange={(e) => setOtp(e.target.value)}
+              value={otp.otp}
+              onChange={(e) => otp.setOtp(e.target.value)}
               required
               autoComplete="one-time-code"
             />
           </label>
-          <button type="submit" className="primary" disabled={busy}>
-            {busy ? m.common_sign_in_signing_in() : m.common_sign_in_submit()}
+          <button type="submit" className="primary" disabled={otp.busy}>
+            {otp.busy ? m.common_sign_in_signing_in() : m.common_sign_in_submit()}
           </button>
-          <button type="button" className="link-button" onClick={() => setStep('email')}>
+          <button type="button" className="link-button" onClick={otp.changeEmail}>
             {m.common_sign_in_other_email()}
           </button>
         </form>
       )}
-      {error && <p className="error">{error}</p>}
+      {otp.error && <p className="error">{otp.error}</p>}
     </div>
   );
 }
