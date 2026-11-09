@@ -7,11 +7,11 @@ import type { Core } from '@shipwords/core/server';
 import { and, desc, eq, isNull } from 'drizzle-orm';
 import { imageSize } from './image-size';
 import {
+  cancelAll,
   cancelQueued,
   claimGuestJobs,
   loadJob,
   markFailed,
-  SKIPPED_UPSTREAM,
   type StoredOutput,
   settleFailure,
   spendKey,
@@ -332,8 +332,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
           }
         })();
         // The job read before canceling may not list every segment yet; use the record after canceling so a just-submitted segment isn't missed.
-        const ids = upstreamIds(updated).filter((id) => !id.startsWith(SKIPPED_UPSTREAM));
-        if (adapter) await Promise.all(ids.map((id) => adapter.cancel(id).catch(() => undefined)));
+        if (adapter) await cancelAll(adapter, upstreamIds(updated));
       }
       return json({ job: updated ? publicJob(updated, baseURL()) : null });
     },

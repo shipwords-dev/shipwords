@@ -1,0 +1,106 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`effect compose > output check > swapped: checks each segment once, only the filled slots, trim over the raw target, stretch over the model duration 1`] = `
+[
+  "load",
+  "submit:left",
+  "submit:group",
+  "poll:left:0",
+  "store:left",
+  "check:left:0",
+  "poll:group:0",
+  "store:group",
+  "check:group:0",
+  "compose",
+  "finish",
+  "settle",
+  "cost:0",
+]
+`;
+
+exports[`effect compose > repair passes > a missed edge person: whole wide shots with everyone in them first, then their box alone, then delivered 1`] = `
+[
+  "load",
+  "submit",
+  "poll:0",
+  "store",
+  "check:band:0",
+  "compose",
+  "repair:band:0:plan",
+  "repair:band:0:extract",
+  "repair:band:0:submit",
+  "poll:repair:band:0:0",
+  "repair:band:0:store",
+  "repair:band:0:patch",
+  "repair:band:0:check",
+  "repair:band:1:plan",
+  "repair:band:1:extract",
+  "repair:band:1:submit",
+  "poll:repair:band:1:0",
+  "repair:band:1:store",
+  "repair:band:1:patch",
+  "repair:band:1:check",
+  "repair:band:1:deliver",
+  "finish",
+  "settle",
+  "cost:0",
+]
+`;
+
+exports[`multi-part effect jobs > success: each segment submits with jobId:segment ID, outputs numbered by segment, charged once 1`] = `
+[
+  "load",
+  "submit:left",
+  "submit:right",
+  "submit:group",
+  "poll:left:0",
+  "pause:left:0",
+  "poll:left:1",
+  "store:left",
+  "poll:right:0",
+  "store:right",
+  "poll:group:0",
+  "store:group",
+  "finish",
+  "settle",
+  "cost:0",
+]
+`;
+
+exports[`prep and reference audio > execution: video segments submit after prep finishes, placeholders replaced with prep results, prep images not stored, output numbered from 0 1`] = `
+[
+  "load",
+  "submit:prep-left",
+  "poll:prep:0",
+  "pause:prep:0",
+  "poll:prep:1",
+  "submit:left",
+  "submit:group",
+  "poll:left:0",
+  "store:left",
+  "poll:group:0",
+  "store:group",
+  "finish",
+  "settle",
+  "cost:0",
+]
+`;
+
+exports[`prep and reference audio > slow prep hedge > prep still running past the hedge time: submits one copy, the first to finish is used, the other is canceled, the copy is not recorded 1`] = `
+[
+  "load",
+  "submit:prep-left",
+  "poll:prep:0",
+  "hedge:prep-left",
+  "poll:prep:1",
+  "submit:left",
+  "submit:group",
+  "poll:left:0",
+  "store:left",
+  "poll:group:0",
+  "store:group",
+  "finish",
+  "settle",
+  "cost:0",
+]
+`;

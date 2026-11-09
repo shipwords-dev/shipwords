@@ -3,7 +3,8 @@ import type { BatchItem, Db } from '@shipwords/core/db/client';
 import { quotaCounters } from '@shipwords/core/db/schema';
 import type { QuotaRule } from '@shipwords/core/quota/counters';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
-import { type JobRow, jobs } from './schema';
+import { type JobRow, jobs, TERMINAL } from './schema';
+import type { UpstreamAdapter } from './upstream';
 
 // Every write to job state goes through here. Each state change is a conditional UPDATE;
 // refunds and quota returns after failure or cancel settle on the final state, so they can be repeated and survive partial failure.
@@ -15,6 +16,12 @@ export const spendKey = (jobId: string) => `job:${jobId}`;
 export async function loadJob(db: Db, jobId: string): Promise<JobRow | null> {
   const [row] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
   return row ?? null;
+}
+
+/** The job while it is still in progress; null once it has ended or is gone. */
+export async function activeJob(db: Db, jobId: string): Promise<JobRow | null> {
+  const job = await loadJob(db, jobId);
+  return job && !TERMINAL.includes(job.status) ? job : null;
 }
 
 export async function markSubmitted(db: Db, jobId: string, upstreamJobId: string): Promise<boolean> {
@@ -156,4 +163,13 @@ export async function claimGuestJobs(db: Db, guestId: string, userId: string): P
     .set({ userId })
     .where(and(eq(jobs.guestId, guestId), isNull(jobs.userId)))
     .run();
+}
+
+/** Best-effort cancel of upstream tasks (prep placeholders skipped): a task left running keeps billing. */
+export async function cancelAll(adapter: UpstreamAdapter, ids: readonly string[]) {
+  await Promise.all(
+    ids
+      .filter((id) => !id.startsWith(SKIPPED_UPSTREAM))
+      .map((id) => adapter.cancel(id).catch(() => undefined)),
+  );
 }

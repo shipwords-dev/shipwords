@@ -153,6 +153,8 @@ describe('effect slot resolution', () => {
     const segment = effectModel.effect!.segments[0]!;
     expect(bad({ slots, segments: [{ ...segment, slots: ['extra'] }] })).toThrow(/unknown slot/);
     expect(bad({ slots, segments: [segment] })).toThrow(/slot right is in no segment/);
+    for (const id of ['prep', 'prep-left'])
+      expect(bad({ slots: [slots[0]!], segments: [{ ...segment, id }] })).toThrow(/bad segment id/);
     expect(bad({ slots: [slots[0]!], segments: [{ ...segment, referenceVideo: 'http://x/a.mp4' }] })).toThrow(
       /referenceVideo/,
     );
@@ -315,7 +317,10 @@ describe('multi-part effect jobs', () => {
     adapter.polls.set(`up_${jobId}:left`, [{ state: 'running' }, succeeded('left')]);
     adapter.polls.set(`up_${jobId}:right`, [succeeded('right')]);
     adapter.polls.set(`up_${jobId}:group`, [succeeded('group')]);
-    await runGeneration(deps(adapter), jobId, durableSteps());
+    const names: string[] = [];
+    await runGeneration(deps(adapter), jobId, durableSteps(new Map(), names));
+    // Step names are Workflow cache keys (here and below): renaming one replays in-flight jobs wrong.
+    expect(names).toMatchSnapshot();
 
     expect(adapter.submits.map((s) => s.key)).toEqual([`${jobId}:left`, `${jobId}:right`, `${jobId}:group`]);
     expect(adapter.submits[0]!.input).toMatchObject({
@@ -683,7 +688,9 @@ describe('effect compose', () => {
       const adapter = adapterFor(jobId);
       const composer = new FakeComposer();
       composer.scores = [[0.32]];
-      await runGeneration(checkDeps(adapter, composer), jobId, durableSteps());
+      const names: string[] = [];
+      await runGeneration(checkDeps(adapter, composer), jobId, durableSteps(new Map(), names));
+      expect(names).toMatchSnapshot();
       expect(composer.checks).toEqual([
         {
           jobId,
@@ -1005,7 +1012,9 @@ describe('effect compose', () => {
         [0.3, 0.7, 0.2],
         [0.3, 0.2, 0.2],
       ];
-      await runGeneration(repairDeps(adapter, composer), jobId, durableSteps());
+      const names: string[] = [];
+      await runGeneration(repairDeps(adapter, composer), jobId, durableSteps(new Map(), names));
+      expect(names).toMatchSnapshot();
 
       expect(composer.calls).toHaveLength(1);
       expect(composer.extracts).toEqual([
@@ -1781,7 +1790,9 @@ describe('prep and reference audio', () => {
       if (!key.endsWith('prep-left') && (adapter.polls.get(`up_${jobId}:prep-left`)?.length ?? 0) > 0)
         videoSubmittedEarly = true;
     };
-    await runGeneration(prepDeps(adapter), jobId, durableSteps());
+    const names: string[] = [];
+    await runGeneration(prepDeps(adapter), jobId, durableSteps(new Map(), names));
+    expect(names).toMatchSnapshot();
 
     expect(videoSubmittedEarly).toBe(false);
     expect(adapter.submits.map((s) => s.key)).toEqual([
@@ -1944,7 +1955,9 @@ describe('prep and reference audio', () => {
       finishVideo(adapter, jobId);
       lateClock(adapter);
       try {
-        await runGeneration(prepDeps(adapter), jobId, durableSteps());
+        const names: string[] = [];
+        await runGeneration(prepDeps(adapter), jobId, durableSteps(new Map(), names));
+        expect(names).toMatchSnapshot();
       } finally {
         vi.restoreAllMocks();
       }

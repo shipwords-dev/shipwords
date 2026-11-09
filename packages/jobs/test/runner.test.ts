@@ -5,10 +5,11 @@ import { user } from '@shipwords/core/db/schema';
 import { consumeQuota } from '@shipwords/core/quota/counters';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
+import { sumUsd } from '../src/cost';
 import { cancelQueued, loadJob, markFailed, markSubmitted, markSucceeded, spendKey } from '../src/lifecycle';
 import { defineModels } from '../src/models';
 import { emailOnFinish } from '../src/notify';
-import { runGeneration, type StepRunner, sumUsd } from '../src/runner';
+import { runGeneration, type StepRunner } from '../src/runner';
 import { jobs } from '../src/schema';
 import {
   type PollResult,

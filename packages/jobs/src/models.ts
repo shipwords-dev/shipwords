@@ -298,7 +298,8 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
   if (slotIds.size !== effect.slots.length) throw new Error(`model ${modelId}: duplicate effect slot`);
   const segmentIds = new Set<string>();
   for (const segment of effect.segments) {
-    if (segmentIds.has(segment.id) || !/^[a-z0-9_-]+$/.test(segment.id))
+    // prep and prep-<slot> are taken by prep parts and their step names; a segment with one of those IDs would be mixed up with a prep.
+    if (segmentIds.has(segment.id) || !/^[a-z0-9_-]+$/.test(segment.id) || /^prep($|-)/.test(segment.id))
       throw new Error(`model ${modelId}: bad segment id ${segment.id}`);
     segmentIds.add(segment.id);
     // A function is called for every slot combination here, so a bad key fails at startup, not on a paid job.
@@ -565,3 +566,28 @@ export function effectParts(
 
 /** Placeholder prefix for video segment reference images: `prep:<slot>` is replaced with that slot's prep result URL at submit. */
 export const PREP_REF = 'prep:';
+
+/** A job's stored input_json. */
+interface JobInput {
+  references?: { url: string; role: string }[];
+  parameters?: Record<string, unknown>;
+  /** Music jobs: the user's lyrics. */
+  lyrics?: string;
+  parts?: JobPart[];
+}
+
+export function partsOf(job: { prompt: string; inputJson: string }, model: ModelDefinition): JobPart[] {
+  const input = JSON.parse(job.inputJson) as JobInput;
+  if (input.parts?.length) return input.parts;
+  return [
+    {
+      id: 'main',
+      upstreamModel: model.upstreamModel,
+      prompt: job.prompt,
+      ...(input.lyrics ? { lyrics: input.lyrics } : {}),
+      references: input.references ?? [],
+      parameters: input.parameters ?? {},
+      ...(model.maxCost ? { maxCost: model.maxCost } : {}),
+    },
+  ];
+}
