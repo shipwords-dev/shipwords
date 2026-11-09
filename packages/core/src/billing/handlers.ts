@@ -219,6 +219,6 @@ export async function recentOrders(db: Db, userId: string, limit = 20) {
     // With a promo code, the paid amount is below list price; use the paid amount to decide full refunds.
     amountPaid: first.get(row.id)?.amount ?? row.amount,
     amountRefunded: first.get(row.id)?.amountRefunded ?? 0,
-    dispute: (first.get(row.id)?.disputeStatus ?? null) as 'open' | 'won' | 'lost' | null,
+    dispute: first.get(row.id)?.disputeStatus ?? null,
   }));
 }

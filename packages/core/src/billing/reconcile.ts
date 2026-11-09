@@ -62,15 +62,18 @@ function disputeRank(column: SQLWrapper) {
 
 export async function applyPayment(ctx: ReconcileContext, fact: PaymentFact): Promise<ReconcileOutcome> {
   if (!fact.paid) return 'ignored';
-  if (!fact.userId || !fact.productId) {
+  const where = and(eq(payments.provider, fact.provider), eq(payments.paymentRef, fact.paymentRef));
+  const known = await ctx.db.query.payments.findFirst({ where });
+  // Once a product is removed (or a PayPal plan replaced, so the fact maps to no product), new payments can't be granted,
+  // but already-stored payments must still be clawed back on refund or chargeback: fall back to the stored owner and product.
+  const userId = fact.userId ?? known?.userId;
+  const productId = fact.productId ?? known?.productId;
+  if (!userId || !productId) {
     ctx.log?.('payment without our metadata', { paymentRef: fact.paymentRef });
     return 'unmapped';
   }
-  const { db } = ctx;
-  const where = and(eq(payments.provider, fact.provider), eq(payments.paymentRef, fact.paymentRef));
+  const mapped = { ...fact, userId, productId };
   const credits = creditsFor(ctx.site, fact);
-  const known = await db.query.payments.findFirst({ where });
-  // Once a product is removed, new payments can't be granted, but already-granted payments must still be clawed back on refund or chargeback.
   if (!credits && !known) {
     ctx.log?.('payment for unknown product or below list price', {
       paymentRef: fact.paymentRef,
@@ -78,9 +81,19 @@ export async function applyPayment(ctx: ReconcileContext, fact: PaymentFact): Pr
     });
     return 'unmapped';
   }
+  const paymentId = await upsertPayment(ctx.db, mapped);
+  if (credits) await grantForPayment(ctx.db, mapped, paymentId, credits);
+  await convergeRevoked(ctx.db, paymentId, fact.paymentRef);
+  return 'applied';
+}
 
-  // 1. Payment record: inserted once; afterwards refund amount and dispute status merge monotonically (refunds only grow, disputes only move
-  //    none → open → won or lost), so a stale snapshot from a late concurrent webhook can't roll state back.
+type MappedPayment = PaymentFact & { userId: string; productId: string };
+
+/**
+ * 1. Payment record: inserted once; afterwards refund amount and dispute status merge monotonically (refunds only grow, disputes only move
+ *    none → open → won or lost), so a stale snapshot from a late concurrent webhook can't roll state back. Returns the row ID.
+ */
+async function upsertPayment(db: Db, fact: MappedPayment): Promise<string> {
   await db
     .insert(payments)
     .values({
@@ -110,87 +123,106 @@ export async function applyPayment(ctx: ReconcileContext, fact: PaymentFact): Pr
         updatedAt: Date.now(),
       },
     });
-  const row = await db.query.payments.findFirst({ where });
+  const row = await db.query.payments.findFirst({
+    columns: { id: true },
+    where: and(eq(payments.provider, fact.provider), eq(payments.paymentRef, fact.paymentRef)),
+  });
   if (!row) throw new Error(`payment row missing after upsert: ${fact.paymentRef}`);
+  return row.id;
+}
 
-  // 2. Grant: the idempotency key is tied to this payment, not order status, so retrying after a failed grant always fills it in.
-  if (credits) {
-    const markOrderPaid = fact.orderId
-      ? [
-          db
-            .update(orders)
-            .set({ status: 'paid', paidAt: fact.paidAt ?? Date.now() })
-            .where(and(eq(orders.id, fact.orderId), eq(orders.status, 'pending'))),
-        ]
-      : [];
-    await grantCredits(
-      db,
-      {
-        userId: fact.userId,
-        amount: credits.amount,
-        idemKey: `pay:${fact.provider}:${fact.paymentRef}`,
-        source: credits.source,
-        sourceRef: row.id,
-        expiresAt: credits.expiresAt,
-      },
-      [
-        db.update(payments).set({ creditsGranted: credits.amount }).where(eq(payments.id, row.id)),
-        ...markOrderPaid,
-      ],
-    );
-  }
+/**
+ * 2. Grant: the idempotency key is tied to this payment, not order status, so retrying after a failed grant always fills it in.
+ *    The order is marked paid only when it belongs to the same user and product: orderId may come from untrusted metadata (PayPal custom_id).
+ */
+async function grantForPayment(
+  db: Db,
+  fact: MappedPayment,
+  paymentId: string,
+  credits: NonNullable<ReturnType<typeof creditsFor>>,
+) {
+  const markOrderPaid = fact.orderId
+    ? [
+        db
+          .update(orders)
+          .set({ status: 'paid', paidAt: fact.paidAt ?? Date.now() })
+          .where(
+            and(
+              eq(orders.id, fact.orderId),
+              eq(orders.userId, fact.userId),
+              eq(orders.productId, fact.productId),
+              eq(orders.status, 'pending'),
+            ),
+          ),
+      ]
+    : [];
+  await grantCredits(
+    db,
+    {
+      userId: fact.userId,
+      amount: credits.amount,
+      idemKey: `pay:${fact.provider}:${fact.paymentRef}`,
+      source: credits.source,
+      sourceRef: paymentId,
+      expiresAt: credits.expiresAt,
+    },
+    [
+      db.update(payments).set({ creditsGranted: credits.amount }).where(eq(payments.id, paymentId)),
+      ...markOrderPaid,
+    ],
+  );
+}
 
-  // 3. Refunds, chargebacks: move clawed-back credits to the target. The target comes from the merged state in the database, not this fact;
-  //    each adjustment takes a sequence number. Whether it succeeds or loses to a concurrent request, re-read and recompute until target equals clawed-back,
-  //    so even if the first concurrent request to return saw an intermediate state, the later one converges the result to the latest target.
+/**
+ * 3. Refunds, chargebacks: move clawed-back credits to the target. The target comes from the merged state in the database, not this fact;
+ *    each adjustment takes a sequence number. Whether it succeeds or loses to a concurrent request, re-read and recompute until target equals clawed-back,
+ *    so even if the first concurrent request to return saw an intermediate state, the later one converges the result to the latest target.
+ */
+async function convergeRevoked(db: Db, paymentId: string, paymentRef: string) {
   for (let attempt = 1; attempt <= MAX_ADJUST_ATTEMPTS; attempt++) {
-    const current = await db.query.payments.findFirst({ where: eq(payments.id, row.id) });
-    if (!current) return 'applied';
+    const current = await db.query.payments.findFirst({ where: eq(payments.id, paymentId) });
+    if (!current) return;
     const target = targetRevoked(
-      {
-        amount: current.amount,
-        amountRefunded: current.amountRefunded,
-        dispute: current.disputeStatus as PaymentFact['dispute'],
-      },
+      { amount: current.amount, amountRefunded: current.amountRefunded, dispute: current.disputeStatus },
       current.creditsGranted,
     );
-    if (target === current.creditsRevoked) return 'applied';
+    if (target === current.creditsRevoked) return;
     const nextSeq = current.adjustSeq + 1;
     const idemKey = `adj:${current.id}:${nextSeq}`;
     const bump = db
       .update(payments)
       .set({ creditsRevoked: target, adjustSeq: nextSeq, updatedAt: Date.now() })
       .where(and(eq(payments.id, current.id), eq(payments.adjustSeq, current.adjustSeq)));
-    const result =
-      target > current.creditsRevoked
-        ? await revokeCredits(
-            db,
-            {
-              userId: current.userId,
-              amount: target - current.creditsRevoked,
-              idemKey,
-              preferSourceRef: current.id,
-              ref: current.id,
-            },
-            [bump],
-          )
-        : // Dispute won or refund reversed: return over-clawed credits, with the same expiry as the lot this payment originally granted.
-          await grantCredits(
-            db,
-            {
-              userId: current.userId,
-              amount: current.creditsRevoked - target,
-              idemKey,
-              source: 'restore',
-              sourceRef: current.id,
-              expiresAt: await originalExpiry(db, current.id),
-            },
-            [bump],
-          );
-    // Loop again whether applied or not: after re-reading, return at the top of the loop once converged.
-    void result;
+    // Applied or lost to a concurrent request, loop again: the re-read at the top returns once converged.
+    if (target > current.creditsRevoked) {
+      await revokeCredits(
+        db,
+        {
+          userId: current.userId,
+          amount: target - current.creditsRevoked,
+          idemKey,
+          preferSourceRef: current.id,
+          ref: current.id,
+        },
+        [bump],
+      );
+    } else {
+      // Dispute won or refund reversed: return over-clawed credits, with the same expiry as the lot this payment originally granted.
+      await grantCredits(
+        db,
+        {
+          userId: current.userId,
+          amount: current.creditsRevoked - target,
+          idemKey,
+          source: 'restore',
+          sourceRef: current.id,
+          expiresAt: await originalExpiry(db, current.id),
+        },
+        [bump],
+      );
+    }
   }
-  throw new Error(`payment adjustment did not converge: ${fact.paymentRef}`);
+  throw new Error(`payment adjustment did not converge: ${paymentRef}`);
 }
 
 async function originalExpiry(db: Db, paymentId: string): Promise<number | null> {

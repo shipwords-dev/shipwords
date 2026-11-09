@@ -174,7 +174,7 @@ export const orders = sqliteTable(
     provider: text('provider').notNull(),
     amount: integer('amount').notNull(),
     currency: text('currency').notNull(),
-    status: text('status', { enum: ['pending', 'paid', 'expired'] })
+    status: text('status', { enum: ['pending', 'paid'] })
       .notNull()
       .default('pending'),
     checkoutRef: text('checkout_ref'),
@@ -201,7 +201,7 @@ export const payments = sqliteTable(
     amount: integer('amount').notNull(),
     currency: text('currency').notNull(),
     amountRefunded: integer('amount_refunded').notNull().default(0),
-    disputeStatus: text('dispute_status'),
+    disputeStatus: text('dispute_status', { enum: ['open', 'won', 'lost'] }),
     creditsGranted: integer('credits_granted').notNull().default(0),
     /** Credits already clawed back for refunds or chargebacks; adjustSeq increments on each adjustment and is part of the idempotency key. */
     creditsRevoked: integer('credits_revoked').notNull().default(0),

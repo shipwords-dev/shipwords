@@ -9,11 +9,12 @@ import {
   paymentFactFromTransaction,
   readCustomId,
   subscriptionFact,
+  subscriptionProduct,
   toMinor,
   webhookTarget,
 } from '../src/billing/paypal';
 import { WebhookSignatureError } from '../src/billing/provider';
-import { defineSite, type Product } from '../src/site';
+import { defineSite, type Product, type SubscriptionProduct } from '../src/site';
 
 const customId = encodeCustomId({ userId: 'u1', productId: 'pack_100', orderId: 'ord_1' });
 
@@ -36,6 +37,7 @@ const products: Product[] = [
     refs: { paypal: 'P-PLAN' },
   },
 ];
+const proMonth = products[1] as SubscriptionProduct;
 
 describe('PayPal field mapping', () => {
   it('converts amounts to the smallest unit by currency decimals, without floating point', () => {
@@ -132,7 +134,7 @@ describe('PayPal field mapping', () => {
       time: '2026-01-31T00:00:00Z',
       amount_with_breakdown: { gross_amount: { currency_code: 'USD', value: '20.00' } },
     };
-    const fact = paymentFactFromTransaction(subscription, transaction, [], 'month', false);
+    const fact = paymentFactFromTransaction(subscription, transaction, [], proMonth, false);
     expect(fact).toMatchObject({
       paymentRef: 'I-SUB:TX1',
       chargeRef: 'TX1',
@@ -166,10 +168,10 @@ describe('PayPal field mapping', () => {
       time: '2026-02-05T00:00:00Z',
       amount_with_breakdown: { gross_amount: { currency_code: 'USD', value: '20.00' } },
     };
-    expect(paymentFactFromTransaction(subscription, transaction, [], 'month', true).periodEnd).toBe(
+    expect(paymentFactFromTransaction(subscription, transaction, [], proMonth, true).periodEnd).toBe(
       Date.parse('2026-03-01T00:00:00Z'),
     );
-    expect(paymentFactFromTransaction(subscription, transaction, [], 'month', false).periodEnd).toBe(
+    expect(paymentFactFromTransaction(subscription, transaction, [], proMonth, false).periodEnd).toBe(
       Date.parse('2026-03-05T00:00:00Z'),
     );
   });
@@ -182,12 +184,12 @@ describe('PayPal field mapping', () => {
       custom_id: encodeCustomId({ userId: 'u1', productId: 'pro_month', orderId: 'ord_2' }),
       billing_info: { last_payment: { time: '2026-03-01T00:00:00Z' } },
     };
-    expect(subscriptionFact(base, 'month', now)).toMatchObject({
+    expect(subscriptionFact(base, proMonth, now)).toMatchObject({
       status: 'active',
       cancelAtPeriodEnd: true,
       currentPeriodEnd: Date.parse('2026-04-01T00:00:00Z'),
     });
-    expect(subscriptionFact(base, 'month', Date.parse('2026-05-01T00:00:00Z')).status).toBe('canceled');
+    expect(subscriptionFact(base, proMonth, Date.parse('2026-05-01T00:00:00Z')).status).toBe('canceled');
     expect(
       subscriptionFact(
         {
@@ -195,7 +197,7 @@ describe('PayPal field mapping', () => {
           status: 'ACTIVE',
           billing_info: { ...base.billing_info, next_billing_time: '2026-04-01T10:00:00Z' },
         },
-        'month',
+        proMonth,
         now,
       ),
     ).toMatchObject({
@@ -203,8 +205,45 @@ describe('PayPal field mapping', () => {
       cancelAtPeriodEnd: false,
       currentPeriodEnd: Date.parse('2026-04-01T10:00:00Z'),
     });
-    expect(subscriptionFact({ ...base, status: 'SUSPENDED' }, 'month', now).status).toBe('paused');
-    expect(subscriptionFact({ ...base, status: 'APPROVAL_PENDING' }, 'month', now).status).toBe('incomplete');
+    expect(subscriptionFact({ ...base, status: 'SUSPENDED' }, proMonth, now).status).toBe('paused');
+    expect(subscriptionFact({ ...base, status: 'APPROVAL_PENDING' }, proMonth, now).status).toBe(
+      'incomplete',
+    );
+  });
+
+  it('a subscription maps to the product of its plan_id, never the productId in custom_id', () => {
+    const yearly: SubscriptionProduct = {
+      ...proMonth,
+      id: 'pro_year',
+      interval: 'year',
+      price: { amount: 20000, currency: 'usd' },
+      refs: { paypal: 'P-YEAR' },
+    };
+    const catalog = [...products, yearly];
+    // Monthly plan paid, custom_id forged to name the yearly product.
+    const forged: PayPalSubscription = {
+      id: 'I-SUB',
+      status: 'CANCELLED',
+      plan_id: 'P-PLAN',
+      custom_id: encodeCustomId({ userId: 'u1', productId: 'pro_year', orderId: 'ord_2' }),
+      billing_info: { last_payment: { time: '2026-03-01T00:00:00Z' } },
+    };
+    expect(subscriptionProduct(forged, catalog)?.id).toBe('pro_month');
+    expect(
+      subscriptionFact(forged, subscriptionProduct(forged, catalog), Date.parse('2026-03-10T00:00:00Z')),
+    ).toMatchObject({
+      productId: 'pro_month',
+      currentPeriodEnd: Date.parse('2026-04-01T00:00:00Z'),
+    });
+    // A plan no product points to, or no plan at all: unmapped.
+    expect(subscriptionProduct({ plan_id: 'P-OTHER' }, catalog)).toBeNull();
+    expect(subscriptionProduct({}, catalog)).toBeNull();
+    const unknown = subscriptionFact(
+      { ...forged, plan_id: 'P-OTHER' },
+      null,
+      Date.parse('2026-03-10T00:00:00Z'),
+    );
+    expect(unknown).toMatchObject({ productId: null, status: 'canceled' });
   });
 
   it('maps webhook events to the object to fetch', () => {
@@ -449,6 +488,7 @@ describe('PayPalProvider', () => {
           id: 'I-SUB',
           status: 'ACTIVE',
           create_time: '2026-10-01T00:00:00Z',
+          plan_id: 'P-PLAN',
           custom_id: encodeCustomId({ userId: 'u1', productId: 'pro_month', orderId: 'ord_2' }),
         },
       }),

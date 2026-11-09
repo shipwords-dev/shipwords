@@ -1,4 +1,4 @@
-import type { Product } from '../site';
+import type { Product, SubscriptionProduct } from '../site';
 import type {
   CheckoutFact,
   CheckoutRequest,
@@ -15,7 +15,8 @@ import { WebhookSignatureError } from './provider';
 //   and capture sends a fixed PayPal-Request-Id so repeated calls charge only once;
 // - Subscriptions use Subscriptions v1 with pre-created Plans; the Plan ID lives in the product's refs.paypal;
 // - Our userId, productId and orderId go into custom_id (max 127 chars), and orderId also goes into invoice_id,
-//   since PayPal rejects a second payment with the same invoice_id;
+//   since PayPal rejects a second payment with the same invoice_id. custom_id is untrusted (anyone with the client ID can create a
+//   subscription carrying any custom_id), so a subscription's product comes from its plan_id;
 // - For one-time payments both paymentRef and chargeRef are the capture ID; for each subscription period paymentRef is `<subscription ID>:<transaction ID>`,
 //   and chargeRef is the transaction ID (what dispute and refund events reference).
 
@@ -205,6 +206,19 @@ export function paymentFactFromCapture(
 }
 
 /**
+ * The product a subscription bills for, read from its plan_id: custom_id is set by the buyer's browser, so its productId could
+ * name a pricier or longer product. A plan no product points to (e.g. replaced in config) maps to null and the payment goes unmapped.
+ */
+export function subscriptionProduct(
+  subscription: Pick<PayPalSubscription, 'plan_id'>,
+  products: readonly Product[],
+): SubscriptionProduct | null {
+  if (!subscription.plan_id) return null;
+  const product = products.find((p) => p.kind === 'subscription' && p.refs?.paypal === subscription.plan_id);
+  return product?.kind === 'subscription' ? product : null;
+}
+
+/**
  * One subscription period: an entry in the subscription's transaction list. PayPal doesn't expose partial refund amounts, so partial refunds are clawed back in full.
  * Service period: from the latest charge to the subscription's next billing time (when a retry succeeds, payment time is later than the period start, so payment time + one period is wrong);
  * older charges have no matching next billing time, so it's estimated as payment time + one period.
@@ -213,7 +227,7 @@ export function paymentFactFromTransaction(
   subscription: PayPalSubscription,
   transaction: PayPalTransaction,
   disputes: PayPalDispute[],
-  interval: 'month' | 'year' | null,
+  product: SubscriptionProduct | null,
   latest: boolean,
 ): PaymentFact {
   const amount = toMinor(transaction.amount_with_breakdown?.gross_amount);
@@ -222,8 +236,8 @@ export function paymentFactFromTransaction(
   const periodEnd =
     nextBilling != null && paidAt != null && nextBilling > paidAt
       ? nextBilling
-      : paidAt != null && interval
-        ? addInterval(paidAt, interval)
+      : paidAt != null && product
+        ? addInterval(paidAt, product.interval)
         : null;
   return {
     provider: PROVIDER,
@@ -236,6 +250,7 @@ export function paymentFactFromTransaction(
     dispute: mapDispute(disputes),
     metadataTrusted: false,
     ...readCustomId(subscription.custom_id),
+    productId: product?.id ?? null,
     subscriptionRef: subscription.id,
     periodStart: paidAt,
     periodEnd,
@@ -246,11 +261,11 @@ export function paymentFactFromTransaction(
 
 export function subscriptionFact(
   subscription: PayPalSubscription,
-  interval: 'month' | 'year' | null,
+  product: SubscriptionProduct | null,
   fetchedAt: number,
 ): SubscriptionFact {
   const lastPaid = time(subscription.billing_info?.last_payment?.time);
-  const paidUntil = lastPaid != null && interval ? addInterval(lastPaid, interval) : null;
+  const paidUntil = lastPaid != null && product ? addInterval(lastPaid, product.interval) : null;
   let status: string;
   let periodEnd = time(subscription.billing_info?.next_billing_time) ?? paidUntil;
   let cancelAtPeriodEnd = false;
@@ -275,6 +290,7 @@ export function subscriptionFact(
     provider: PROVIDER,
     subscriptionRef: subscription.id,
     ...readCustomId(subscription.custom_id),
+    productId: product?.id ?? null,
     status,
     currentPeriodStart: lastPaid,
     currentPeriodEnd: periodEnd,
@@ -465,7 +481,7 @@ export class PayPalProvider implements PaymentProvider {
       const payment = target ? await this.transactionFact(subscription, target, transactions) : null;
       return {
         orderId: readCustomId(subscription.custom_id).orderId,
-        subscription: subscriptionFact(subscription, this.intervalOf(subscription), Date.now()),
+        subscription: subscriptionFact(subscription, this.productOf(subscription), Date.now()),
         payment,
       };
     }
@@ -508,7 +524,7 @@ export class PayPalProvider implements PaymentProvider {
 
   async fetchSubscription(subscriptionRef: string): Promise<SubscriptionFact | null> {
     const subscription = await this.getSubscription(subscriptionRef);
-    return subscriptionFact(subscription, this.intervalOf(subscription), Date.now());
+    return subscriptionFact(subscription, this.productOf(subscription), Date.now());
   }
 
   /**
@@ -585,15 +601,13 @@ export class PayPalProvider implements PaymentProvider {
       subscription,
       transaction,
       await this.disputes(transaction.id),
-      this.intervalOf(subscription),
+      this.productOf(subscription),
       latest,
     );
   }
 
-  private intervalOf(subscription: PayPalSubscription): 'month' | 'year' | null {
-    const { productId } = readCustomId(subscription.custom_id);
-    const product = this.options.products.find((p) => p.id === productId);
-    return product?.kind === 'subscription' ? product.interval : null;
+  private productOf(subscription: PayPalSubscription): SubscriptionProduct | null {
+    return subscriptionProduct(subscription, this.options.products);
   }
 
   private async accessToken(): Promise<string> {

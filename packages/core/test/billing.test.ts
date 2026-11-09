@@ -262,6 +262,31 @@ describe('storing payments', () => {
     expect(await applyPayment(ctx(), packPayment(userId, 'pi_u', { paid: false }))).toBe('ignored');
     expect(await db.query.payments.findFirst({ where: eq(payments.paymentRef, 'pi_u') })).toBeUndefined();
   });
+
+  it("a payment marks its order paid only when the order is the same user's and product's", async () => {
+    const [owner, other] = [uid(), uid()];
+    const orderId = `ord_${crypto.randomUUID().slice(0, 12)}`;
+    await db.insert(orders).values({
+      id: orderId,
+      userId: owner,
+      productId: 'pack_100',
+      provider: 'fake',
+      amount: 1000,
+      currency: 'usd',
+    });
+    const status = async () => (await db.query.orders.findFirst({ where: eq(orders.id, orderId) }))?.status;
+    // Untrusted metadata naming someone else's order: the payer still gets credits, the order stays pending.
+    await applyPayment(ctx(), packPayment(other, 'pp_steal', { metadataTrusted: false, orderId }));
+    expect((await getBalance(db, other)).available).toBe(100);
+    expect(await status()).toBe('pending');
+    await applyPayment(
+      ctx(),
+      packPayment(owner, 'pp_own', { orderId, productId: 'pro_month', amount: 2000 }),
+    );
+    expect(await status()).toBe('pending');
+    await applyPayment(ctx(), packPayment(owner, 'pp_paid', { orderId }));
+    expect(await status()).toBe('paid');
+  });
 });
 
 describe('regressions found in review', () => {
@@ -321,6 +346,22 @@ describe('regressions found in review', () => {
       packPayment(userId, 'pi_gone', { amountRefunded: 1000 }),
     );
     expect((await getBalance(db, userId)).available).toBe(0);
+  });
+
+  it('a stored payment whose fact no longer maps to a product (PayPal plan replaced) still converges refunds and disputes', async () => {
+    const userId = uid();
+    const renewal = { productId: 'pro_month', amount: 2000, subscriptionRef: 'I-OLD' };
+    await applyPayment(ctx(), packPayment(userId, 'I-OLD:TX1', renewal));
+    expect((await getBalance(db, userId)).available).toBe(300);
+    const unmapped = { ...renewal, productId: null };
+    expect(
+      await applyPayment(ctx(), packPayment(userId, 'I-OLD:TX1', { ...unmapped, dispute: 'open' })),
+    ).toBe('applied');
+    expect((await getBalance(db, userId)).available).toBe(0);
+    await applyPayment(ctx(), packPayment(userId, 'I-OLD:TX1', { ...unmapped, dispute: 'won' }));
+    expect((await getBalance(db, userId)).available).toBe(300);
+    // A new payment on that plan is still not granted.
+    expect(await applyPayment(ctx(), packPayment(userId, 'I-OLD:TX2', unmapped))).toBe('unmapped');
   });
 
   it('credits returned on a won chargeback keep the original lot expiry', async () => {
