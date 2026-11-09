@@ -196,7 +196,11 @@ test('new site: renames, writes README, check-site finds unfinished items', () =
       spec,
     );
   }
-  fs.writeFileSync(bad, "import site from '../../site.config';\nconst lazy = import('./other');\n");
+  fs.writeFileSync(
+    bad,
+    "import site from '../../site.config';\nconst lazy = import('./other');\nimport root from '../..';\n" +
+      "// import x from '../../../../packages/core/src/x';\n/* import('../../../other/src/x') */\n",
+  );
   assert.ok(!checkSite(target).some((p) => p.includes('imports another site')));
   fs.rmSync(bad);
   fs.rmSync(path.join(target, 'src', 'models.server.ts'));

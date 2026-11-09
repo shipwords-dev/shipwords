@@ -205,8 +205,9 @@ function checkLegal(dir, isTemplate) {
 /** A relative import that resolves outside the site directory: shared code comes from packages by name, never by path. */
 function escapesSite(dir, file, source) {
   const root = path.resolve(dir) + path.sep;
-  for (const match of source.matchAll(/(?:\bfrom|\bimport\s*\(?)\s*['"](\.{1,2}\/[^'"]*)['"]/g)) {
-    if (!path.resolve(path.dirname(file), match[1]).startsWith(root)) return true;
+  const code = source.replace(/\/\*[\s\S]*?\*\/|^\s*\/\/.*$/gm, '');
+  for (const match of code.matchAll(/(?:\bfrom|\bimport\s*\(?)\s*['"](\.{1,2}\/[^'"]*)['"]/g)) {
+    if (!(path.resolve(path.dirname(file), match[1]) + path.sep).startsWith(root)) return true;
   }
   return false;
 }
