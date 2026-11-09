@@ -17,7 +17,7 @@ import {
   useState,
 } from 'react';
 import { authClient } from '~/lib/auth';
-import { identify, track } from '~/lib/track';
+import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { openAccount } from '~/site/account';
 import { PhoneHandoff } from '~/site/phone-upload';
@@ -167,11 +167,6 @@ export function TinyDeskTool({
       window.history.replaceState(window.history.state, '', url);
     }
   }, []);
-
-  const userId = session.data?.user.id;
-  useEffect(() => {
-    if (userId) identify(userId);
-  }, [userId]);
 
   // Results: only jobs seen going from running to done/failed on this page; jobs already finished on load are not recorded again.
   const statuses = useRef(new Map<string, PublicJob['status']>());

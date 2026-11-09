@@ -4,6 +4,7 @@ import { createRootRoute, HeadContent, Link, Outlet, Scripts } from '@tanstack/r
 import { type ReactNode, useEffect } from 'react';
 import { authClient } from '~/lib/auth';
 import { getPublicConfig } from '~/lib/public-config';
+import { identify } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { getLocale, setLocale } from '~/paraglide/runtime.js';
 import { AccountDialog, AccountLink } from '~/site/account';
@@ -92,6 +93,12 @@ function Layout() {
     if (session.isPending || session.data || !config.googleClientId) return;
     promptGoogleOneTap(config.googleClientId);
   }, [session.isPending, session.data, config.googleClientId]);
+
+  // Every page, not just the generator: a visitor who signs in on a guide page is linked to their user ID too.
+  const userId = session.data?.user.id;
+  useEffect(() => {
+    if (userId) identify(userId);
+  }, [userId]);
 
   return (
     <div className="page">

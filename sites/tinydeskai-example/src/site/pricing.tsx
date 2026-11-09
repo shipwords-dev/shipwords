@@ -7,11 +7,12 @@ import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { openSignIn } from '~/site/sign-in';
 import site from '../../site.config';
+import models from '../../site.models';
 
 // Pricing has no page of its own: the home page #pricing section checks out directly, other entry points (nav, low credits, account, guides) open a dialog,
-// so the visitor stays on the page with the stage photos intact. Each video is 10 credits; unit prices derive from credits, so change prices only in site.config.ts.
+// so the visitor stays on the page with the stage photos intact. Unit prices derive from pack credits (site.config.ts) and the per-video price (site.models.ts).
 
-const CREDITS_PER_VIDEO = 10;
+const CREDITS_PER_VIDEO = models[0].credits;
 const OPEN_EVENT = 'tinydesk:pricing';
 /** Checkout return and cancel both land here; tool.tsx sees resume, scrolls to the generator and says the stage is intact. */
 const RESUME_PATH = '/?resume=1#make';

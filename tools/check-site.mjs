@@ -202,6 +202,15 @@ function checkLegal(dir, isTemplate) {
   return problems;
 }
 
+/** A relative import that resolves outside the site directory: shared code comes from packages by name, never by path. */
+function escapesSite(dir, file, source) {
+  const root = path.resolve(dir) + path.sep;
+  for (const match of source.matchAll(/(?:\bfrom|\bimport\s*\(?)\s*['"](\.{1,2}\/[^'"]*)['"]/g)) {
+    if (!path.resolve(path.dirname(file), match[1]).startsWith(root)) return true;
+  }
+  return false;
+}
+
 export function checkSite(dir) {
   const problems = [];
   const isTemplate = path.resolve(dir).split(path.sep).includes('templates');
@@ -225,7 +234,7 @@ export function checkSite(dir) {
   problems.push(...checkLegal(dir, isTemplate), ...checkBuild(dir));
   for (const file of fs.existsSync(path.join(dir, 'src')) ? walk(path.join(dir, 'src')) : []) {
     const source = fs.readFileSync(file, 'utf8');
-    if (/from ['"](\.\.\/)+(sites|templates)\//.test(source) || /@shipwords\/(site|template)-/.test(source)) {
+    if (escapesSite(dir, file, source) || /@shipwords\/(site|template)-/.test(source)) {
       problems.push(`${path.relative(dir, file)} imports another site`);
     }
   }

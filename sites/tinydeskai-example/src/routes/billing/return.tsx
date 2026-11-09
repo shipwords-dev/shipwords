@@ -4,8 +4,9 @@ import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
+import models from '../../../site.models';
 
-const CREDITS_PER_VIDEO = 10;
+const CREDITS_PER_VIDEO = models[0].credits;
 /** How long to stay after credits arrive before going back, long enough to read the balance. */
 const CONTINUE_DELAY_MS = 3500;
 

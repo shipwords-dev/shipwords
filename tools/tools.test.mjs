@@ -184,8 +184,21 @@ test('new site: renames, writes README, check-site finds unfinished items', () =
   const problems = checkSite(target);
   assert.ok(problems.includes('Missing policy page src/routes/dmca.tsx'));
   assert.ok(problems.includes('src/site/legal.tsx SUPPORT_EMAIL is still a placeholder'));
-  fs.writeFileSync(path.join(target, 'src', 'bad.ts'), "import x from '../../sites/other/src/x';\n");
-  assert.ok(checkSite(target).some((p) => p.includes('imports another site')));
+  const bad = path.join(target, 'src', 'site', 'bad.ts');
+  for (const spec of [
+    '../../../other/src/x',
+    '../../../../templates/ai-site/src/x',
+    '../../../../packages/core/src/x',
+  ]) {
+    fs.writeFileSync(bad, `import x from '${spec}';\n`);
+    assert.ok(
+      checkSite(target).some((p) => p.includes('imports another site')),
+      spec,
+    );
+  }
+  fs.writeFileSync(bad, "import site from '../../site.config';\nconst lazy = import('./other');\n");
+  assert.ok(!checkSite(target).some((p) => p.includes('imports another site')));
+  fs.rmSync(bad);
   fs.rmSync(path.join(target, 'src', 'models.server.ts'));
   assert.ok(checkSite(target).includes('Missing src/models.server.ts'));
   assert.throws(() => createSite(root, { slug: 'ghibli-photo', template: 'ai-site' }), /already exists/);
