@@ -81,11 +81,12 @@ describe('effect slot resolution', () => {
       prompt: 'swap in @image1',
       references: [
         { url: 'https://site/files/assets/demo/left.mp4', role: 'reference_video' },
-        { url: 'https://site/files/uploads/up_a.png', role: 'reference_image' },
+        { url: 'https://site/files/uploads/up_a.png', role: 'reference_image', slot: 'left' },
       ],
       parameters: { duration: 6 },
       maxCost: '0.30',
       slots: ['left'],
+      kinds: { left: 'person' },
     });
     expect(parts[1]!.prompt).toBe('group @image1 -');
     expect(parts[1]!.slots).toEqual(['left']);
@@ -1084,6 +1085,18 @@ describe('effect compose', () => {
             [0.5, 0.4, 3],
           ],
           seconds: 6,
+          // Each point looks at the shots of its group only: front and edge at the wide shots 0 and 2, solo at shot 1.
+          windows: [
+            [
+              [0, 1.7],
+              [4.3, 6],
+            ],
+            [
+              [0, 1.7],
+              [4.3, 6],
+            ],
+            [[2.3, 3.7]],
+          ],
         },
         expect.objectContaining({ key: `jobs/${jobId}/repair-band-1-song.mp4` }),
       ]);
@@ -1311,6 +1324,105 @@ describe('effect compose', () => {
         expect((await getBalance(db, userId)).available).toBe(40);
       });
 
+      it('delivered with people still missed: the job is marked for review and someone is told, the user sees a plain success', async () => {
+        const { jobId, adapter } = await repairJob();
+        const composer = new FakeComposer();
+        composer.scores = [0, 1, 2, 3].map(() => [0.3, 0.8, 0.2]);
+        const reviewed: [string, readonly string[]][] = [];
+        await runGeneration(
+          {
+            ...deliverDeps(adapter, composer),
+            review: async (job, reasons) => void reviewed.push([job.id, reasons]),
+          },
+          jobId,
+          durableSteps(),
+        );
+        const job = await loadJob(db, jobId);
+        expect(job).toMatchObject({ status: 'succeeded', errorCode: null });
+        expect(job!.errorMessage).toMatch(/^needs review: band: delivered with edge not swapped/);
+        expect(reviewed).toEqual([[jobId, [expect.stringMatching(/^band: delivered with edge/)]]]);
+      });
+
+      it('a fully swapped job is not marked for review', async () => {
+        const { jobId, adapter } = await repairJob();
+        const composer = new FakeComposer();
+        const reviewed: string[] = [];
+        await runGeneration(
+          { ...deliverDeps(adapter, composer), review: async (job) => void reviewed.push(job.id) },
+          jobId,
+          durableSteps(),
+        );
+        expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded', errorMessage: null });
+        expect(reviewed).toEqual([]);
+      });
+
+      it('a person also seen in another shot: the pass re-renders the shot group where the check saw them', async () => {
+        // front also shows in solo's shot (shot 1), checked at 3 s; the render still has front there.
+        const cornerModels = defineModels([
+          {
+            ...repairModel,
+            effect: {
+              ...repairModel.effect!,
+              segments: [
+                {
+                  ...band,
+                  check: {
+                    ...band.check!,
+                    faces: {
+                      ...band.check!.faces,
+                      front: [
+                        [0.5, 0.5],
+                        [0.9, 0.9, 3],
+                      ],
+                    },
+                  },
+                  repair: {
+                    ...repair,
+                    onMiss: 'deliver',
+                    shots: [
+                      ['front', 'edge'],
+                      ['solo', 'front'],
+                      ['front', 'edge'],
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ]);
+        const { jobId, adapter } = await repairJob();
+        const composer = new FakeComposer();
+        // Points in order: front (two), edge, solo.
+        composer.scores = [[0.2, 0.8, 0.2, 0.2]];
+        await runGeneration(
+          { ...repairDeps(adapter, composer), models: cornerModels },
+          jobId,
+          durableSteps(),
+        );
+        expect(composer.checks[0]!.points).toEqual([
+          [0.5, 0.5],
+          [0.9, 0.9, 3],
+          [0.1, 0.1],
+          [0.5, 0.4, 3],
+        ]);
+        // The render is checked on its own timeline (6 s requested): front's second point only looks at shot 1, so it flags shot 1 alone.
+        expect(composer.checks[0]!.windows).toEqual([
+          [
+            [0, 1.7],
+            [4.3, 6],
+          ],
+          [[2.3, 3.7]],
+          [
+            [0, 1.7],
+            [4.3, 6],
+          ],
+          [[2.3, 3.7]],
+        ]);
+        expect(composer.extracts.map((e) => e.ranges)).toEqual([[[48, 96]]]);
+        expect(adapter.submits[1]!.input.prompt).toBe('replace front solo');
+        expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+      });
+
       it('a pass is rejected, fails upstream or times out before any pass lands: the render itself is delivered, credits kept', async () => {
         for (const setup of [
           (adapter: FakeAdapter, _: string, __: FakeComposer) => {
@@ -1470,17 +1582,43 @@ describe('effect compose', () => {
           models: likenessModels,
         });
 
+        it('the check matched the original but the face clearly looks like the photo (a profile): no pass, delivered as composed', async () => {
+          const { jobId, adapter } = await repairJob();
+          const composer = new FakeComposer();
+          composer.scores = [[0.3, 0.2, 0.6]];
+          composer.likenessScores = [[0.7, 0.1, 0.1]];
+          await runGeneration(likenessDeps(adapter, composer), jobId, durableSteps());
+          expect(adapter.submits).toHaveLength(1);
+          expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded', errorMessage: null });
+        });
+
+        it('the face looks like it should but more like another filled slot: a swap, repaired', async () => {
+          const { jobId, adapter } = await repairJob();
+          const composer = new FakeComposer();
+          // solo looks enough like its photo (0.6), but more like front's (0.7).
+          composer.likenessScores = [[0.6, 0.7, 0.1]];
+          await runGeneration(likenessDeps(adapter, composer), jobId, durableSteps());
+          expect(adapter.submits).toHaveLength(2);
+          expect(adapter.submits[1]!.input.prompt).toBe('replace solo');
+          expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+        });
+
         it('the close-up is unlike its photo: one pass on its shot with its photo, delivered once it looks like them', async () => {
           const { userId, jobId, adapter } = await repairJob();
           const composer = new FakeComposer();
           composer.likenessScores = [[0.4], [0.7]];
           await runGeneration(likenessDeps(adapter, composer), jobId, durableSteps());
-          // Scored on the composed video over solo's shot, the photo read from the bucket rather than over HTTP.
+          // Scored on the composed video over solo's shot, the photo read from the bucket rather than over HTTP; then the other filled
+          // slots' photos over the same shot, so a face on the wrong person shows up.
           expect(composer.likenessChecks).toEqual([
             {
               jobId,
               key: `jobs/${jobId}/1.mp4`,
-              people: [{ photo: { key: 'uploads/up_s.png' }, ranges: [[2, 4]] }],
+              people: [
+                { photo: { key: 'uploads/up_s.png' }, ranges: [[2, 4]] },
+                { photo: { key: 'uploads/up_f.png' }, ranges: [[2, 4]] },
+                { photo: { key: 'uploads/up_e.png' }, ranges: [[2, 4]] },
+              ],
             },
             expect.objectContaining({ key: `jobs/${jobId}/repair-band-0-song.mp4` }),
           ]);
@@ -1651,24 +1789,21 @@ describe('effect compose', () => {
       expect(
         withRepair({ repair: { ...repair, shots: [['front', 'edge'], ['front', 'solo'], []] } }),
       ).not.toThrow();
-      expect(() =>
+      const withExtra = (shots: string[][]) => () =>
         defineModels([
           {
             ...repairModel,
             effect: {
               ...repairModel.effect!,
               slots: [...repairModel.effect!.slots, { id: 'extra', label: 'Extra', required: false }],
-              segments: [
-                {
-                  ...band,
-                  slots: [...band.slots, 'extra'],
-                  repair: { ...repair, shots: [['front', 'edge', 'solo'], ['front', 'extra'], []] },
-                },
-              ],
+              segments: [{ ...band, slots: [...band.slots, 'extra'], repair: { ...repair, shots } }],
             },
           },
-        ]),
-      ).toThrow(/at most 3/);
+        ]);
+      // The limit is per shot: a pass re-renders one group of shots with the same people, so front may be in two groups of 3 and 2.
+      expect(withExtra([['front', 'edge', 'solo'], ['front', 'extra'], []])).not.toThrow();
+      expect(withExtra([['front', 'edge', 'solo', 'extra'], ['front'], []])).toThrow(/at most 3/);
+      expect(withRepair({ repair: { ...repair, aspect: 0 } })).toThrow(/aspect/);
       expect(withRepair({ repair: { ...repair, shots: [['front'], ['solo'], ['front']] } })).toThrow(
         /edge must be in some shot/,
       );
@@ -1744,8 +1879,8 @@ describe('prep and reference audio', () => {
     });
     expect(parts[3]!.references).toEqual([
       { url: 'https://site/files/assets/demo/group.mp4', role: 'reference_video' },
-      { url: 'prep:left', role: 'reference_image' },
-      { url: 'https://site/files/uploads/up_b.png', role: 'reference_image' },
+      { url: 'prep:left', role: 'reference_image', slot: 'left' },
+      { url: 'https://site/files/uploads/up_b.png', role: 'reference_image', slot: 'right' },
       { url: 'https://site/files/assets/demo/group.mp3', role: 'reference_audio' },
     ]);
     // Only a slot without prep is filled: no prep segment.
@@ -1809,6 +1944,7 @@ describe('prep and reference audio', () => {
     expect(adapter.submits[1]!.input.references[1]).toEqual({
       url: 'https://up/left-prep.png',
       role: 'reference_image',
+      slot: 'left',
     });
     const job = await loadJob(db, jobId);
     expect(job).toMatchObject({
@@ -1820,6 +1956,128 @@ describe('prep and reference audio', () => {
       `jobs/${jobId}/1.mp4`,
     ]);
     expect((await getBalance(db, userId)).available).toBe(40);
+  });
+
+  describe('subjects and descriptions', () => {
+    // left is a subject with three prep views; right a plain reference without prep. The prompt asks for left's description (view 1).
+    const subjectModel: ModelDefinition = {
+      ...prepModel,
+      id: 'demo-subjects',
+      maxCost: '1.00',
+      effect: {
+        slots: [
+          { id: 'left', label: 'Left', required: true, prep: ['face', 'front', 'side'] },
+          { id: 'right', label: 'Right', required: false },
+        ],
+        prep: prepModel.effect!.prep,
+        describe: { instruction: 'describe them', view: 1 },
+        segments: [
+          {
+            id: 'group',
+            referenceVideo: 'assets/demo/group.mp4',
+            slots: ['left', 'right'],
+            subjects: { left: 'Left' },
+            prompt: (images, { describe }) =>
+              `group ${images.left}${describe('left')} ${images.right ?? '-'}`,
+            parameters: { duration: 5 },
+            maxCost: '0.40',
+          },
+        ],
+      },
+    };
+    const subjectModels = defineModels([subjectModel]);
+
+    async function subjectJob() {
+      const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
+      const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
+      const parts = effectParts(
+        subjectModel,
+        { left: '/files/uploads/up_a.png', right: '/files/uploads/up_b.png' },
+        upload,
+        asset,
+      )!;
+      await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
+      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
+        db.insert(jobs).values({
+          id: jobId,
+          userId,
+          modelId: 'demo-subjects',
+          kind: 'video',
+          prompt: '',
+          inputJson: JSON.stringify({ parts }),
+          costCredits: 10,
+          upstream: 'yir',
+        }),
+      ]);
+      const adapter = new FakeAdapter();
+      adapter.polls.set(`up_${jobId}:group`, [succeeded('group')]);
+      return { userId, jobId, adapter };
+    }
+
+    it('each view goes to the subject, a failed view falls back to the photo, the description lands after the name', async () => {
+      const { jobId, adapter } = await subjectJob();
+      adapter.polls.set(`up_${jobId}:prep-left`, [image('https://up/face.png')]);
+      adapter.polls.set(`up_${jobId}:prep-left-v1`, [{ state: 'failed', code: 'x', message: 'no' }]);
+      adapter.polls.set(`up_${jobId}:prep-left-v2`, [image('https://up/side.png')]);
+      const asked: [string, string][] = [];
+      const names: string[] = [];
+      await runGeneration(
+        {
+          ...deps(adapter),
+          models: subjectModels,
+          fileUrl: (key: string) => `https://site/files/${key}`,
+          describe: async (url: string, instruction: string) => {
+            asked.push([url, instruction]);
+            return 'The person is a woman in a red "N" shirt.';
+          },
+        },
+        jobId,
+        durableSteps(new Map(), names),
+      );
+      expect(names).toContain('describe:group');
+      // The front view fell back to the photo, so that is what was described.
+      expect(asked).toEqual([['https://site/files/uploads/up_a.png', 'describe them']]);
+      const video = adapter.submits.find((submit) => submit.key === `${jobId}:group`)!.input;
+      expect(video.prompt).toBe('group @Left, a woman in a red N shirt @image2');
+      expect(video.references.map((ref) => [ref.url, ref.subject])).toEqual([
+        ['https://site/files/assets/demo/group.mp4', undefined],
+        ['https://up/face.png', 'Left'],
+        ['https://site/files/uploads/up_a.png', 'Left'],
+        ['https://up/side.png', 'Left'],
+        ['https://site/files/uploads/up_b.png', undefined],
+      ]);
+      expect(buildYirRequest(video).input).toMatchObject({
+        references: expect.arrayContaining([
+          { role: 'reference_image', url: 'https://up/face.png', subject: 'Left' },
+        ]),
+      });
+      expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+    });
+
+    it('every view fell back to the photo: sent once plus a second URL; a failed description is left out, the job goes on', async () => {
+      const { jobId, adapter } = await subjectJob();
+      for (const id of ['prep-left', 'prep-left-v1', 'prep-left-v2'])
+        adapter.polls.set(`up_${jobId}:${id}`, [{ state: 'failed', code: 'x', message: 'no' }]);
+      await runGeneration(
+        {
+          ...deps(adapter),
+          models: subjectModels,
+          fileUrl: (key: string) => `https://site/files/${key}`,
+          describe: async () => {
+            throw new Error('model down');
+          },
+        },
+        jobId,
+        durableSteps(),
+      );
+      const video = adapter.submits.find((submit) => submit.key === `${jobId}:group`)!.input;
+      expect(video.prompt).toBe('group @Left @image2');
+      expect(video.references.filter((ref) => ref.subject === 'Left').map((ref) => ref.url)).toEqual([
+        'https://site/files/uploads/up_a.png',
+        'https://site/files/uploads/up_a.png?view=2',
+      ]);
+      expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+    });
   });
 
   const finishVideo = (adapter: FakeAdapter, jobId: string) => {

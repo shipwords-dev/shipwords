@@ -7,14 +7,16 @@ import {
   cancelAll,
   loadJob,
   markFailed,
+  markForReview,
   markSucceeded,
   SKIPPED_UPSTREAM as SKIPPED,
   type StoredOutput,
   settleFailure,
   upstreamIds,
 } from './lifecycle';
-import { type ModelDefinition, PREP_REF, partsOf } from './models';
+import { fillDescriptions, type ModelDefinition, PREP_REF, partsOf } from './models';
 import { composeOutputs, storeOutputs } from './outputs';
+import { checkPoints, checkWindows, judgeCheck } from './repair';
 import { type RepairContext, repairOutputs, type SegmentCheck } from './repair-steps';
 import type { JobRow } from './schema';
 import type { PollResult, SubmitInput, UpstreamAdapter } from './upstream';
@@ -43,6 +45,16 @@ export interface RunnerDeps {
   fileUrl?: (key: string) => string;
   /** Notify the user when the job succeeds or fails (e.g. email) so they don't have to wait on the page; errors are only logged and don't affect the job. */
   notify?: (job: JobRow) => Promise<void>;
+  /**
+   * Describe a person in an image (effect.describe), e.g. with a vision model: a short phrase that goes into the video prompt. Errors
+   * and empty answers leave the description out; without it describe placeholders are dropped.
+   */
+  describe?: (imageUrl: string, instruction: string) => Promise<string>;
+  /**
+   * Tell someone a delivered job needs a human look (people the repair passes couldn't swap, a face on the wrong person). The job is
+   * delivered either way; errors are only logged.
+   */
+  review?: (job: JobRow, reasons: readonly string[]) => Promise<void>;
   log?: (message: string, details: Record<string, unknown>) => void;
 }
 
@@ -149,6 +161,10 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       parts,
       prep: partsOf(job, model).filter((part) => part.kind === 'image' && model.kind === 'video').length,
       compose: Boolean(model.effect?.compose),
+      // Video segments whose prompt waits for descriptions (effect.describe); cached loads from older versions have none.
+      describe: partsOf(job, model)
+        .filter((part) => part.describe)
+        .map((part) => part.id),
       // Output checks: segment ID → config. Cached loads from older versions lack this, so old in-flight jobs keep running unchecked.
       checks: Object.fromEntries(
         (model.effect?.segments ?? [])
@@ -216,26 +232,54 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   const prepUrls = new Map<string, string>();
   const submittedIds: string[] = [];
   const outputs: StoredOutput[] = [];
-  /** Segments whose check found original people and that have repair passes: segment ID → [part index, missed slots]. */
-  const toRepair = new Map<string, [number, string[]]>();
+  /**
+   * Segments whose check found original people and that have repair passes: segment ID → [part index, missed slots, where each was seen
+   * (shot indices)].
+   */
+  const toRepair = new Map<string, [number, string[], Record<string, number[]>]>();
+  /** Descriptions of the people in each video segment (effect.describe): segment ID → slot → phrase. */
+  const descriptions = new Map<string, Record<string, string>>();
+  /** Why the delivered job needs a human look; written after it succeeds. */
+  const reviews: string[] = [];
   /** Key of each segment's first output, looked up by segment ID when composing. */
   const partKeys = new Map<string, string>();
   const timeOut = () => stop('timeout', 'timeout', `no result after ${setup.timeoutMinutes} minutes`);
 
-  /** Upstream request for segment `index`: prep placeholders replaced with prep results. */
+  /** A reference URL with its prep placeholder replaced by the prep result. */
+  const resolve = (partId: string, url: string): string => {
+    if (!url.startsWith(PREP_REF)) return url;
+    const resolved = prepUrls.get(`prep-${url.slice(PREP_REF.length)}`);
+    if (!resolved) throw new Error(`part ${partId} needs ${url} before it is ready`);
+    return resolved;
+  };
+  /**
+   * Upstream request for segment `index`: prep placeholders replaced with prep results, and descriptions filled in. A subject's views that
+   * fell back to the same photo are sent once; a subject left with one site photo gets it again under a second URL, since subjects take
+   * two photos or more.
+   */
   const submitInput = (job: JobRow, index: number): SubmitInput => {
     const model = deps.models.find((m) => m.id === job.modelId)!;
     const part = partsOf(job, model)[index]!;
-    const references = part.references.map((ref) => {
-      if (!ref.url.startsWith(PREP_REF)) return ref;
-      const url = prepUrls.get(`prep-${ref.url.slice(PREP_REF.length)}`);
-      if (!url) throw new Error(`part ${part.id} needs ${ref.url} before it is ready`);
-      return { ...ref, url };
-    });
+    const resolved = part.references.map((ref) => ({ ...ref, url: resolve(part.id, ref.url) }));
+    const references = resolved.filter(
+      (ref, i) =>
+        !ref.subject ||
+        !resolved.slice(0, i).some((earlier) => earlier.subject === ref.subject && earlier.url === ref.url),
+    );
+    const files = deps.fileUrl?.('');
+    for (const name of new Set(references.flatMap((ref) => (ref.subject ? [ref.subject] : [])))) {
+      const own = references.filter((ref) => ref.subject === name);
+      if (own.length !== 1 || !files || !own[0]!.url.startsWith(files)) continue;
+      const only = own[0]!;
+      references.splice(references.indexOf(only) + 1, 0, {
+        ...only,
+        url: `${only.url}${only.url.includes('?') ? '&' : '?'}view=2`,
+      });
+    }
     return {
       upstreamModel: part.upstreamModel,
       kind: part.kind ?? model.kind,
-      prompt: part.prompt,
+      prompt: part.describe ? fillDescriptions(part.prompt, descriptions.get(part.id) ?? {}) : part.prompt,
       ...(part.lyrics ? { lyrics: part.lyrics } : {}),
       references,
       parameters: part.parameters,
@@ -340,34 +384,49 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
    * and refunding one good video costs less than charging for a broken one. Under repair.onMiss 'deliver' the render has been charged, so a
    * check error delivers it unchecked and a miss that can't be repaired delivers it as is, neither refunds. Returns false if the job has ended.
    */
-  const verify = async (partId: string, index: number, check: SegmentCheck): Promise<boolean | string[]> => {
+  const verify = async (
+    partId: string,
+    index: number,
+    check: SegmentCheck,
+  ): Promise<boolean | string[] | { missed: string[]; where: Record<string, number[]> }> => {
     const { original, faces } = check;
     const key = partKeys.get(partId);
     if (!key) return true;
     // Step name keeps the old round suffix so in-flight jobs replay their cached check.
-    const verdict: { stopped: true } | { errored: string } | { scores: number[]; slots?: string[] } =
-      await step
-        .do(`check:${partId}:0`, async () => {
-          const job = await activeJob(deps.db, jobId);
-          if (!job) return { stopped: true as const };
-          if (!original || !faces) return { scores: [] as number[] };
-          const model = deps.models.find((m) => m.id === job.modelId)!;
-          // Parts stored by older versions don't record their slots: check none rather than flag slots the user left as the original.
-          const slots = (partsOf(job, model)[index]!.slots ?? []).filter((slot) => faces[slot]);
-          if (!deps.composer || slots.length === 0) return { scores: [] as number[] };
-          const scores = await deps.composer.faces({
-            jobId,
-            key,
-            originalKey: original,
-            points: slots.map((slot) => faces[slot]!),
-            seconds: check.seconds,
-          });
-          return { scores, slots };
-        })
-        .catch((error: unknown) => {
-          deps.log?.('swap check errored', { jobId, part: partId, error: String(error) });
-          return { errored: String(error) };
+    const verdict:
+      | { stopped: true }
+      | { errored: string }
+      | { scores: number[]; slots?: string[]; points?: true } = await step
+      .do(`check:${partId}:0`, async () => {
+        const job = await activeJob(deps.db, jobId);
+        if (!job) return { stopped: true as const };
+        if (!original || !faces) return { scores: [] as number[] };
+        const model = deps.models.find((m) => m.id === job.modelId)!;
+        // Parts stored by older versions don't record their slots: check none rather than flag slots the user left as the original.
+        const slots = (partsOf(job, model)[index]!.slots ?? []).filter((slot) => faces[slot]);
+        if (!deps.composer || slots.length === 0) return { scores: [] as number[] };
+        const { points, owners } = checkPoints(faces, slots);
+        // With repair, each point looks only at the shots of its group, so the shots it flags are where the original really is.
+        const segment = model.effect?.segments.find((candidate) => candidate.id === partId);
+        const windows =
+          segment?.repair && segment.cuts
+            ? checkWindows(points, owners, segment.repair.shots, segment.cuts, check.seconds)
+            : undefined;
+        const scores = await deps.composer.faces({
+          jobId,
+          key,
+          originalKey: original,
+          points,
+          seconds: check.seconds,
+          ...(windows ? { windows } : {}),
         });
+        // points: scores are per check point (a slot can have several), not per slot as cached by older versions.
+        return { scores, slots, points: true as const };
+      })
+      .catch((error: unknown) => {
+        deps.log?.('swap check errored', { jobId, part: partId, error: String(error) });
+        return { errored: String(error) };
+      });
     if ('stopped' in verdict) return false;
     // Read from the current config like repairOutputs; a cached load without repair keeps refunding as before.
     const deliverOnMiss =
@@ -383,8 +442,13 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     if (worst < check.maxSimilarity) return true;
     deps.log?.('swap not applied', { jobId, part: partId, scores: verdict.scores });
     // Checks cached by older versions don't name their slots; repair needs compose, the container and a public URL for the frames.
-    if (check.repair && verdict.slots && setup.compose && deps.composer && deps.fileUrl)
-      return verdict.slots.filter((_, i) => verdict.scores[i]! >= check.maxSimilarity);
+    if (check.repair && verdict.slots && setup.compose && deps.composer && deps.fileUrl) {
+      if (!verdict.points) return verdict.slots.filter((_, i) => verdict.scores[i]! >= check.maxSimilarity);
+      const cuts = deps.models
+        .find((m) => m.id === setup.model)
+        ?.effect?.segments.find((s) => s.id === partId)?.cuts;
+      return judgeCheck(faces!, verdict.slots, verdict.scores, check.maxSimilarity, cuts ?? []);
+    }
     if (deliverOnMiss) return true;
     await fail('swap_not_applied', `${partId} still shows an original face (similarity ${worst})`);
     return false;
@@ -398,6 +462,36 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   ] as const) {
     for (let index = from; index < to; index++) {
       const partId = partIds[index]!;
+      if (index >= prepCount && setup.describe?.includes(partId)) {
+        // Best effort: a failed description leaves it out of the prompt, it never holds up or fails the job.
+        const described = await step
+          .do(`describe:${partId}`, async (): Promise<Record<string, string>> => {
+            const job = await activeJob(deps.db, jobId);
+            const model = job && deps.models.find((m) => m.id === job.modelId);
+            const ask = job && model ? partsOf(job, model)[index]!.describe : undefined;
+            if (!ask || !deps.describe) return {};
+            const said = await Promise.all(
+              Object.entries(ask.images).map(async ([slot, image]): Promise<[string, string]> => {
+                try {
+                  return [
+                    slot,
+                    cleanDescription(await deps.describe!(resolve(partId, image), ask.instruction)),
+                  ];
+                } catch (error) {
+                  deps.log?.('describe failed', { jobId, part: partId, slot, error: String(error) });
+                  return [slot, ''];
+                }
+              }),
+            );
+            deps.log?.('described', { jobId, part: partId, said });
+            return Object.fromEntries(said.filter(([, text]) => text));
+          })
+          .catch((error: unknown) => {
+            deps.log?.('describe failed', { jobId, part: partId, error: String(error) });
+            return {} as Record<string, string>;
+          });
+        descriptions.set(partId, described);
+      }
       const submitted = await step.do(name('submit', partId), async () => {
         const job = await activeJob(deps.db, jobId);
         if (!job) return { done: true as const };
@@ -516,7 +610,8 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       if (!check) continue;
       const verdict = await verify(partId, index, check);
       if (verdict === false) return;
-      if (Array.isArray(verdict)) toRepair.set(partId, [index, verdict]);
+      if (Array.isArray(verdict)) toRepair.set(partId, [index, verdict, {}]);
+      else if (verdict !== true) toRepair.set(partId, [index, verdict.missed, verdict.where]);
     }
   }
   let finalOutputs = outputs;
@@ -538,13 +633,22 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       timeOut,
       submitInput,
       pollUntilDone,
+      review: (reason) => reviews.push(reason),
     };
     for (const [index, partId] of partIds.entries()) {
       const check = setup.checks?.[partId];
       const missed = toRepair.get(partId)?.[1];
       // A segment with nothing missed still goes through when it has repair passes: its likeness check may ask for some.
       if (!check || (!missed && !(check.repair && deps.composer && deps.fileUrl))) continue;
-      const repaired = await repairOutputs(repairContext, partId, index, check, missed ?? [], composed);
+      const repaired = await repairOutputs(
+        repairContext,
+        partId,
+        index,
+        check,
+        missed ?? [],
+        composed,
+        toRepair.get(partId)?.[2],
+      );
       if (!repaired) return;
     }
   }
@@ -552,4 +656,25 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     await markSucceeded(deps.db, jobId, finalOutputs);
     return true;
   });
+  if (reviews.length > 0) {
+    // Best effort, after delivery: the note is kept on the job (error_message, which pages never show) and sent to deps.review.
+    await step
+      .do('review', async () => {
+        const job = await markForReview(deps.db, jobId, reviews.join('; '));
+        if (job) await deps.review?.(job, reviews);
+        return true;
+      })
+      .catch((error: unknown) => deps.log?.('review notice failed', { jobId, error: String(error) }));
+  }
+}
+
+/** A vision model's answer as a prompt phrase: one line, no markup or references, at most 200 characters, no closing period. */
+export function cleanDescription(text: string): string {
+  return text
+    .replace(/[@{}<>`*#"]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^(the person is|this is|a photo of)\s+/i, '')
+    .slice(0, 200)
+    .replace(/[.\s]+$/, '');
 }

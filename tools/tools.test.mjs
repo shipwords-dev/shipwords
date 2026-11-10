@@ -10,6 +10,7 @@ import { checkSite, devVars, stringLiterals } from './check-site.mjs';
 import { isWorktree, portFor, sitePort } from './dev-port.mjs';
 import { readSiteConfig, readStatus, setVar, TOOLS_ROOT } from './lib.mjs';
 import { createSite, nextDevPort, parseArgs, validateSlug } from './new-site.mjs';
+import { replacementKey, replaceOutput, siteResources, sqlString } from './replace-output.mjs';
 import { listenArgs, parseVars } from './stripe-listen.mjs';
 
 const crawlHtml = `<html><head><title>Photo studio</title><meta content="Make a video" name="description"><link href="https://example.com" rel="canonical"></head><body><h1>Photo studio</h1><p>One photo. $9.98.</p><script type="application/ld+json">{"@type":"VideoObject","uploadDate":"2026-10-27T15:02:46Z"}</script></body></html>`;
@@ -365,4 +366,24 @@ test('check-public: flags real-looking emails, IDs and live keys, accepts placeh
   assert.equal(isScanned('sites/x/migrations/meta/0_snapshot.json'), false);
   assert.equal(isScanned('pnpm-lock.yaml'), false);
   assert.equal(isScanned('sites/x/wrangler.jsonc'), true);
+});
+
+test('replace-output: new key per redo, outputs_json keeps the rest, resources read from wrangler.jsonc', () => {
+  const wrangler = `{ "d1_databases": [{ "binding": "DB", "database_name": "demo", "database_id": "x" }],
+    "r2_buckets": [{ "binding": "OUTPUTS", "bucket_name": "demo-outputs" }] }`;
+  assert.deepEqual(siteResources(wrangler), { bucket: 'demo-outputs', database: 'demo' });
+  assert.throws(() => siteResources('{}'), /OUTPUTS/);
+  assert.equal(replacementKey('job_abc123', 0, '.mp4', 42), 'jobs/job_abc123/0-r42.mp4');
+  assert.throws(() => replacementKey("job_x'; drop", 0, '.mp4'), /bad job id/);
+  const outputs = JSON.stringify([
+    { key: 'jobs/job_a/0.mp4', mediaType: 'video/mp4' },
+    { key: 'jobs/job_a/1.mp4', mediaType: 'video/mp4' },
+  ]);
+  assert.deepEqual(JSON.parse(replaceOutput(outputs, 1, 'jobs/job_a/1-r9.mp4')), [
+    { key: 'jobs/job_a/0.mp4', mediaType: 'video/mp4' },
+    { key: 'jobs/job_a/1-r9.mp4', mediaType: 'video/mp4' },
+  ]);
+  assert.throws(() => replaceOutput(outputs, 2, 'k'), /no output 2/);
+  assert.throws(() => replaceOutput(null, 0, 'k'), /no output 0/);
+  assert.equal(sqlString("it's"), "'it''s'");
 });

@@ -42,7 +42,7 @@ def faces(image):
     return result
 
 
-def frames(path, seconds, count):
+def frames(path, seconds, count, with_times=False):
     capture = cv2.VideoCapture(path)
     end = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = capture.get(cv2.CAP_PROP_FPS)
@@ -50,10 +50,11 @@ def frames(path, seconds, count):
         end = min(end, int(seconds * fps))
     result = []
     for i in range(count):
-        capture.set(cv2.CAP_PROP_POS_FRAMES, int(end * (i + 0.5) / count))
+        index = int(end * (i + 0.5) / count)
+        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
         ok, image = capture.read()
         if ok:
-            result.append(image)
+            result.append((image, index / fps if fps > 0 else 0.0) if with_times else image)
     return result
 
 
@@ -107,6 +108,8 @@ def main():
         print(json.dumps(likeness(sys.argv[2], json.loads(sys.argv[3]))))
         return
     output, original, seconds, points = sys.argv[1], sys.argv[2], float(sys.argv[3]), json.loads(sys.argv[4])
+    # Optional: per point, the time ranges of the output to look in (the shots it stands for).
+    windows = json.loads(sys.argv[5]) if len(sys.argv) > 5 else None
     by_time = {}
     targets = []
     for point in points:
@@ -118,16 +121,18 @@ def main():
         nearest = min(originals, key=lambda f: (f[0] - x) ** 2 + (f[1] - y) ** 2, default=None)
         # Only trust a face that is actually near the configured point.
         targets.append(nearest[2] if nearest and (nearest[0] - x) ** 2 + (nearest[1] - y) ** 2 < 0.15 ** 2 else None)
-    sampled = frames(output, seconds, max(SAMPLES, round(seconds * SAMPLES_PER_SECOND)))
+    sampled = frames(output, seconds, max(SAMPLES, round(seconds * SAMPLES_PER_SECOND)), with_times=True)
     if not sampled:
         raise SystemExit('cannot read the output')
-    found = [face[2] for image in sampled for face in faces(image)]
+    found = [(at, face[2]) for image, at in sampled for face in faces(image)]
     scores = []
-    for target in targets:
+    for i, target in enumerate(targets):
         if target is None:
             scores.append(0.0)
             continue
-        best = max((recognizer.match(target, feature, cv2.FaceRecognizerSF_FR_COSINE) for feature in found), default=0.0)
+        ranges = windows[i] if windows else None
+        seen = [feature for at, feature in found if ranges is None or any(start <= at <= end for start, end in ranges)]
+        best = max((recognizer.match(target, feature, cv2.FaceRecognizerSF_FR_COSINE) for feature in seen), default=0.0)
         scores.append(round(max(0.0, float(best)), 3))
     print(json.dumps(scores))
 

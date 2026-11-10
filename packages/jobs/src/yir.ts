@@ -29,7 +29,11 @@ type YirRequest =
   | StandardMusicGenerationRequest;
 
 export function buildYirRequest(input: SubmitInput): YirRequest {
-  const references = input.references.map((ref) => ({ role: ref.role, url: ref.url }));
+  const references = input.references.map((ref) => ({
+    role: ref.role,
+    url: ref.url,
+    ...(ref.subject ? { subject: ref.subject } : {}),
+  }));
   const base = {
     model: input.upstreamModel,
     parameters: input.parameters,

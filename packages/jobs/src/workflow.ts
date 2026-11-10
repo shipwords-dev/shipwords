@@ -2,10 +2,11 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloud
 import { createDb } from '@shipwords/core/db/client';
 import type { SiteConfig } from '@shipwords/core/site';
 import { containerComposer } from './compose';
+import { workersAiDescribe } from './describe';
 import { markFailed } from './lifecycle';
 import { MockAdapter, mockComposer, mockMode } from './mock';
 import type { ModelDefinition } from './models';
-import { emailOnFinish } from './notify';
+import { emailOnFinish, emailReview } from './notify';
 import { runGeneration } from './runner';
 import type { UpstreamAdapter } from './upstream';
 import { YirAdapter } from './yir';
@@ -23,6 +24,10 @@ export interface JobsEnv {
   /** For job-finished emails; shares the send_email binding and sender address with sign-in codes. */
   EMAIL?: SendEmail;
   EMAIL_FROM?: string;
+  /** Where to send notes about delivered jobs that need a human look (people the repair passes couldn't swap); unset sends none. */
+  REVIEW_EMAIL?: string;
+  /** Workers AI, for describing the people in effect prep images (effect.describe); without it descriptions are left out. */
+  AI?: Ai;
   APP_URL?: string;
   /** For testing flows locally or on a test-mode demo, see mock.ts. */
   UPSTREAM_MOCK?: string;
@@ -94,6 +99,18 @@ export function defineGenerationWorkflow(
                     db,
                     email: env.EMAIL,
                     from: env.EMAIL_FROM,
+                    site,
+                    baseURL: (env.APP_URL ?? site.url).replace(/\/$/, ''),
+                  }),
+                }
+              : {}),
+            ...(env.AI ? { describe: workersAiDescribe(env.AI) } : {}),
+            ...(site && env.EMAIL && env.EMAIL_FROM && env.REVIEW_EMAIL
+              ? {
+                  review: emailReview({
+                    email: env.EMAIL,
+                    from: env.EMAIL_FROM,
+                    to: env.REVIEW_EMAIL,
                     site,
                     baseURL: (env.APP_URL ?? site.url).replace(/\/$/, ''),
                   }),

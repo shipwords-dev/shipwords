@@ -10,7 +10,8 @@
 // POST /extract  multipart: manifest (JSON: { ranges: [[start, end), ...] frames, crop?: [x, y, w, h], width, height, fps }), video.
 //   Returns those frames joined into one silent MP4 (the box only, scaled up, with crop): the input of a repair pass. Read-only.
 // POST /patch  multipart: manifest (as extract plus id), video, patch (the repaired clip). Returns video with the repaired frames
-//   put back; results also stay in /tmp/compose/<id>/ (song.mp4, silent.mp4) like compose.
+//   put back, lined up frame by frame on the background (align.py; stretched over the box if that fails); results also stay in
+//   /tmp/compose/<id>/ (song.mp4, silent.mp4) like compose.
 // Repeating compose with the same id overwrites the same files, so Workflow retries are idempotent.
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -26,9 +27,12 @@ import {
   buildPatchArgs,
   buildSilentArgs,
   checkRanges,
+  clampRanges,
+  cropPixels,
   matchCuts,
   parseCutTimes,
   parsePoints,
+  parseWindows,
   splitAtCuts,
 } from './compose.mjs';
 
@@ -136,6 +140,7 @@ async function faces(req) {
   const seconds = Number(form.get('seconds'));
   if (!(Number.isFinite(seconds) && seconds > 0 && seconds <= 60)) throw new Error('bad seconds');
   const points = parsePoints(String(form.get('points') ?? ''));
+  const windows = form.has('windows') ? parseWindows(String(form.get('windows')), points.length) : null;
   const dir = join('/tmp/faces', randomUUID());
   await mkdir(dir, { recursive: true });
   try {
@@ -149,6 +154,7 @@ async function faces(req) {
       original,
       String(seconds),
       JSON.stringify(points),
+      ...(windows ? [JSON.stringify(windows)] : []),
     ]);
     const similarity = JSON.parse(stdout);
     if (!Array.isArray(similarity) || similarity.length !== points.length)
@@ -242,17 +248,31 @@ async function patch(req) {
   await save(form, 'video', video);
   await save(form, 'patch', patchFile);
   const song = join(dir, 'song.mp4');
-  await run(
-    'ffmpeg',
-    buildPatchArgs({
-      ...spec,
-      video,
-      frames: await framesOf(video),
-      patch: patchFile,
-      patchDuration: await durationOf(patchFile),
-      output: song,
-    }),
-  );
+  const frames = await framesOf(video);
+  // Line the repaired frames up with the ones they replace (align.py); if that fails, stretch them over the box as before.
+  try {
+    const box = spec.crop ? cropPixels(spec.crop, spec.width, spec.height) : null;
+    const plan = { ranges: clampRanges(spec.ranges, frames), box, fps: spec.fps };
+    const { stdout } = await run('python3', ['align.py', video, patchFile, song, JSON.stringify(plan)], {
+      maxBuffer: 1 << 20,
+    });
+    console.log(JSON.stringify({ event: 'patch aligned', id: manifest.id, ...JSON.parse(stdout) }));
+  } catch (error) {
+    console.log(
+      JSON.stringify({ event: 'patch align failed, stretching', id: manifest.id, error: String(error) }),
+    );
+    await run(
+      'ffmpeg',
+      buildPatchArgs({
+        ...spec,
+        video,
+        frames,
+        patch: patchFile,
+        patchDuration: await durationOf(patchFile),
+        output: song,
+      }),
+    );
+  }
   await run('ffmpeg', buildSilentArgs(song, join(dir, 'silent.mp4')));
   return song;
 }

@@ -34,6 +34,11 @@ export interface FacesInput {
   points: FacePoint[];
   /** Only look at the first few seconds of the output. */
   seconds: number;
+  /**
+   * Per point, the time ranges (seconds on the output) to look in: the shots that point stands for, so a score says the original is
+   * still in those shots and not somewhere else. Without it every point looks at the whole output.
+   */
+  windows?: readonly (readonly (readonly [number, number])[])[];
 }
 
 export interface LikenessInput {
@@ -133,6 +138,7 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       const form = new FormData();
       form.set('seconds', String(input.seconds));
       form.set('points', JSON.stringify(input.points));
+      if (input.windows) form.set('windows', JSON.stringify(input.windows));
       form.set('video', await blobOf(bucket, input.key), 'video.mp4');
       form.set('original', await blobOf(bucket, input.originalKey), 'original.mp4');
       const stub = namespace.get(namespace.idFromName(input.jobId));

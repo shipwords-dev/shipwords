@@ -8,8 +8,8 @@ export interface SubmitInput {
   prompt: string;
   /** Music only: song lyrics; absent when the model writes them or makes an instrumental. */
   lyrics?: string;
-  /** Reference images: public HTTPS URLs. */
-  references: { url: string; role: string }[];
+  /** Reference images: public HTTPS URLs; subject groups several photos of one person for upstreams that take them (Kling subjects). */
+  references: { url: string; role: string; subject?: string }[];
   parameters: Record<string, unknown>;
   /** Cost cap per task (USD string); unlimited if unset. */
   maxCost?: string;

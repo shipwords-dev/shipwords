@@ -25,8 +25,8 @@ export interface GenerateInput {
   lyrics?: string;
   references?: string[];
   parameters?: Record<string, unknown>;
-  /** Effects: slot ID → path returned by uploadReference. */
-  slots?: Record<string, string>;
+  /** Effects: slot ID → path returned by uploadReference, or { photo: path, kind } to say the photo shows a pet (kind 'pet'). */
+  slots?: Record<string, string | { photo: string; kind?: 'person' | 'pet' }>;
 }
 
 const isActive = (job: PublicJob) => job.status === 'queued' || job.status === 'submitted';

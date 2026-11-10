@@ -81,6 +81,20 @@ export async function markSucceeded(db: Db, jobId: string, outputs: StoredOutput
   return result.meta.changes > 0;
 }
 
+/**
+ * Note on a delivered job that it needs a human look (error_message; error_code stays empty, so pages still show a plain success).
+ * Only bookkeeping like recordUpstreamCost. Returns the job, or null if it isn't a success.
+ */
+export async function markForReview(db: Db, jobId: string, note: string): Promise<JobRow | null> {
+  await db
+    .update(jobs)
+    .set({ errorMessage: `needs review: ${note}`.slice(0, 500) })
+    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'succeeded')))
+    .run();
+  const job = await loadJob(db, jobId);
+  return job?.status === 'succeeded' ? job : null;
+}
+
 /** Record the upstream charge of an ended job; only bookkeeping, it never touches state or credits, so a re-read simply overwrites it. */
 export async function recordUpstreamCost(db: Db, jobId: string, usd: string): Promise<void> {
   await db.update(jobs).set({ upstreamCostUsd: usd }).where(eq(jobs.id, jobId)).run();

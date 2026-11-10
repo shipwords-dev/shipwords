@@ -174,6 +174,36 @@ export function parsePoints(text) {
 }
 
 /**
+ * Face check windows: per point, 1–10 [start, end] time ranges in seconds (0–120, start < end). Throws on anything else.
+ * @param {string} text
+ * @param {number} count number of points
+ */
+export function parseWindows(text, count) {
+  const windows = JSON.parse(text);
+  if (
+    !Array.isArray(windows) ||
+    windows.length !== count ||
+    !windows.every(
+      (ranges) =>
+        Array.isArray(ranges) &&
+        ranges.length > 0 &&
+        ranges.length <= 10 &&
+        ranges.every(
+          (range) =>
+            Array.isArray(range) &&
+            range.length === 2 &&
+            range.every(
+              (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 120,
+            ) &&
+            range[0] < range[1],
+        ),
+    )
+  )
+    throw new Error('bad windows');
+  return windows;
+}
+
+/**
  * Repair frame ranges: a JSON-parsed list of 1–10 [start, end) frame pairs, increasing and not overlapping. Throws on anything else.
  * @param {unknown} ranges
  * @returns {[number, number][]}

@@ -49,7 +49,9 @@ describe('public and server model files', () => {
     expect(image).toMatchObject({ id: 'image', credits: 5, upstreamModel: 'vendor/image' });
     expect(image?.effect).toBeUndefined();
     expect(effect?.effect?.slots).toEqual([{ id: 'a', label: 'A', required: true }]);
-    expect(effect?.effect?.segments[0]?.prompt({ a: '@image1' })).toBe('Swap in @image1');
+    expect(
+      effect?.effect?.segments[0]?.prompt({ a: '@image1' }, { kinds: { a: 'person' }, describe: () => '' }),
+    ).toBe('Swap in @image1');
   });
 
   it('rejects server fields in site.models.ts', () => {

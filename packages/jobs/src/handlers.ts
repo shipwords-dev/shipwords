@@ -379,11 +379,14 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
       );
     },
 
-    /** GET /files/<key>: read outputs and uploads from R2. Keys contain a random ID and can't be enumerated. */
+    /**
+     * GET /files/<key>: read outputs and uploads from R2. Keys contain a random ID and can't be enumerated. An output replaced by hand
+     * after a redo (tools/replace-output.mjs) gets a new key, <n>-r<timestamp>.<ext>, since outputs are cached as immutable.
+     */
     async file(request: Request, key: string): Promise<Response> {
       // assets/ holds site-provided assets (effect reference videos etc.); file names are chosen by the site, read-only.
       if (
-        !/^(jobs\/job_[a-z0-9]+\/(\d+\.[a-z0-9]+|repair-[a-z0-9_-]+-\d+\.mp4)|uploads\/up_[a-z0-9]+\.(png|jpg|webp)|assets\/[a-z0-9][a-z0-9/_-]*\.(mp4|mp3|png|jpg|webp))$/.test(
+        !/^(jobs\/job_[a-z0-9]+\/(\d+(-r\d+)?\.[a-z0-9]+|repair-[a-z0-9_-]+-\d+\.mp4)|uploads\/up_[a-z0-9]+\.(png|jpg|webp)|assets\/[a-z0-9][a-z0-9/_-]*\.(mp4|mp3|png|jpg|webp))$/.test(
           key,
         ) ||
         key.includes('..')

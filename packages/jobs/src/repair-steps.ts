@@ -6,8 +6,17 @@ import {
   type StoredOutput,
   upstreamIds,
 } from './lifecycle';
-import { type FacePoint, partsOf } from './models';
-import { nextRepairPass, type RepairPass, shotFrames } from './repair';
+import { type FacePoint, partsOf, type SlotKind } from './models';
+import {
+  checkPoints,
+  checkWindows,
+  fitAspect,
+  judgeCheck,
+  nextRepairPass,
+  photoOf,
+  type RepairPass,
+  shotFrames,
+} from './repair';
 import type { RunnerDeps, StepRunner } from './runner';
 import type { JobRow } from './schema';
 import type { PollResult, SubmitInput, UpstreamAdapter } from './upstream';
@@ -20,7 +29,7 @@ export interface SegmentCheck {
   maxSimilarity: number;
   /** Missing on checks cached by older versions (per-second SSIM): those jobs are delivered unchecked. */
   original?: string;
-  faces?: Readonly<Record<string, FacePoint>>;
+  faces?: Readonly<Record<string, FacePoint | readonly FacePoint[]>>;
   seconds: number;
   /** The segment has repair passes; missing on loads cached by older versions, whose missed swaps are refunded as before. */
   repair?: boolean;
@@ -50,10 +59,23 @@ export interface RepairContext {
     upstreamJobId: string,
     label: string | null,
   ) => Promise<Exclude<PollResult, { state: 'running' }> | { state: 'stopped' } | { state: 'timeout' }>;
+  /** Mark the job for a human look after it is delivered (people still missed or on the wrong face). */
+  review: (reason: string) => void;
 }
 
+/** A likeness check: slots that don't look like their photo (or look more like someone else's), and slots that clearly do. */
+interface Likeness {
+  missed: string[];
+  passed: string[];
+  /** Slots whose face looks more like another filled slot's photo than their own: the model put the wrong person there. */
+  swapped: string[];
+}
+
+const NO_LIKENESS: Likeness = { missed: [], passed: [], swapped: [] };
+
 /**
- * Filled slots of a composed video that don't look enough like their photos (repair.likeness), each scored over the shots it is in.
+ * Filled slots of a composed video that don't look enough like their photos (repair.likeness), each scored over the shots it is in,
+ * and against every other filled slot's photo over the same shots: a face closer to someone else's photo than to its own is a swap.
  * Soft by design: a check error or a photo with no face counts as no miss, so this only ever adds repair passes, never fails or refunds.
  */
 async function unlike(
@@ -62,7 +84,7 @@ async function unlike(
   partId: string,
   index: number,
   key: string,
-): Promise<string[]> {
+): Promise<Likeness> {
   const { deps, jobId, step } = ctx;
   const effect = deps.models.find((m) => m.id === ctx.modelId)?.effect;
   const segment = effect?.segments.find((candidate) => candidate.id === partId);
@@ -76,38 +98,58 @@ async function unlike(
     !fps ||
     !deps.composer
   )
-    return [];
+    return NO_LIKENESS;
   const { likeness, shots } = repair;
   const { cuts, target } = segment;
-  return step
-    .do(stepName, async () => {
+  const result = await step
+    .do(stepName, async (): Promise<Likeness> => {
       const row = await activeJob(deps.db, jobId);
-      if (!row) return [];
+      if (!row) return NO_LIKENESS;
       const model = deps.models.find((m) => m.id === row.modelId)!;
       const filled = partsOf(row, model)[index]!.slots ?? [];
-      const photos = ctx.submitInput(row, index).references.filter((ref) => ref.role === 'reference_image');
+      const references = ctx.submitInput(row, index).references;
       const slots = filled.filter((slot) => likeness[slot] !== undefined);
-      if (slots.length === 0) return [];
+      if (slots.length === 0) return NO_LIKENESS;
       // Site uploads (the photo itself when prep fell back to it) are read from the bucket, not over HTTP from the site.
       const files = deps.fileUrl?.('') ?? null;
-      const people = slots.map((slot) => {
-        const url = photos[filled.indexOf(slot)]!.url;
+      const photo = (slot: string) => {
+        const url = photoOf(references, filled, slot)!;
+        return files && url.startsWith(files) ? { key: url.slice(files.length) } : { url };
+      };
+      // Per likeness slot: its own photo first, then each other filled slot's photo, all over the likeness slot's shots.
+      const people = slots.flatMap((slot) => {
         const ofSlot = shots.flatMap((inShot, i) => (inShot.includes(slot) ? [i] : []));
-        return {
-          photo: files && url.startsWith(files) ? { key: url.slice(files.length) } : { url },
-          ranges: shotFrames(cuts, target!, fps, ofSlot).map(
-            ([start, end]) => [start / fps, end / fps] as [number, number],
-          ),
-        };
+        const ranges = shotFrames(cuts, target!, fps, ofSlot).map(
+          ([start, end]) => [start / fps, end / fps] as [number, number],
+        );
+        return [slot, ...filled.filter((other) => other !== slot)].map((who) => ({
+          photo: photo(who),
+          ranges,
+        }));
       });
       const scores = await deps.composer!.likeness({ jobId, key, people });
       deps.log?.('likeness checked', { jobId, part: partId, key, slots, scores });
-      return slots.filter((slot, i) => scores[i] != null && scores[i]! < likeness[slot]!);
+      const verdict: Likeness = { missed: [], passed: [], swapped: [] };
+      let at = 0;
+      for (const slot of slots) {
+        const own = scores[at];
+        const others = scores
+          .slice(at + 1, at + filled.length)
+          .filter((score): score is number => score != null);
+        at += filled.length;
+        if (own == null) continue;
+        if (others.some((score) => score > own)) verdict.swapped.push(slot);
+        if (own < likeness[slot]! || verdict.swapped.includes(slot)) verdict.missed.push(slot);
+        else verdict.passed.push(slot);
+      }
+      return verdict;
     })
     .catch((error: unknown) => {
       deps.log?.('likeness check errored', { jobId, part: partId, key, error: String(error) });
-      return [];
+      return NO_LIKENESS;
     });
+  // Steps cached by versions before the swap check returned the missed slots alone.
+  return Array.isArray(result) ? { missed: result as string[], passed: [], swapped: [] } : result;
 }
 
 /**
@@ -126,9 +168,11 @@ export async function repairOutputs(
   check: SegmentCheck,
   initial: string[],
   composed: StoredOutput[],
+  initialWhere: Readonly<Record<string, readonly number[]>> = {},
 ): Promise<StoredOutput[] | null> {
   const { deps, jobId, step, adapter, deadline, fail, timeOut, pollUntilDone } = ctx;
   let missed = initial;
+  let where: Readonly<Record<string, readonly number[]>> = initialWhere;
   const notApplied = (why: string) => () =>
     fail(
       'swap_not_applied',
@@ -151,8 +195,15 @@ export async function repairOutputs(
   const passes: RepairPass[] = [];
   let current = composed[0]!.key;
   let silent = composed[1]!.key;
-  const off = await unlike(ctx, `likeness:${partId}`, partId, index, current);
-  missed = [...initial, ...off.filter((slot) => !initial.includes(slot))];
+  const first = await unlike(ctx, `likeness:${partId}`, partId, index, current);
+  // A face the check matched to the original but that clearly looks like the user's photo is a false alarm (a profile shot keeps the
+  // original's outline); a face that looks like another filled slot's photo is missed however it scored.
+  missed = [
+    ...initial.filter((slot) => !first.passed.includes(slot)),
+    ...first.missed.filter((slot) => !initial.includes(slot)),
+  ];
+  if (first.swapped.length > 0)
+    deps.log?.('faces swapped between slots', { jobId, part: partId, slots: first.swapped });
   if (missed.length === 0) return composed;
   /** Copy a version over the compose keys (the delivered outputs). */
   const deliver = (stepName: string, song: string, quiet: string) =>
@@ -171,7 +222,7 @@ export async function repairOutputs(
       return true;
     });
   // The checked version with the fewest missed people so far; a tie keeps the earlier one.
-  let best = { song: current, silent, missed: missed.length };
+  let best = { song: current, silent, missed: missed.length, names: missed, swapped: first.swapped };
   /**
    * The passes can't finish the swap. By default the job fails (`failure`, with a refund); under onMiss 'deliver' the paid render
    * has been charged, so the best checked version is delivered and the credits are kept.
@@ -187,6 +238,11 @@ export async function repairOutputs(
       why,
       missed: best.missed,
     });
+    ctx.review(
+      `${partId}: delivered with ${best.names.join(', ') || 'nobody'} not swapped or not like their photo` +
+        (best.swapped.length ? ` (${best.swapped.join(', ')} on another person's face)` : '') +
+        ` after ${why}`,
+    );
     // A pass can still be running upstream (the deadline passed while polling it): cancel it as a failure would, so it stops billing.
     await step.do(`repair:${partId}:cancel-passes`, async () => {
       const row = await loadJob(deps.db, jobId);
@@ -203,11 +259,16 @@ export async function repairOutputs(
         if (!row) return null;
         const model = deps.models.find((m) => m.id === row.modelId)!;
         const part = partsOf(row, model)[index]!;
-        const photos = ctx.submitInput(row, index).references.filter((ref) => ref.role === 'reference_image');
-        return { slots: part.slots ?? [], photos: photos.map((ref) => ref.url) };
+        const references = ctx.submitInput(row, index).references;
+        const slots = part.slots ?? [];
+        return {
+          slots,
+          photos: slots.map((slot) => photoOf(references, slots, slot)!),
+          kinds: part.kinds ?? {},
+        };
       });
       if (!job) return null;
-      const pass = nextRepairPass(repair, job.slots, missed, passes);
+      const pass = nextRepairPass(repair, job.slots, missed, passes, where);
       if (!pass) return giveUp('no pass covers them', notApplied('no pass covers them'));
       passes.push(pass);
       const ranges = shotFrames(cuts, segment.target!, fps, pass.shots);
@@ -215,7 +276,10 @@ export async function repairOutputs(
         jobId,
         key: current,
         ranges,
-        ...(pass.crop ? { crop: pass.crop } : {}),
+        // The box is cut at the replace model's aspect so it renders all of it and lines up when blended back.
+        ...(pass.crop
+          ? { crop: repair.aspect ? fitAspect(pass.crop, repair.aspect, width, height) : pass.crop }
+          : {}),
         width,
         height,
         fps,
@@ -235,7 +299,8 @@ export async function repairOutputs(
         const input: SubmitInput = {
           upstreamModel: repair.upstreamModel,
           kind: 'video',
-          prompt: repair.prompt(pass.slots),
+          // Plans cached by versions before slot kinds have none: everyone is a person, as before.
+          prompt: repair.prompt(pass.slots, (job as { kinds?: Record<string, SlotKind> }).kinds ?? {}),
           references: [
             { url: deps.fileUrl!(clip), role: 'reference_video' },
             ...pass.slots.map((slot) => ({
@@ -296,14 +361,16 @@ export async function repairOutputs(
       current = patched.song;
       silent = patched.silent;
       const slots = job.slots.filter((slot) => check.faces![slot]);
+      const { points, owners } = checkPoints(check.faces!, slots);
       const scores = await step
         .do(`${label}:check`, () =>
           deps.composer!.faces({
             jobId,
             key: current,
             originalKey: check.original!,
-            points: slots.map((slot) => check.faces![slot]!),
+            points,
             seconds: segment.target!,
+            windows: checkWindows(points, owners, repair.shots, cuts, segment.target!),
           }),
         )
         .catch((error: unknown) => ({ errored: String(error) }));
@@ -317,12 +384,15 @@ export async function repairOutputs(
         );
       deps.log?.('repair pass checked', { jobId, part: partId, round, pass, scores });
       const unlikeNow = await unlike(ctx, `${label}:likeness`, partId, index, current);
+      const judged = judgeCheck(check.faces!, slots, scores, check.maxSimilarity, cuts);
+      where = judged.where;
       missed = job.slots.filter(
         (slot) =>
-          (slots.includes(slot) && scores[slots.indexOf(slot)]! >= check.maxSimilarity) ||
-          unlikeNow.includes(slot),
+          (judged.missed.includes(slot) && !unlikeNow.passed.includes(slot)) ||
+          unlikeNow.missed.includes(slot),
       );
-      if (missed.length < best.missed) best = { song: current, silent, missed: missed.length };
+      if (missed.length < best.missed)
+        best = { song: current, silent, missed: missed.length, names: missed, swapped: unlikeNow.swapped };
       if (missed.length > 0) continue;
       return (await deliver(`${label}:deliver`, current, silent)) ? composed : null;
     }

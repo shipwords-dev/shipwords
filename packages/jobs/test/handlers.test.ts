@@ -38,6 +38,7 @@ async function setup(balance = 10) {
       log: () => {},
       env: {
         GUEST_COOKIE_SECRET: 'test-secret',
+        OUTPUTS: env.OUTPUTS,
         GENERATION_WORKFLOW: {
           create: async ({ id }: { id: string }) => {
             if (dispatchFails) throw new Error('dispatch error');
@@ -63,8 +64,24 @@ async function setup(balance = 10) {
     create: () => api.create(request('/api/jobs', { modelId: 'paid', prompt: 'a cat' })),
     get: (jobId: string) => api.get(new Request(`https://test.example/api/jobs/${jobId}`), jobId),
     cancel: (jobId: string) => api.cancel(request(`/api/jobs/${jobId}/cancel`), jobId),
+    file: (key: string) => api.file(new Request(`https://test.example/files/${key}`), key),
   };
 }
+
+describe('GET /files', () => {
+  it('serves an output replaced by hand under its new key, once the job succeeded', async () => {
+    const ctx = await setup();
+    const jobId = await createdId(await ctx.create());
+    const replaced = `jobs/${jobId}/0-r1794301409744.mp4`;
+    await env.OUTPUTS.put(replaced, new Uint8Array([1, 2, 3]), {
+      httpMetadata: { contentType: 'video/mp4' },
+    });
+    expect((await ctx.file(replaced)).status).toBe(404);
+    await markSucceeded(db, jobId, [{ key: replaced, mediaType: 'video/mp4' }]);
+    expect((await ctx.file(replaced)).status).toBe(200);
+    expect((await ctx.file(`jobs/${jobId}/0-rx.mp4`)).status).toBe(404);
+  });
+});
 
 async function createdId(response: Response) {
   return ((await response.json()) as { job: { id: string } }).job.id;
