@@ -16,13 +16,12 @@ async function dataUrl(url: string, fetcher: typeof fetch): Promise<string> {
   return `data:${type};base64,${btoa(binary)}`;
 }
 
-export function workersAiDescribe(ai: Ai, options: { model?: string; fetcher?: typeof fetch } = {}) {
-  const model = options.model ?? DESCRIBE_MODEL;
+export function workersAiDescribe(ai: Ai, options: { fetcher?: typeof fetch } = {}) {
   const fetcher = options.fetcher ?? fetch;
   return async (imageUrl: string, instruction: string): Promise<string> => {
     const image = await dataUrl(imageUrl, fetcher);
     const result = (await ai.run(
-      model as never,
+      DESCRIBE_MODEL as never,
       {
         messages: [
           {

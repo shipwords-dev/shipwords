@@ -29,6 +29,7 @@ import {
   checkRanges,
   clampRanges,
   cropPixels,
+  ENCODE,
   matchCuts,
   parseCutTimes,
   parsePoints,
@@ -252,7 +253,7 @@ async function patch(req) {
   // Line the repaired frames up with the ones they replace (align.py); if that fails, stretch them over the box as before.
   try {
     const box = spec.crop ? cropPixels(spec.crop, spec.width, spec.height) : null;
-    const plan = { ranges: clampRanges(spec.ranges, frames), box, fps: spec.fps };
+    const plan = { ranges: clampRanges(spec.ranges, frames), box, fps: spec.fps, encode: ENCODE };
     const { stdout } = await run('python3', ['align.py', video, patchFile, song, JSON.stringify(plan)], {
       maxBuffer: 1 << 20,
     });

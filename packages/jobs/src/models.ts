@@ -181,6 +181,9 @@ export interface EffectCheck {
 
 export type FacePoint = readonly [number, number] | readonly [number, number, number];
 
+/** Most face points (check) or people (likeness) the compose container takes in one call (compose.mjs parsePoints, server.mjs). */
+const CONTAINER_LIMIT = 10;
+
 /** A check.faces entry as a list of points. */
 export function pointsOf(entry: FacePoint | readonly FacePoint[]): readonly FacePoint[] {
   return typeof entry[0] === 'number' ? [entry as FacePoint] : (entry as readonly FacePoint[]);
@@ -203,11 +206,6 @@ export function fillDescriptions(prompt: string, descriptions: Readonly<Record<s
   return prompt.replace(DESCRIBE_TOKEN, (_, slot: string) =>
     descriptions[slot] ? `, ${descriptions[slot]}` : '',
   );
-}
-
-/** Slots whose appearance a prompt asks for. */
-export function describedSlots(prompt: string): string[] {
-  return [...new Set([...prompt.matchAll(DESCRIBE_TOKEN)].map((match) => match[1]!))];
 }
 
 /** Every non-empty subset of a segment's slots, in slot order. */
@@ -407,6 +405,11 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
         throw new Error(
           `model ${modelId}: segment ${segment.id} subjects must map its slots to distinct names (letters, digits, _)`,
         );
+      // Subjects take 2–4 photos: one prep view would leave a subject with a single photo (runner subjectPhotos pads only uploads).
+      for (const slot of Object.keys(segment.subjects)) {
+        if (effect.prep && prepViews(effect.slots.find((candidate) => candidate.id === slot)!).length === 1)
+          throw new Error(`model ${modelId}: subject slot ${slot} needs 2–4 prep views, or none`);
+      }
     }
   }
   for (const slot of effect.slots) {
@@ -417,6 +420,11 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
     )
       throw new Error(`model ${modelId}: slot ${slot.id} prep needs 1–4 prompts`);
   }
+  const prepIds = effect.slots.flatMap((slot) => prepViews(slot).map((_, view) => prepPartId(slot.id, view)));
+  if (new Set(prepIds).size !== prepIds.length)
+    throw new Error(
+      `model ${modelId}: prep part IDs collide (a slot ID ending in -vN next to a slot with views)`,
+    );
   if (effect.describe) {
     const view = effect.describe.view ?? 0;
     if (
@@ -497,6 +505,11 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
       throw new Error(
         `model ${modelId}: segment ${segment.id} check.faces must map this segment's slots to 0–1 points (and 0–60 s)`,
       );
+    // One check call sends every filled slot's points; the compose container takes at most CONTAINER_LIMIT.
+    if (faces.reduce((sum, [, entry]) => sum + pointsOf(entry).length, 0) > CONTAINER_LIMIT)
+      throw new Error(
+        `model ${modelId}: segment ${segment.id} check.faces lists more than ${CONTAINER_LIMIT} points`,
+      );
     if (!(check.maxSimilarity > 0 && check.maxSimilarity < 1))
       throw new Error(`model ${modelId}: segment ${segment.id} check.maxSimilarity must be between 0 and 1`);
   }
@@ -543,6 +556,9 @@ function validateRepair(modelId: string, effect: EffectSpec, segment: EffectSegm
     )
       throw new Error(`${where}.crops must map this segment's slots to boxes inside the frame`);
   }
+  // One likeness call scores each likeness slot against every filled slot's photo; the compose container takes at most CONTAINER_LIMIT.
+  if (Object.keys(repair.likeness ?? {}).length * segment.slots.length > CONTAINER_LIMIT)
+    throw new Error(`${where}.likeness: slots × segment slots must be at most ${CONTAINER_LIMIT}`);
   for (const [slot, min] of Object.entries(repair.likeness ?? {})) {
     if (repair.onMiss !== 'deliver') throw new Error(`${where}.likeness needs onMiss 'deliver'`);
     if (!shots.some((slots) => slots.includes(slot)) || !(min > 0 && min < 1))
@@ -619,7 +635,7 @@ function slotInput(value: unknown): { ref: unknown; kind?: SlotKind } | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const { photo, kind } = value as { photo?: unknown; kind?: unknown };
     if (kind !== undefined && kind !== 'person' && kind !== 'pet') return null;
-    return { ref: photo, ...(kind ? { kind } : {}) };
+    return { ref: photo, kind };
   }
   return { ref: value };
 }
@@ -686,9 +702,16 @@ export function effectParts(
     const names = Object.fromEntries(
       used.map((slotId, i) => [slotId, subject(slotId) ? `@${subject(slotId)}` : `@image${i + 1}`]),
     );
+    const usedKinds = Object.fromEntries(used.map((slotId) => [slotId, kinds[slotId]!]));
+    // Only a slot with a prep image can be described; the slots the prompt asked about are the ones it gets descriptions for.
+    const asked: string[] = [];
     const prompt = segment.prompt(names, {
-      kinds: Object.fromEntries(used.map((slotId) => [slotId, kinds[slotId]!])),
-      describe: (slotId) => (describe && used.includes(slotId) ? `{{describe:${slotId}}}` : ''),
+      kinds: usedKinds,
+      describe: (slotId) => {
+        if (!describe || !used.includes(slotId) || !views.has(slotId)) return '';
+        if (!asked.includes(slotId)) asked.push(slotId);
+        return `{{describe:${slotId}}}`;
+      },
     });
     const photos = used.flatMap((slotId) => {
       const name = subject(slotId);
@@ -701,7 +724,6 @@ export function effectParts(
         ...(name ? { subject: name } : {}),
       }));
     });
-    const asked = describedSlots(prompt).filter((slotId) => views.has(slotId));
     parts.push({
       id: segment.id,
       upstreamModel: model.upstreamModel,
@@ -716,7 +738,7 @@ export function effectParts(
       parameters: { ...segment.parameters },
       maxCost: segment.maxCost,
       slots: used,
-      kinds: Object.fromEntries(used.map((slotId) => [slotId, kinds[slotId]!])),
+      kinds: usedKinds,
       ...(describe && asked.length > 0
         ? {
             describe: {

@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { DESCRIBE_MODEL, workersAiDescribe } from '../src/describe';
 import {
   defineModels,
-  describedSlots,
   type EffectRepair,
   effectParts,
   fillDescriptions,
@@ -15,12 +14,13 @@ import {
   checkWindows,
   fitAspect,
   judgeCheck,
+  missedAfterLikeness,
   nextRepairPass,
   photoOf,
   shotAt,
   shotGroups,
 } from '../src/repair';
-import { cleanDescription } from '../src/runner';
+import { cleanDescription, subjectPhotos } from '../src/runner';
 
 // Person swaps: several prep views per person sent as upstream subjects, person/pet slots, descriptions in the prompt, and repair planning.
 
@@ -53,7 +53,7 @@ const swapModel: ModelDefinition = {
         id: 'full',
         referenceVideo: 'assets/demo/full.mp4',
         slots: ['lead', 'keys', 'sax'],
-        subjects: { lead: 'Lead', keys: 'Keys' },
+        subjects: { lead: 'Lead' },
         prompt: (images, { kinds, describe }) =>
           Object.entries(images)
             .map(([slot, name]) => `${slot}=${name}${describe(slot)}(${kinds[slot]})`)
@@ -92,18 +92,18 @@ describe('person swap parts', () => {
     ]);
     const full = parts[4]!;
     expect(full.prompt).toBe(
-      'lead=@Lead{{describe:lead}}(person) keys=@Keys{{describe:keys}}(pet) sax=@image3{{describe:sax}}(person)',
+      'lead=@Lead{{describe:lead}}(person) keys=@image2{{describe:keys}}(pet) sax=@image3(person)',
     );
     expect(full.references).toEqual([
       { url: 'https://site/files/assets/demo/full.mp4', role: 'reference_video' },
       { url: 'prep:lead', role: 'reference_image', slot: 'lead', subject: 'Lead' },
       { url: 'prep:lead-v1', role: 'reference_image', slot: 'lead', subject: 'Lead' },
       { url: 'prep:lead-v2', role: 'reference_image', slot: 'lead', subject: 'Lead' },
-      { url: 'prep:keys', role: 'reference_image', slot: 'keys', subject: 'Keys' },
+      { url: 'prep:keys', role: 'reference_image', slot: 'keys' },
       { url: 'https://site/files/uploads/up_s.png', role: 'reference_image', slot: 'sax' },
     ]);
     expect(full.kinds).toEqual({ lead: 'person', keys: 'pet', sax: 'person' });
-    // The described view is the front (view 1); keys has one view, so its only one. sax has no prep image to describe.
+    // The described view is the front (view 1); keys has one view, so its only one. sax has no prep image: no placeholder.
     expect(full.describe).toEqual({
       instruction: 'say what they look like',
       images: { lead: 'prep:lead-v1', keys: 'prep:keys' },
@@ -128,7 +128,6 @@ describe('person swap parts', () => {
 
   it('fills descriptions after the name and drops the ones it has none for', () => {
     const prompt = 'with @Lead{{describe:lead}}. with @Keys{{describe:keys}}.';
-    expect(describedSlots(prompt)).toEqual(['lead', 'keys']);
     expect(fillDescriptions(prompt, { lead: 'a man in a red shirt' })).toBe(
       'with @Lead, a man in a red shirt. with @Keys.',
     );
@@ -152,6 +151,18 @@ describe('person swap parts', () => {
     );
     expect(withEffect({ segments: [{ ...segment, subjects: { lead: '1st' } }] })).toThrow(/subjects/);
     expect(withEffect({ segments: [{ ...segment, subjects: { nobody: 'Nobody' } }] })).toThrow(/subjects/);
+    // A subject takes 2–4 photos: a slot with one prep view can't be one; a slot without prep can (its upload is padded).
+    expect(withEffect({ segments: [{ ...segment, subjects: { lead: 'Lead', keys: 'Keys' } }] })).toThrow(
+      /keys needs 2–4 prep views/,
+    );
+    expect(withEffect({ segments: [{ ...segment, subjects: { lead: 'Lead', sax: 'Sax' } }] })).not.toThrow();
+    // Generated prep IDs must not collide: lead's second view is prep-lead-v1, so a slot called lead-v1 with prep can't exist.
+    expect(
+      withEffect({
+        slots: [...swapModel.effect!.slots, { id: 'lead-v1', label: 'X', required: false, prep: 'x' }],
+        segments: [{ ...segment, slots: [...segment.slots, 'lead-v1'] }],
+      }),
+    ).toThrow(/prep part IDs collide/);
     const lead = swapModel.effect!.slots[0]!;
     expect(
       withEffect({
@@ -204,6 +215,10 @@ describe('check points', () => {
         [15.3, 18],
       ],
       [[11.925, 14.7]],
+    ]);
+    // A shot shorter than 4 × margin is trimmed by a quarter of its length, so its window stays valid.
+    expect(checkWindows([[0.5, 0.5, 1.2]], ['lead'], [['keys'], ['lead'], ['sax']], [1, 1.5], 3)).toEqual([
+      [[1.125, 1.375]],
     ]);
     // lead's point at 5.4 s is in shot 1, which has lead; a slot not in the point's shot gets the whole output.
     expect(checkWindows([[0.5, 0.5, 0]], ['lead'], shots, [5.333, 11.625, 15], 18)).toEqual([[[0, 18]]]);
@@ -351,5 +366,34 @@ describe('describe and review helpers', () => {
     expect(sent[0]!.text).toContain('- band: delivered with keys not swapped <x>');
     expect(sent[0]!.text).toContain('Result: https://site.example/files/jobs/job_1/1.mp4');
     expect(sent[0]!.html).toContain('&lt;x&gt;');
+  });
+});
+
+describe('subject photos and the likeness rule', () => {
+  it('sends a subject’s photos once each and pads a lone site upload with a second URL', () => {
+    const refs = [
+      { url: 'https://cdn/a.png', role: 'reference_image', subject: 'Lead' },
+      { url: 'https://site/files/uploads/up_l.png', role: 'reference_image', subject: 'Lead' },
+      { url: 'https://site/files/uploads/up_l.png', role: 'reference_image', subject: 'Lead' },
+      { url: 'https://site/files/uploads/up_k.png', role: 'reference_image', subject: 'Keys' },
+      { url: 'https://site/files/uploads/up_k.png', role: 'reference_image', subject: 'Keys' },
+      { url: 'https://cdn/s.png', role: 'reference_image', subject: 'Sax' },
+      { url: 'https://site/files/uploads/up_x.png', role: 'reference_image' },
+    ];
+    expect(subjectPhotos(refs, 'https://site/files/').map((ref) => [ref.url, ref.subject])).toEqual([
+      ['https://cdn/a.png', 'Lead'],
+      ['https://site/files/uploads/up_l.png', 'Lead'],
+      ['https://site/files/uploads/up_k.png', 'Keys'],
+      ['https://site/files/uploads/up_k.png?view=2', 'Keys'],
+      // A lone upstream URL is left as is (validation keeps it from happening); plain references are untouched.
+      ['https://cdn/s.png', 'Sax'],
+      ['https://site/files/uploads/up_x.png', undefined],
+    ]);
+  });
+
+  it('drops a face-check miss that clearly looks like the photo, keeps likeness misses', () => {
+    expect(
+      missedAfterLikeness(['lead', 'sax', 'keys'], ['lead', 'keys'], { missed: ['sax'], passed: ['lead'] }),
+    ).toEqual(['sax', 'keys']);
   });
 });

@@ -12,6 +12,7 @@ import {
   checkWindows,
   fitAspect,
   judgeCheck,
+  missedAfterLikeness,
   nextRepairPass,
   photoOf,
   type RepairPass,
@@ -196,12 +197,11 @@ export async function repairOutputs(
   let current = composed[0]!.key;
   let silent = composed[1]!.key;
   const first = await unlike(ctx, `likeness:${partId}`, partId, index, current);
-  // A face the check matched to the original but that clearly looks like the user's photo is a false alarm (a profile shot keeps the
-  // original's outline); a face that looks like another filled slot's photo is missed however it scored.
-  missed = [
-    ...initial.filter((slot) => !first.passed.includes(slot)),
-    ...first.missed.filter((slot) => !initial.includes(slot)),
-  ];
+  missed = missedAfterLikeness(
+    [...initial, ...first.missed.filter((slot) => !initial.includes(slot))],
+    initial,
+    first,
+  );
   if (first.swapped.length > 0)
     deps.log?.('faces swapped between slots', { jobId, part: partId, slots: first.swapped });
   if (missed.length === 0) return composed;
@@ -222,7 +222,7 @@ export async function repairOutputs(
       return true;
     });
   // The checked version with the fewest missed people so far; a tie keeps the earlier one.
-  let best = { song: current, silent, missed: missed.length, names: missed, swapped: first.swapped };
+  let best = { song: current, silent, missed, swapped: first.swapped };
   /**
    * The passes can't finish the swap. By default the job fails (`failure`, with a refund); under onMiss 'deliver' the paid render
    * has been charged, so the best checked version is delivered and the credits are kept.
@@ -236,10 +236,10 @@ export async function repairOutputs(
       jobId,
       part: partId,
       why,
-      missed: best.missed,
+      missed: best.missed.length,
     });
     ctx.review(
-      `${partId}: delivered with ${best.names.join(', ') || 'nobody'} not swapped or not like their photo` +
+      `${partId}: delivered with ${best.missed.join(', ') || 'nobody'} not swapped or not like their photo` +
         (best.swapped.length ? ` (${best.swapped.join(', ')} on another person's face)` : '') +
         ` after ${why}`,
     );
@@ -386,13 +386,9 @@ export async function repairOutputs(
       const unlikeNow = await unlike(ctx, `${label}:likeness`, partId, index, current);
       const judged = judgeCheck(check.faces!, slots, scores, check.maxSimilarity, cuts);
       where = judged.where;
-      missed = job.slots.filter(
-        (slot) =>
-          (judged.missed.includes(slot) && !unlikeNow.passed.includes(slot)) ||
-          unlikeNow.missed.includes(slot),
-      );
-      if (missed.length < best.missed)
-        best = { song: current, silent, missed: missed.length, names: missed, swapped: unlikeNow.swapped };
+      missed = missedAfterLikeness(job.slots, judged.missed, unlikeNow);
+      if (missed.length < best.missed.length)
+        best = { song: current, silent, missed, swapped: unlikeNow.swapped };
       if (missed.length > 0) continue;
       return (await deliver(`${label}:deliver`, current, silent)) ? composed : null;
     }

@@ -236,7 +236,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
    * Segments whose check found original people and that have repair passes: segment ID → [part index, missed slots, where each was seen
    * (shot indices)].
    */
-  const toRepair = new Map<string, [number, string[], Record<string, number[]>]>();
+  const toRepair = new Map<string, { missed: string[]; where: Record<string, number[]> }>();
   /** Descriptions of the people in each video segment (effect.describe): segment ID → slot → phrase. */
   const descriptions = new Map<string, Record<string, string>>();
   /** Why the delivered job needs a human look; written after it succeeds. */
@@ -260,22 +260,10 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   const submitInput = (job: JobRow, index: number): SubmitInput => {
     const model = deps.models.find((m) => m.id === job.modelId)!;
     const part = partsOf(job, model)[index]!;
-    const resolved = part.references.map((ref) => ({ ...ref, url: resolve(part.id, ref.url) }));
-    const references = resolved.filter(
-      (ref, i) =>
-        !ref.subject ||
-        !resolved.slice(0, i).some((earlier) => earlier.subject === ref.subject && earlier.url === ref.url),
+    const references = subjectPhotos(
+      part.references.map((ref) => ({ ...ref, url: resolve(part.id, ref.url) })),
+      deps.fileUrl?.(''),
     );
-    const files = deps.fileUrl?.('');
-    for (const name of new Set(references.flatMap((ref) => (ref.subject ? [ref.subject] : [])))) {
-      const own = references.filter((ref) => ref.subject === name);
-      if (own.length !== 1 || !files || !own[0]!.url.startsWith(files)) continue;
-      const only = own[0]!;
-      references.splice(references.indexOf(only) + 1, 0, {
-        ...only,
-        url: `${only.url}${only.url.includes('?') ? '&' : '?'}view=2`,
-      });
-    }
     return {
       upstreamModel: part.upstreamModel,
       kind: part.kind ?? model.kind,
@@ -388,7 +376,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     partId: string,
     index: number,
     check: SegmentCheck,
-  ): Promise<boolean | string[] | { missed: string[]; where: Record<string, number[]> }> => {
+  ): Promise<boolean | { missed: string[]; where: Record<string, number[]> }> => {
     const { original, faces } = check;
     const key = partKeys.get(partId);
     if (!key) return true;
@@ -418,7 +406,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           originalKey: original,
           points,
           seconds: check.seconds,
-          ...(windows ? { windows } : {}),
+          windows,
         });
         // points: scores are per check point (a slot can have several), not per slot as cached by older versions.
         return { scores, slots, points: true as const };
@@ -443,7 +431,11 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     deps.log?.('swap not applied', { jobId, part: partId, scores: verdict.scores });
     // Checks cached by older versions don't name their slots; repair needs compose, the container and a public URL for the frames.
     if (check.repair && verdict.slots && setup.compose && deps.composer && deps.fileUrl) {
-      if (!verdict.points) return verdict.slots.filter((_, i) => verdict.scores[i]! >= check.maxSimilarity);
+      if (!verdict.points)
+        return {
+          missed: verdict.slots.filter((_, i) => verdict.scores[i]! >= check.maxSimilarity),
+          where: {},
+        };
       const cuts = deps.models
         .find((m) => m.id === setup.model)
         ?.effect?.segments.find((s) => s.id === partId)?.cuts;
@@ -462,7 +454,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   ] as const) {
     for (let index = from; index < to; index++) {
       const partId = partIds[index]!;
-      if (index >= prepCount && setup.describe?.includes(partId)) {
+      if (setup.describe?.includes(partId)) {
         // Best effort: a failed description leaves it out of the prompt, it never holds up or fails the job.
         const described = await step
           .do(`describe:${partId}`, async (): Promise<Record<string, string>> => {
@@ -610,8 +602,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       if (!check) continue;
       const verdict = await verify(partId, index, check);
       if (verdict === false) return;
-      if (Array.isArray(verdict)) toRepair.set(partId, [index, verdict, {}]);
-      else if (verdict !== true) toRepair.set(partId, [index, verdict.missed, verdict.where]);
+      if (verdict !== true) toRepair.set(partId, verdict);
     }
   }
   let finalOutputs = outputs;
@@ -637,17 +628,17 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     };
     for (const [index, partId] of partIds.entries()) {
       const check = setup.checks?.[partId];
-      const missed = toRepair.get(partId)?.[1];
+      const seen = toRepair.get(partId);
       // A segment with nothing missed still goes through when it has repair passes: its likeness check may ask for some.
-      if (!check || (!missed && !(check.repair && deps.composer && deps.fileUrl))) continue;
+      if (!check || (!seen && !(check.repair && deps.composer && deps.fileUrl))) continue;
       const repaired = await repairOutputs(
         repairContext,
         partId,
         index,
         check,
-        missed ?? [],
+        seen?.missed ?? [],
         composed,
-        toRepair.get(partId)?.[2],
+        seen?.where,
       );
       if (!repaired) return;
     }
@@ -666,6 +657,33 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       })
       .catch((error: unknown) => deps.log?.('review notice failed', { jobId, error: String(error) }));
   }
+}
+
+/**
+ * A subject's photos as the upstream takes them (Kling: 2–4 per subject). Views that fell back to the same photo are sent once; a subject
+ * left with a single photo from the site's own /files (every view fell back to the upload) gets it again under a second URL. That only
+ * works because /files ignores the query string; validateEffect makes sure a subject's slot has 2 views or none, so a prep result never
+ * ends up alone.
+ */
+export function subjectPhotos<T extends { url: string; subject?: string }>(
+  references: readonly T[],
+  files?: string,
+): T[] {
+  const kept = references.filter(
+    (ref, i) =>
+      !ref.subject ||
+      !references.slice(0, i).some((earlier) => earlier.subject === ref.subject && earlier.url === ref.url),
+  );
+  for (const name of new Set(kept.flatMap((ref) => (ref.subject ? [ref.subject] : [])))) {
+    const own = kept.filter((ref) => ref.subject === name);
+    if (own.length !== 1 || !files || !own[0]!.url.startsWith(files)) continue;
+    const only = own[0]!;
+    kept.splice(kept.indexOf(only) + 1, 0, {
+      ...only,
+      url: `${only.url}${only.url.includes('?') ? '&' : '?'}view=2`,
+    });
+  }
+  return kept;
 }
 
 /** A vision model's answer as a prompt phrase: one line, no markup or references, at most 200 characters, no closing period. */

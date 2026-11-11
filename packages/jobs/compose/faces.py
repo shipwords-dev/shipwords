@@ -42,7 +42,8 @@ def faces(image):
     return result
 
 
-def frames(path, seconds, count, with_times=False):
+def frames(path, seconds, count):
+    """(image, seconds) for count frames spread over the first `seconds` of the video."""
     capture = cv2.VideoCapture(path)
     end = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = capture.get(cv2.CAP_PROP_FPS)
@@ -54,7 +55,7 @@ def frames(path, seconds, count, with_times=False):
         capture.set(cv2.CAP_PROP_POS_FRAMES, index)
         ok, image = capture.read()
         if ok:
-            result.append((image, index / fps if fps > 0 else 0.0) if with_times else image)
+            result.append((image, index / fps if fps > 0 else 0.0))
     return result
 
 
@@ -121,7 +122,7 @@ def main():
         nearest = min(originals, key=lambda f: (f[0] - x) ** 2 + (f[1] - y) ** 2, default=None)
         # Only trust a face that is actually near the configured point.
         targets.append(nearest[2] if nearest and (nearest[0] - x) ** 2 + (nearest[1] - y) ** 2 < 0.15 ** 2 else None)
-    sampled = frames(output, seconds, max(SAMPLES, round(seconds * SAMPLES_PER_SECOND)), with_times=True)
+    sampled = frames(output, seconds, max(SAMPLES, round(seconds * SAMPLES_PER_SECOND)))
     if not sampled:
         raise SystemExit('cannot read the output')
     found = [(at, face[2]) for image, at in sampled for face in faces(image)]

@@ -263,7 +263,7 @@ export function clampRanges(ranges, frames) {
   return kept;
 }
 
-const ENCODE = [
+export const ENCODE = [
   '-c:v',
   'libx264',
   '-preset',

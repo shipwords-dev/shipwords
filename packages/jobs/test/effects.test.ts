@@ -1803,6 +1803,39 @@ describe('effect compose', () => {
       // The limit is per shot: a pass re-renders one group of shots with the same people, so front may be in two groups of 3 and 2.
       expect(withExtra([['front', 'edge', 'solo'], ['front', 'extra'], []])).not.toThrow();
       expect(withExtra([['front', 'edge', 'solo', 'extra'], ['front'], []])).toThrow(/at most 3/);
+      // The container takes at most 10 points or people per call: likeness slots × segment slots, and all check points, are capped.
+      const withExtraRepair = (extra: object, faces?: object) => () =>
+        defineModels([
+          {
+            ...repairModel,
+            effect: {
+              ...repairModel.effect!,
+              slots: [...repairModel.effect!.slots, { id: 'extra', label: 'Extra', required: false }],
+              segments: [
+                {
+                  ...band,
+                  slots: [...band.slots, 'extra'],
+                  ...(faces ? { check: { ...band.check!, faces: faces as never } } : {}),
+                  repair: {
+                    ...repair,
+                    onMiss: 'deliver' as const,
+                    shots: [['front', 'edge', 'solo'], ['extra'], []],
+                    ...extra,
+                  },
+                },
+              ],
+            },
+          },
+        ]);
+      expect(withExtraRepair({ likeness: { front: 0.5, edge: 0.5 } })).not.toThrow();
+      expect(withExtraRepair({ likeness: { front: 0.5, edge: 0.5, solo: 0.5 } })).toThrow(/at most 10/);
+      const four = [
+        [0.1, 0.1],
+        [0.2, 0.2],
+        [0.3, 0.3],
+        [0.4, 0.4],
+      ];
+      expect(withExtraRepair({}, { front: four, edge: four, solo: four })).toThrow(/more than 10 points/);
       expect(withRepair({ repair: { ...repair, aspect: 0 } })).toThrow(/aspect/);
       expect(withRepair({ repair: { ...repair, shots: [['front'], ['solo'], ['front']] } })).toThrow(
         /edge must be in some shot/,

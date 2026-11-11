@@ -100,7 +100,7 @@ export function defineGenerationWorkflow(
                     email: env.EMAIL,
                     from: env.EMAIL_FROM,
                     site,
-                    baseURL: (env.APP_URL ?? site.url).replace(/\/$/, ''),
+                    baseURL: baseURL!,
                   }),
                 }
               : {}),
@@ -112,7 +112,7 @@ export function defineGenerationWorkflow(
                     from: env.EMAIL_FROM,
                     to: env.REVIEW_EMAIL,
                     site,
-                    baseURL: (env.APP_URL ?? site.url).replace(/\/$/, ''),
+                    baseURL: baseURL!,
                   }),
                 }
               : {}),

@@ -1,7 +1,8 @@
 """Put a repaired clip back over the frames it was cut from, lined up frame by frame.
 
 Usage: python3 align.py <video.mp4> <patch.mp4> <output.mp4> '<spec JSON>'
-spec: { "ranges": [[start, end), ...] frames, "box": {"x", "y", "w", "h"} pixels or null for the whole frame, "fps": n }
+spec: { "ranges": [[start, end), ...] frames, "box": {"x", "y", "w", "h"} pixels or null for the whole frame, "fps": n,
+        "encode": [ffmpeg output args, compose.mjs ENCODE] }
 
 Replace models don't hand back exactly the frames they were given: they crop to their own aspect, and the background can drift or zoom
 a little over a shot. Stretching the clip over the box then leaves the shelves behind the person misaligned at its edges. Here every
@@ -139,11 +140,14 @@ def main():
     regions = {}
     position = {n: i for i, n in enumerate(targets)}
     transforms = [None] * len(targets)
-    for n in range(total):
-        ok, frame = capture.read()
-        if not ok:
+    # First pass: only the target frames are decoded (grab skips the rest), and it stops after the last one.
+    for n in range(targets[-1] + 1):
+        if not capture.grab():
             break
         if n in position:
+            ok, frame = capture.retrieve()
+            if not ok:
+                continue
             region = frame[box['y']: box['y'] + bh, box['x']: box['x'] + bw]
             transforms[position[n]] = estimate(orb, matcher, region, clip.get(pick[position[n]]), mask)
     matched = sum(t is not None for t in transforms)
@@ -159,7 +163,7 @@ def main():
         ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
          '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{frame_w}x{frame_h}', '-r', str(fps), '-i', '-',
          '-i', video, '-map', '0:v', '-map', '1:a?', '-c:a', 'copy',
-         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', output],
+         *spec['encode'], output],
         stdin=subprocess.PIPE,
     )
     capture = cv2.VideoCapture(video)
@@ -177,7 +181,7 @@ def main():
             alpha = (edge * cover)[..., None]
             region = frame[box['y']: box['y'] + bh, box['x']: box['x'] + bw].astype(np.float32)
             frame[box['y']: box['y'] + bh, box['x']: box['x'] + bw] = (warped * alpha + region * (1 - alpha)).astype(np.uint8)
-        encoder.stdin.write(frame.tobytes())
+        encoder.stdin.write(frame.data)
     encoder.stdin.close()
     if encoder.wait() != 0:
         raise SystemExit('encode failed')

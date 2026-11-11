@@ -6,6 +6,12 @@ import { eq } from 'drizzle-orm';
 import type { StoredOutput } from './lifecycle';
 import type { JobRow } from './schema';
 
+/** Public link of a job's first output, or null. */
+function firstOutputUrl(job: JobRow, baseURL: string): string | null {
+  const [first] = job.outputsJson ? (JSON.parse(job.outputsJson) as StoredOutput[]) : [];
+  return first ? `${baseURL}/files/${first.key}` : null;
+}
+
 /**
  * Email the site owner that a delivered job needs a human look (RunnerDeps.review): which job, whose, why, and the result link.
  * Sent in English to the address in REVIEW_EMAIL; the user isn't told anything beyond their normal result email.
@@ -19,13 +25,13 @@ export function emailReview(options: {
 }) {
   const { email, from, to, site, baseURL } = options;
   return async (job: JobRow, reasons: readonly string[]) => {
-    const [first] = job.outputsJson ? (JSON.parse(job.outputsJson) as StoredOutput[]) : [];
+    const result = firstOutputUrl(job, baseURL);
     const lines = [
       `Job ${job.id} (${job.modelId}) was delivered but needs a look:`,
       ...reasons.map((reason) => `- ${reason}`),
       '',
       `User: ${job.userId ?? 'guest'}`,
-      first ? `Result: ${baseURL}/files/${first.key}` : 'No result file.',
+      result ? `Result: ${result}` : 'No result file.',
     ];
     const text = lines.join('\n');
     const html = (value: string) =>
@@ -67,8 +73,7 @@ export function emailOnFinish(options: {
       });
       return;
     }
-    const [first] = job.outputsJson ? (JSON.parse(job.outputsJson) as StoredOutput[]) : [];
-    const resultURL = first ? `${baseURL}/files/${first.key}` : `${baseURL}/`;
+    const resultURL = firstOutputUrl(job, baseURL) ?? `${baseURL}/`;
     await email.send({
       to: row.email,
       from: sender,

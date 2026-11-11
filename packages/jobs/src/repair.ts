@@ -42,6 +42,22 @@ export function judgeCheck(
   return { missed: slots.filter((slot) => where[slot]), where };
 }
 
+/**
+ * Slots still missed after both checks: a face the swap check matched to the original but that clearly looks like the user's photo is a
+ * false alarm (a profile shot keeps the original's outline); a face the likeness check missed (unlike its photo, or closer to another
+ * filled slot's photo) is missed however it scored. In `slots` order.
+ */
+export function missedAfterLikeness(
+  slots: readonly string[],
+  faceMissed: readonly string[],
+  likeness: { missed: readonly string[]; passed: readonly string[] },
+): string[] {
+  return slots.filter(
+    (slot) =>
+      (faceMissed.includes(slot) && !likeness.passed.includes(slot)) || likeness.missed.includes(slot),
+  );
+}
+
 /** The photo the check and repair use for a slot: its first image (the main prep view), by slot name, or by position in older parts. */
 export function photoOf(
   references: readonly { url: string; role: string; slot?: string }[],
@@ -136,7 +152,7 @@ export function fitAspect(box: CropBox, aspect: number, width: number, height: n
 
 /**
  * Where each check point looks on the output: the shots of its group (shotGroups of the repair shots containing the point's shot), each
- * trimmed by `margin` seconds at inner cuts so a cut that came out a few frames late doesn't mix in the next shot. Points the repair shots
+ * trimmed by `margin` seconds (at most a quarter of the shot) at inner cuts so a cut that came out a few frames late doesn't mix in the next shot. Points the repair shots
  * don't cover (or a slot not in the point's shot) look everywhere: [[0, end]].
  */
 export function checkWindows(
@@ -153,10 +169,13 @@ export function checkWindows(
     const shot = shotAt(cuts, point[2] ?? 0);
     const group = groups.find((candidate) => candidate.shots.includes(shot));
     if (!group || !group.slots.includes(owners[i]!)) return [[0, end]];
-    return group.shots.map((index): [number, number] => [
-      index === 0 ? 0 : bounds[index]! + margin,
-      index === cuts.length ? end : bounds[index + 1]! - margin,
-    ]);
+    return group.shots.map((index): [number, number] => {
+      const trim = Math.min(margin, (bounds[index + 1]! - bounds[index]!) / 4);
+      return [
+        index === 0 ? 0 : bounds[index]! + trim,
+        index === cuts.length ? end : bounds[index + 1]! - trim,
+      ];
+    });
   });
 }
 

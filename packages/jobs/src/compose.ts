@@ -157,15 +157,24 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       const form = new FormData();
       form.set('people', JSON.stringify(input.people.map(({ ranges }) => ({ ranges }))));
       form.set('video', await blobOf(bucket, input.key), 'video.mp4');
-      for (const [i, { photo }] of input.people.entries()) {
-        if ('key' in photo) {
-          form.set(`photo-${i}`, await blobOf(bucket, photo.key), 'photo');
-          continue;
-        }
-        const response = await fetch(photo.url);
-        if (!response.ok) throw new Error(`likeness photo ${i} failed: ${response.status}`);
-        form.set(`photo-${i}`, await response.blob(), 'photo');
-      }
+      // A photo can be listed several times (each likeness slot is also scored against the others' photos): fetch each once, in parallel.
+      const blobs = new Map<string, Promise<Blob>>();
+      const blobFor = (photo: { key: string } | { url: string }) => {
+        const id = 'key' in photo ? `key:${photo.key}` : `url:${photo.url}`;
+        if (!blobs.has(id))
+          blobs.set(
+            id,
+            'key' in photo
+              ? blobOf(bucket, photo.key)
+              : fetch(photo.url).then((response) => {
+                  if (!response.ok) throw new Error(`likeness photo ${photo.url} failed: ${response.status}`);
+                  return response.blob();
+                }),
+          );
+        return blobs.get(id)!;
+      };
+      const photos = await Promise.all(input.people.map(({ photo }) => blobFor(photo)));
+      for (const [i, blob] of photos.entries()) form.set(`photo-${i}`, blob, 'photo');
       const stub = namespace.get(namespace.idFromName(input.jobId));
       const response = await stub.fetch('http://compose/likeness', { method: 'POST', body: form });
       if (!response.ok) throw new Error(`likeness failed: ${response.status} ${await response.text()}`);
