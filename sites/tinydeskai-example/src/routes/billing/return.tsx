@@ -1,12 +1,11 @@
 import { safeRelativePath } from '@shipwords/core/http';
 import { useAccount, waitForOrder } from '@shipwords/core/react/account';
-import { track } from '@shipwords/core/react/track';
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
+import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
-import models from '../../../site.models';
 
-const CREDITS_PER_VIDEO = models[0].credits;
+const CREDITS_PER_VIDEO = 10;
 /** How long to stay after credits arrive before going back, long enough to read the balance. */
 const CONTINUE_DELAY_MS = 3500;
 

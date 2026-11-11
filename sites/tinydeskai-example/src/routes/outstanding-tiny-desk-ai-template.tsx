@@ -5,12 +5,12 @@ import { Faq, type FaqItem, faqJsonLd, GuidePage } from '~/site/guide';
 import { formatPrice } from '~/site/pricing';
 import site from '../../site.config';
 
-// Template page: targets searches like "outstanding tiny desk ai template" and "capcut". Splits the video into shots and 5 spots and explains how it differs from CapCut templates.
+// Template page: targets searches like "outstanding tiny desk ai template" and "capcut". Splits the video into 4 shots and 5 spots and explains how it differs from CapCut templates.
 // It describes the original viral cut as visitors know it (19.06 s, 5 shots, cuts at 1.375 / 6.708 / 13.0 / 16.375 s), with times on the original timeline.
 // This site skips the first 1.4 s side view of the lead (SHOTS on the home page use the output timeline); only the "why it skips the profile shot" section says so.
 
 const PATH = '/outstanding-tiny-desk-ai-template';
-// Our own engineering notes on Hugging Face: an outside source for the trade-offs on this page.
+// Our own engineering notes on Hugging Face (2026-10-30): an outside source for the trade-offs on this page.
 const HF_NOTES = 'https://huggingface.co/blog/gargantuax/tiny-desk-ai-video-face-swap';
 
 // The profile shot has no clip of its own, so it only appears in the table.

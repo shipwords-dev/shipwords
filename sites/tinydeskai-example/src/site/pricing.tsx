@@ -1,18 +1,17 @@
 import { useCheckout } from '@shipwords/core/react/account';
-import { track } from '@shipwords/core/react/track';
 import type { Product } from '@shipwords/core/site';
 import { getRouteApi, Link } from '@tanstack/react-router';
 import { type MouseEvent, type ReactNode, useEffect, useRef } from 'react';
 import { authClient } from '~/lib/auth';
+import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { openSignIn } from '~/site/sign-in';
 import site from '../../site.config';
-import models from '../../site.models';
 
 // Pricing has no page of its own: the home page #pricing section checks out directly, other entry points (nav, low credits, account, guides) open a dialog,
-// so the visitor stays on the page with the stage photos intact. Unit prices derive from pack credits (site.config.ts) and the per-video price (site.models.ts).
+// so the visitor stays on the page, stage photos intact. Unit prices derive from credits at 10 per video; change prices only in site.config.ts.
 
-const CREDITS_PER_VIDEO = models[0].credits;
+const CREDITS_PER_VIDEO = 10;
 const OPEN_EVENT = 'tinydesk:pricing';
 /** Checkout return and cancel both land here; tool.tsx sees resume, scrolls to the generator and says the stage is intact. */
 const RESUME_PATH = '/?resume=1#make';

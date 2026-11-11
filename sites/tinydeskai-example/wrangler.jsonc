@@ -13,7 +13,9 @@
   "vars": {
     "EMAIL_FROM": "noreply@tinydeskai.example.com",
     // Rybbit collector URL, used only inside the Worker (/stats/* proxy); leave empty to disable.
-    "RYBBIT_UPSTREAM": ""
+    "RYBBIT_UPSTREAM": "",
+    // Delivered jobs whose repair passes couldn't swap everyone (or put a face on the wrong person) also send a note here; empty sends none.
+    "REVIEW_EMAIL": ""
   },
   "d1_databases": [
     {
@@ -25,6 +27,8 @@
   ],
   "r2_buckets": [{ "binding": "OUTPUTS", "bucket_name": "tinydeskai-example-outputs" }],
   "send_email": [{ "name": "EMAIL" }],
+  // Workers AI: describes each person's prepped reference photo in one phrase for the video prompt (effect.describe).
+  "ai": { "binding": "AI" },
   "workflows": [
     {
       "name": "tinydeskai-example-generation",

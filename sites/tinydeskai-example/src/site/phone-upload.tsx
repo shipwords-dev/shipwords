@@ -1,8 +1,8 @@
 import { ApiError } from '@shipwords/core/react/account';
-import { track } from '@shipwords/core/react/track';
 import { uploadReference } from '@shipwords/jobs/react';
 import { useEffect, useRef, useState } from 'react';
 import { renderSVG } from 'uqr';
+import { track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 
 // Upload photos from a phone by QR code (server side in handoff.server.ts).

@@ -1,6 +1,6 @@
-// 静态资源层不处理 Range（总是 200 整个文件），iPhone Safari 播放 <video> 要求服务器支持字节范围（206）。
-// 视频路径交给 Worker（wrangler.jsonc 的 assets.run_worker_first），从静态资源取出整个文件后按 Range 切片。
-// 样片都在 2 MB 以内，整块读进内存切片足够。
+// Static assets ignore Range (always 200 with the whole file), but iPhone Safari needs byte ranges (206) to play <video>.
+// Video paths go to the Worker (assets.run_worker_first in wrangler.jsonc), which fetches the whole file from static assets and slices it by Range.
+// Sample videos are all under 2 MB, so reading the whole file into memory to slice is fine.
 
 export const VIDEO_PATH = /^\/media\/[^/]+\.mp4$/;
 
@@ -15,7 +15,7 @@ export async function serveVideo(request: Request, assets: Fetcher): Promise<Res
   }
   const body = await file.arrayBuffer();
   const size = body.byteLength;
-  // bytes=-N 是最后 N 个字节；bytes=N- 到文件末尾。
+  // bytes=-N is the last N bytes; bytes=N- runs to the end of the file.
   const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
   const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
   if (start >= size || start > end) {

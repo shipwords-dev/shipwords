@@ -39,7 +39,7 @@ const freeWays = () => [
   },
 ];
 
-// Competitor data: home and pricing pages checked site by site on 2026-10-30; these are the sites ChatGPT ranked highest at the time.
+// Competitor data: home and pricing pages checked site by site on 2026-11-09; these are the sites ChatGPT ranked highest (tiny-desk-ai.com and clipremake.com added on 11-09).
 const generators = (): {
   name: string;
   url?: string;
@@ -58,6 +58,24 @@ const generators = (): {
     sound: m.guides_free_gen_song_silent(),
   },
   {
+    name: 'tiny-desk-ai.com',
+    url: 'https://tiny-desk-ai.com/pricing',
+    people: '1–5',
+    length: '18 s',
+    quality: '720p',
+    price: '$8.90',
+    sound: m.guides_free_gen_song_silent(),
+  },
+  {
+    name: 'clipremake.com',
+    url: 'https://clipremake.com/templates/tiny-desk-ai-video',
+    people: m.guides_free_gen_lead_required(),
+    length: '15 s',
+    quality: m.guides_free_gen_not_stated(),
+    price: '$9.99',
+    sound: m.guides_free_gen_song(),
+  },
+  {
     name: 'outstandingtinydesk.net',
     url: 'https://outstandingtinydesk.net/pricing',
     people: m.guides_free_gen_up_to_5(),
@@ -69,7 +87,7 @@ const generators = (): {
   {
     name: 'tinydeskai.tv',
     url: 'https://tinydeskai.tv/pricing',
-    people: '1–2',
+    people: '1–5',
     length: '15 s',
     quality: '720p / 1080p',
     price: '$9.99 / $24.99',
@@ -96,8 +114,8 @@ const generators = (): {
   {
     name: 'tinydesk.video',
     url: 'https://tinydesk.video/',
-    people: '1',
-    length: '11 s',
+    people: '1–5',
+    length: '15 s',
     quality: '480p / 720p',
     price: '$9.90 / $14.90',
     sound: m.guides_free_gen_song(),

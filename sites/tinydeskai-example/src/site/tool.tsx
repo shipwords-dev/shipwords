@@ -1,5 +1,4 @@
 import { ApiError } from '@shipwords/core/react/account';
-import { track } from '@shipwords/core/react/track';
 import {
   acceptsUpload,
   type PublicJob,
@@ -18,6 +17,7 @@ import {
   useState,
 } from 'react';
 import { authClient } from '~/lib/auth';
+import { identify, track } from '~/lib/track';
 import { m } from '~/paraglide/messages.js';
 import { openAccount } from '~/site/account';
 import { PhoneHandoff } from '~/site/phone-upload';
@@ -27,8 +27,9 @@ import site from '../../site.config';
 import models from '../../site.models';
 
 // The generator on the home page: a stage image with a round face slot on each of the 5 musicians. Click one to upload a photo.
-// The 5 slots start with 5 dogs (the same cast as the hero dog version; every competitor's sample is people, so dogs set us apart): click a dog to swap in your photo,
-// × on your photo puts the dog back, × on a dog keeps the original coach. At least 1 photo of your own; same price for 1–5 people. Sign in (Google One Tap), then buy credits; no free trial. Design: DESIGN.md "Upload area".
+// The 5 slots start with 5 dogs (the same cast as the hero dog version; every competitor's sample is people, so dogs set us apart, decided 2026-10-28): click a dog to swap in your photo,
+// × on your photo puts the dog back, × on a dog keeps the original coach. At least 1 photo of your own; same price for 1–5 people.
+// Sign in (Google One Tap), then buy credits; no free trial. Design: DESIGN.md "Upload stage".
 
 const MODEL = models[0];
 const SLOTS = MODEL.effect.slots;
@@ -38,8 +39,8 @@ const PRICE = PRODUCT ? formatPrice(PRODUCT) : '';
 /**
  * The stage image public/media/stage.jpg is three frames of the viral clip (left: band at 16.8 s, top right: lead at 9.8 s, bottom right: sax at 14.9 s), 1020×960.
  * stage-ours.jpg is the hero output at the same moments (the output starts at 1.375 s of the original, so each minus 1.375) with the same scale and crop; the slot coordinates fit both images.
- * x and y are each face center as a percent of stage width and height; size is the slot diameter as a percent of stage width. Remeasure if the image changes.
  * stage-dogs.jpg is the dog output cut the same way, except the band frame is at 15.1 s (at 15.425 s the golden retriever raises what looks like a human hand); faces sit in the same places.
+ * x and y are each face center as a percent of stage width and height; size is the slot diameter as a percent of stage width. Remeasure if the image changes.
  * edge: the face touches the stage's left edge, so the name label is left-aligned and not clipped on narrow screens.
  */
 const SEATS: Record<
@@ -66,10 +67,9 @@ const PRESETS = [
   { id: 'back', label: m.common_preset_back, slots: ['backLeft', 'backRight'] },
 ];
 
-// The default dogs (public/media/dogs/, the 5 from the hero dog version). The stage shows 192px face crops (*-face.jpg), about 40 KB per home page load;
-// the order swaps in the same-named half-body photo (768×1024, the model needs the clothes too).
-// The server only accepts /files/uploads/ paths from the upload API, and uploads are cleaned up after 2 days, so fixed files cannot be placed there;
-// the browser uploads the slots that are still dogs at order time.
+// The default dogs (public/media/dogs/, the 5 from the hero dog version). The stage shows 192px face crops (*-face.jpg), about 40 KB
+// per home page load; the order swaps in the same-named half-body photo (768×1024, the model needs the clothes too). The server only
+// accepts /files/uploads/ paths from the upload API, and uploads are cleaned up after 2 days, so the browser uploads the slots still dogs at order time.
 const DOGS: Record<string, string> = {
   lead: '/media/dogs/lead-face.jpg',
   sax: '/media/dogs/sax-face.jpg',
@@ -93,6 +93,8 @@ const root = getRouteApi('__root__');
 
 // Stage photos and the consent are kept in sessionStorage, so the stage survives leaving for checkout or a reload.
 const PHOTOS_KEY = 'tinydesk:photos';
+// Photos the user marked as pets (by photo path, so they follow drag moves); the dogs on the stage are pets already and are not stored.
+const PETS_KEY = 'tinydesk:pets';
 const CONSENT_KEY = 'tinydesk:consent';
 
 function store(key: string, value: unknown) {
@@ -153,9 +155,13 @@ export function TinyDeskTool({
   // Slot under the pointer while a file is dragged in from the desktop: dropping uploads the photo here.
   const [fileTarget, setFileTarget] = useState<string | null>(null);
 
+  // Your own photos count as people by default; the paw at the face's top left marks one as a pet, and the server then gives fur and paws only to pets (no more furry human hands).
+  const [pets, setPets] = useState<string[]>([]);
+
   useEffect(() => {
     const saved = load<Record<string, string>>(PHOTOS_KEY);
     if (saved) setPhotos(saved);
+    setPets(load<string[]>(PETS_KEY) ?? []);
     if (load<boolean>(CONSENT_KEY)) setConsent(true);
     // Back from checkout (RESUME_PATH in pricing.tsx): show a notice, then drop resume from the URL so a reload does not repeat it.
     const url = new URL(window.location.href);
@@ -167,6 +173,11 @@ export function TinyDeskTool({
       window.history.replaceState(window.history.state, '', url);
     }
   }, []);
+
+  const userId = session.data?.user.id;
+  useEffect(() => {
+    if (userId) identify(userId);
+  }, [userId]);
 
   // Results: only jobs seen going from running to done/failed on this page; jobs already finished on load are not recorded again.
   const statuses = useRef(new Map<string, PublicJob['status']>());
@@ -188,6 +199,14 @@ export function TinyDeskTool({
     track('generate_failed', { code: error.code ?? 'unknown' });
     if (error.code === 'insufficient_credits') openPricing('insufficient_credits');
   }, [error]);
+
+  function togglePet(photo: string) {
+    setPets((current) => {
+      const next = current.includes(photo) ? current.filter((p) => p !== photo) : [...current, photo];
+      store(PETS_KEY, next);
+      return next;
+    });
+  }
 
   function changePhotos(update: (current: Record<string, string>) => Record<string, string>) {
     setPhotos((current) => {
@@ -366,9 +385,18 @@ export function TinyDeskTool({
   async function start() {
     setUploadError(null);
     setPreparing(true);
-    const slots = await uploadDogs(photosRef.current);
+    const current = photosRef.current;
+    const uploaded = await uploadDogs(current);
     setPreparing(false);
-    if (!slots) return;
+    if (!uploaded) return;
+    // Dogs and photos marked as pets are sent with kind: 'pet'; the rest are treated as people.
+    const slots = Object.fromEntries(
+      Object.entries(uploaded).map(([id, path]) => {
+        const photo = current[id];
+        const pet = isDog(photo) || (photo !== undefined && pets.includes(photo));
+        return [id, pet ? { photo: path, kind: 'pet' as const } : path];
+      }),
+    );
     const job = await generate({ modelId: MODEL.id, slots });
     if (!job) return;
     track('generate_started', { faces: own.length, dogs: filled.length - own.length, another: rendering });
@@ -490,6 +518,18 @@ export function TinyDeskTool({
                 />
               </label>
               <span className="member-name">{seat.short()}</span>
+              {photo && !isDog(photo) && (
+                <button
+                  type="button"
+                  className={pets.includes(photo) ? 'face-kind face-kind-on' : 'face-kind'}
+                  aria-pressed={pets.includes(photo)}
+                  aria-label={m.common_tool_pet({ member: member.toLowerCase() })}
+                  title={m.common_tool_pet({ member: member.toLowerCase() })}
+                  onClick={() => togglePet(photo)}
+                >
+                  🐾
+                </button>
+              )}
               {photo && (
                 <button
                   type="button"
@@ -533,7 +573,7 @@ export function TinyDeskTool({
         {m.common_tool_consent()}
       </label>
 
-      {/* With only some seats swapped, say the remaining dogs stay in the video: one order swapped only the lead and expected the other seats not to count. */}
+      {/* With only some seats swapped, say the remaining dogs stay in the video: a complaint came from an order that swapped only the lead and expected the other seats not to count. */}
       {own.length > 0 && dogsLeft > 0 && (
         <p className="notice">{m.common_tool_dogs_left({ count: dogsLeft, total: SLOTS.length })}</p>
       )}

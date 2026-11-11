@@ -49,6 +49,15 @@ const VIRAL = [
   },
 ];
 
+// Real outputs: in its 11-09 recheck ChatGPT marked us down for having no real sample going from input photos to a full video. Only checkable facts here:
+// the dog and people versions were both single Kling 4.0 Edit renders on 10-28,
+// and the new-lead clip used the older 10-27 pipeline (Seedance 2.0 Mini), stated as such.
+const RESULTS: { title: () => string; text: () => string; flaw?: () => string }[] = [
+  { title: m.home_results_dogs_title, text: m.home_results_dogs_text, flaw: m.home_results_dogs_flaw },
+  { title: m.home_results_faces_title, text: m.home_results_faces_text },
+  { title: m.home_results_lead_title, text: m.home_results_lead_text },
+];
+
 // Meme origin. Dates checked: NPR published 2023-06-05; Outstanding is from The Gap Band IV (1982).
 const ORIGIN = [
   { when: m.home_origin_2023_when, text: m.home_origin_2023_text },
@@ -320,6 +329,21 @@ function HomePage() {
             </li>
           ))}
         </ol>
+      </section>
+
+      <section className="band" id="results">
+        <p className="kicker">{m.home_results_kicker()}</p>
+        <h2>{m.home_results_title()}</h2>
+        <p className="muted">{m.home_results_intro()}</p>
+        <ul className="steps">
+          {RESULTS.map((item) => (
+            <li key={item.title()}>
+              <h3>{item.title()}</h3>
+              <p>{item.text()}</p>
+              {item.flaw && <p className="muted">{item.flaw()}</p>}
+            </li>
+          ))}
+        </ul>
       </section>
 
       <section className="sheet" id="how">
