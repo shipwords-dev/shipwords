@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { definePublicModels, type EffectSlot, serverModels } from '../src/models';
+import { definePublicModels, type EffectSlot, effectParts, serverModels } from '../src/models';
 
 const catalog = definePublicModels([
   {
@@ -44,6 +44,35 @@ const server = {
 } as const;
 
 describe('public and server model files', () => {
+  it('preserves server-only sheet prompts through the public catalog merge', () => {
+    const [, effect] = serverModels(catalog, {
+      ...server,
+      effect: {
+        ...server.effect,
+        maxCost: '1.04',
+        effect: {
+          slots: [{ id: 'a', label: 'A', required: true, prepSheet: 'four views' }],
+          prep: { upstreamModel: 'vendor/image', parameters: {}, maxCost: '0.04' },
+          describe: { instruction: 'Describe clothes', view: 1 },
+          segments: [{ ...segment, subjects: { a: 'Lead' } }],
+        },
+      },
+    });
+    const parts = effectParts(
+      effect!,
+      { a: 'https://example.com/a.png' },
+      (ref) => String(ref),
+      (key) => `https://example.com/${key}`,
+    )!;
+    expect(parts.map((part) => part.id)).toEqual(['prep-a', 'full']);
+    expect(parts[0]).toMatchObject({ prepSheet: true, prompt: 'four views' });
+    expect(parts[1]!.references.filter((ref) => ref.subject === 'Lead')).toHaveLength(4);
+    expect(() =>
+      definePublicModels([
+        { ...catalog[1], effect: { slots: [{ id: 'a', label: 'A', required: true, prepSheet: 'secret' }] } },
+      ]),
+    ).toThrow(/slot prepSheet/);
+  });
   it('joins each public model with its server fields', () => {
     const [image, effect] = serverModels(catalog, server);
     expect(image).toMatchObject({ id: 'image', credits: 5, upstreamModel: 'vendor/image' });

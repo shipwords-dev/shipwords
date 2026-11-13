@@ -357,7 +357,11 @@ export function serverModels<const T extends readonly PublicModel[]>(
       )
         throw new Error(`model ${model.id}: server effect slots must match site.models.ts apart from prep`);
       const slots = serverSlots
-        ? publicSlots.map((slot, i) => ({ ...slot, prep: serverSlots[i]?.prep }))
+        ? publicSlots.map((slot, i) => ({
+            ...slot,
+            prep: serverSlots[i]?.prep,
+            ...(serverSlots[i]?.prepSheet !== undefined ? { prepSheet: serverSlots[i]!.prepSheet } : {}),
+          }))
         : publicSlots;
       return { ...fields, ...model, effect: { ...fields.effect, slots } };
     }),
