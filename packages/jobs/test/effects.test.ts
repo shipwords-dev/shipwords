@@ -2578,6 +2578,47 @@ describe('four-view sheets', () => {
       vi.restoreAllMocks();
     }
   });
+  it('retries a partial crop write without submitting another image task', async () => {
+    const { jobId, adapter, split, runDeps } = await setup();
+    let interrupted = false;
+    const bucket = new Proxy(env.OUTPUTS, {
+      get(target, key) {
+        if (key === 'put')
+          return async (...args: Parameters<R2Bucket['put']>) => {
+            if (args[0].endsWith('prep-left-1.png') && !interrupted) {
+              interrupted = true;
+              throw new Error('write interrupted');
+            }
+            return target.put(...args);
+          };
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const steps = durableSteps();
+    await runGeneration({ ...runDeps, bucket }, jobId, {
+      ...steps,
+      async do(name, fn) {
+        if (name.startsWith('split:'))
+          return steps.do(name, async () => {
+            try {
+              return await fn();
+            } catch {
+              return fn();
+            }
+          });
+        return steps.do(name, fn);
+      },
+    });
+    expect(interrupted).toBe(true);
+    expect(split).toHaveBeenCalledTimes(2);
+    expect(adapter.submits).toHaveLength(2);
+    expect((await loadJob(db, jobId))?.status).toBe('succeeded');
+    for (let view = 0; view < 4; view++) {
+      const object = await env.OUTPUTS.get(`jobs/${jobId}/prep-left-${view}.png`);
+      expect(new Uint8Array(await object!.arrayBuffer())).toEqual(new Uint8Array([view + 1]));
+    }
+  });
   it('failed sheet falls back to original photos without splitting', async () => {
     const { jobId, adapter, runDeps, split } = await setup();
     adapter.polls.set(`up_${jobId}:prep-left`, [{ state: 'failed', code: 'rejected', message: 'rejected' }]);
