@@ -283,6 +283,43 @@ function sendFile(res, file, size) {
   createReadStream(file).pipe(res);
 }
 
+async function splitSheet(req) {
+  const form = await new Request('http://local/', {
+    method: 'POST',
+    headers: req.headers,
+    body: req,
+    duplex: 'half',
+  }).formData();
+  const dir = join(ROOT, `sheet-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  try {
+    const source = join(dir, 'source');
+    await save(form, 'image', source);
+    const images = [];
+    for (let view = 0; view < 4; view++) {
+      const target = join(dir, `${view}.png`);
+      await run('ffmpeg', [
+        '-y',
+        '-v',
+        'error',
+        '-i',
+        source,
+        '-vf',
+        `format=rgb24,crop=floor(iw/2):floor(ih/2):${view % 2}*floor(iw/2):${Math.floor(view / 2)}*floor(ih/2):exact=1`,
+        '-frames:v',
+        '1',
+        '-threads',
+        '1',
+        target,
+      ]);
+      images.push((await readFile(target)).toString('base64'));
+    }
+    return images;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 // The process stops itself rather than trusting the platform to stop it: sleepAfter in @cloudflare/containers can renew
 // forever (an unread response body keeps its in-flight count up; re-creating an evicted Durable Object resets the timer),
 // and a running instance bills memory whether or not it works. Calls within one job step come seconds apart, while
@@ -310,6 +347,10 @@ createServer(async (req, res) => {
     });
   }
   try {
+    if (req.method === 'POST' && req.url === '/split-sheet') {
+      const body = JSON.stringify({ images: await splitSheet(req) });
+      return res.writeHead(200, { 'content-type': 'application/json' }).end(body);
+    }
     if (req.method === 'POST' && req.url === '/compose') {
       const song = await compose(req);
       return sendFile(res, song, (await stat(song)).size);

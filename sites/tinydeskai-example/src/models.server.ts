@@ -110,12 +110,7 @@ const CLIP = 'assets/tinydesk/full-17s.mp4';
  */
 const PREP_BASE =
   'Make a realistic reference photo of the main person or animal in this image, for a character reference sheet. Keep exactly the same individual: the same face and features, skin tone or fur, age, hairstyle, glasses and facial hair, with natural skin or fur texture. Only this one subject: remove any other people or animals and their arms or hands, phone status bars, app interface, captions, stickers and watermarks. Keep their own outfit exactly as in the photo, including any wig, hat, glasses and accessories, and keep every logo, letter, number and team mark on the clothes exactly as it is. Plain light wall background, soft even daylight, sharp focus, no added text, labels or borders.';
-const PREP_VIEWS = [
-  `${PREP_BASE} Head-and-shoulders close-up, facing the camera straight on, the face filling most of the frame, relaxed natural smile.`,
-  `${PREP_BASE} Waist-up, facing the camera straight on, arms relaxed at the sides, the whole front of the top and its logo or number clearly visible.`,
-  `${PREP_BASE} Waist-up, body and head turned about 45 degrees to the left in a three-quarter view, looking off to the side, the face clearly visible.`,
-  `${PREP_BASE} Chest-up, full side profile: head and body turned 90 degrees to the right, looking straight ahead, one ear and the whole profile of the face clearly visible.`,
-];
+const PREP_SHEET = `${PREP_BASE} Output exactly one borderless 2 by 2 character reference sheet: four equal rectangular panels covering the entire canvas, with divisions exactly at 50% width and 50% height, no gaps or grid lines. Each panel shows the same individual independently, wholly inside its own panel; do not let heads or bodies cross a panel boundary. Top left: front-facing head-and-shoulders close-up, relaxed natural smile. Top right: front-facing waist-up, arms relaxed, the whole front of the top and its logo or number clearly visible. Bottom left: waist-up, body and head turned 45 degrees to the left, three-quarter view. Bottom right: chest-up, head and body turned 90 degrees to the right, full right-facing profile. Keep identical face, hair, outfit, colors, letters, numbers and team marks across all panels. Do not mirror or invent visible clothing details. Same pale background and lighting in every panel. No labels, captions or borders.`;
 
 export default serverModels(catalog, {
   'tiny-desk': {
@@ -123,7 +118,7 @@ export default serverModels(catalog, {
     upstreamModel: 'klingai/kling-4.0',
     // Kling is quoted at $3.06 (billed as 18 s, same with subject reference), capped at 3.40. A missed swap does not rerun Kling: Pruna repairs it, up to 4 rounds at 0.40 each.
     // Once Kling has charged, credits are not refunded: if someone is still missed after the repairs, the version with the fewest misses is delivered and REVIEW_EMAIL gets a review alert.
-    // Prep is 5 people × 4 views at $0.0085 each (capped at 0.015; a slow one gets a second copy, so 0.60 counting two); descriptions run on Workers AI, under $0.001 per person.
+    // Prep: one four-view sheet per person, cropped locally; five sheets cost $0.0425, capped at $0.075, without hedges.
     // The job cap of 5.60 stays below the net per video of the cheapest pack (10 for $59.99, about 5.80 after fees), so even a fully repaired job breaks even.
     maxCost: '5.60',
     // Usually about 8 minutes (6 to generate, 2 for the face check and compose); each repair round adds a few minutes, plus room for upstream queues.
@@ -131,7 +126,7 @@ export default serverModels(catalog, {
     effect: {
       slots: catalog
         .find((model) => model.id === 'tiny-desk')!
-        .effect!.slots.map((slot) => ({ ...slot, prep: PREP_VIEWS })),
+        .effect!.slots.map((slot) => ({ ...slot, prepSheet: PREP_SHEET })),
       prep: {
         upstreamModel: 'openai/gpt-image-2.5-sunburst',
         parameters: { resolution: '1K', aspect_ratio: '3:4' },

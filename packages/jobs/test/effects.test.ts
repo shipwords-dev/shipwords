@@ -16,7 +16,7 @@ import { defineModels, type EffectSegment, effectParts, type ModelDefinition } f
 import { PREP_HEDGE_MS, runGeneration, type StepRunner } from '../src/runner';
 import { jobs } from '../src/schema';
 import { type PollResult, type SubmitInput, type UpstreamAdapter, UpstreamError } from '../src/upstream';
-import { buildYirRequest } from '../src/yir';
+import { buildYirRequest, YirAdapter } from '../src/yir';
 
 const db = createDb(env.DB);
 
@@ -2505,5 +2505,108 @@ describe('prep and reference audio', () => {
       ]);
       expect((await loadJob(db, jobId))?.status).toBe('succeeded');
     });
+  });
+});
+
+describe('four-view sheets', () => {
+  const model: ModelDefinition = {
+    ...effectModel,
+    maxCost: '0.84',
+    effect: {
+      ...effectModel.effect!,
+      slots: [{ id: 'left', label: 'Left', required: true, prepSheet: 'four equal panels' }],
+      prep: { upstreamModel: 'vendor/image', parameters: {}, maxCost: '0.04' },
+      segments: [{ ...effectModel.effect!.segments[0]!, subjects: { left: 'Lead' } }],
+    },
+  };
+  const sheetModels = defineModels([model]);
+  const splitSheet = () =>
+    vi.fn(async () => Array.from({ length: 4 }, (_, n) => new Uint8Array([n + 1]).buffer));
+  async function setup() {
+    const parts = effectParts(model, { left: '/files/uploads/up_a.png' }, upload, asset)!;
+    const job = await effectJob(
+      { left: '/files/uploads/up_a.png' },
+      { inputJson: JSON.stringify({ parts }) },
+    );
+    const adapter = new FakeAdapter();
+    adapter.polls.set(`up_${job.jobId}:prep-left`, [succeeded('sheet')]);
+    adapter.polls.set(`up_${job.jobId}:left`, [succeeded('video')]);
+    const split = splitSheet();
+    const runDeps = {
+      ...deps(adapter),
+      models: sheetModels,
+      fileUrl: asset,
+      composer: { splitSheet: split } as unknown as Composer,
+    };
+    return { ...job, adapter, split, runDeps, parts };
+  }
+  it('one image task yields four distinct subject photos and retains credits once on replay', async () => {
+    const { jobId, userId, adapter, split, runDeps, parts } = await setup();
+    expect(parts.map((part) => part.id)).toEqual(['prep-left', 'left']);
+    const cache = new Map<string, unknown>();
+    adapter.submitErrors = [null, new Error('evicted')];
+    const steps = durableSteps(cache);
+    await expect(
+      runGeneration(runDeps, jobId, {
+        ...steps,
+        async do(name, fn) {
+          if (name === 'abort') throw new Error('interrupted');
+          return steps.do(name, fn);
+        },
+      }),
+    ).rejects.toThrow('interrupted');
+    await runGeneration(runDeps, jobId, durableSteps(cache));
+    await runGeneration(runDeps, jobId, durableSteps(cache));
+    expect(split).toHaveBeenCalledTimes(1);
+    expect(adapter.submits).toHaveLength(2);
+    const photos = adapter.submits[1]!.input.references.slice(1);
+    expect(photos).toHaveLength(4);
+    expect(new Set(photos.map((photo) => photo.url)).size).toBe(4);
+    expect(photos.every((photo) => photo.subject === 'Lead')).toBe(true);
+    expect((await getBalance(db, userId)).available).toBe(40);
+    expect((await loadJob(db, jobId))?.status).toBe('succeeded');
+  });
+  it('slow sheets never submit speculative copies', async () => {
+    const { jobId, adapter, runDeps } = await setup();
+    adapter.polls.set(`up_${jobId}:prep-left`, [{ state: 'running' }, succeeded('sheet')]);
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now + PREP_HEDGE_MS + 1000);
+    try {
+      await runGeneration(runDeps, jobId, durableSteps());
+      expect(adapter.submits.map((item) => item.key)).toEqual([`${jobId}:prep-left`, `${jobId}:left`]);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+  it('failed sheet falls back to original photos without splitting', async () => {
+    const { jobId, adapter, runDeps, split } = await setup();
+    adapter.polls.set(`up_${jobId}:prep-left`, [{ state: 'failed', code: 'rejected', message: 'rejected' }]);
+    await runGeneration(runDeps, jobId, durableSteps());
+    expect(split).not.toHaveBeenCalled();
+    expect(adapter.submits[1]!.input.references.slice(1)).toHaveLength(2);
+    expect((await loadJob(db, jobId))?.status).toBe('succeeded');
+  });
+  it('real SDK validation rejects invalid video before any prep charge, refunds only once', async () => {
+    const { jobId, userId, adapter, runDeps, parts } = await setup();
+    parts[1]!.references[1]!.subject = 'bad name!';
+    await db
+      .update(jobs)
+      .set({ inputJson: JSON.stringify({ parts }) })
+      .where(eq(jobs.id, jobId));
+    const validator = new YirAdapter({ apiKey: 'unused' });
+    Object.assign(adapter, { validate: validator.validate.bind(validator) });
+    await runGeneration(runDeps, jobId, durableSteps());
+    await runGeneration(runDeps, jobId, durableSteps());
+    expect(adapter.submits).toHaveLength(0);
+    expect((await loadJob(db, jobId))?.status).toBe('failed');
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+  it('split failure prevents video spending and refunds once', async () => {
+    const { jobId, userId, adapter, runDeps, split } = await setup();
+    split.mockRejectedValue(new Error('bad image'));
+    await runGeneration(runDeps, jobId, durableSteps());
+    await runGeneration(runDeps, jobId, durableSteps());
+    expect(adapter.submits).toHaveLength(1);
+    expect((await getBalance(db, userId)).available).toBe(50);
   });
 });

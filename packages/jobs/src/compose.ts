@@ -70,6 +70,8 @@ export interface PatchInput extends ExtractInput {
 }
 
 export interface Composer {
+  /** Crop a borderless 2x2 sheet in row-major order. Read-only and repeatable. */
+  splitSheet?(input: { jobId: string; image: ArrayBuffer }): Promise<ArrayBuffer[]>;
   /** Repeated calls with the same jobId give the same result, safe for Workflow retries. */
   compose(input: ComposeInput): Promise<{ song: ArrayBuffer; silent: ArrayBuffer }>;
   /**
@@ -103,6 +105,21 @@ async function blobOf(bucket: R2Bucket, key: string): Promise<Blob> {
  */
 export function containerComposer(namespace: DurableObjectNamespace, bucket: R2Bucket): Composer {
   return {
+    async splitSheet(input) {
+      const form = new FormData();
+      form.set('image', new Blob([input.image]), 'sheet');
+      const stub = namespace.get(namespace.idFromName(input.jobId));
+      const response = await stub.fetch('http://compose/split-sheet', { method: 'POST', body: form });
+      if (!response.ok) throw new Error(`split sheet failed: ${response.status} ${await response.text()}`);
+      const { images } = (await response.json()) as { images: string[] };
+      if (
+        !Array.isArray(images) ||
+        images.length !== 4 ||
+        images.some((image) => typeof image !== 'string' || !image)
+      )
+        throw new Error('split sheet returned invalid images');
+      return images.map((image) => Uint8Array.from(atob(image), (char) => char.charCodeAt(0)).buffer);
+    },
     async compose(input) {
       const form = new FormData();
       form.set(

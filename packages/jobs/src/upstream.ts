@@ -46,6 +46,8 @@ export class UpstreamError extends Error {
 
 export interface UpstreamAdapter {
   readonly name: string;
+  /** Local structural validation only; must not submit or charge. */
+  validate?(input: SubmitInput): void;
   /** Repeated submits with the same idempotencyKey must return the same upstream task. */
   submit(input: SubmitInput, idempotencyKey: string): Promise<{ upstreamJobId: string }>;
   /** Long poll: waits up to waitSeconds, returns immediately on a state change or completion. */

@@ -114,6 +114,9 @@ export function mockComposer(bucket: R2Bucket, fixed?: { song: string; silent: s
     return object.arrayBuffer();
   }
   return {
+    async splitSheet(input) {
+      return Array.from({ length: 4 }, () => input.image.slice(0));
+    },
     async compose(input) {
       if (fixed) return { song: await read(fixed.song), silent: await read(fixed.silent) };
       const first = input.segments.find((segment) => segment.key.startsWith('jobs/')) ?? input.segments[0];

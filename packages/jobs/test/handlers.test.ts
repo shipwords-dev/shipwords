@@ -69,6 +69,20 @@ async function setup(balance = 10) {
 }
 
 describe('GET /files', () => {
+  it('serves prep crops only while submitted, without caching temporary access', async () => {
+    const ctx = await setup();
+    const jobId = await createdId(await ctx.create());
+    const key = `jobs/${jobId}/prep-backLeft-3.png`;
+    await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    expect((await ctx.file(key)).status).toBe(404);
+    await db.update(jobs).set({ status: 'submitted' }).where(eq(jobs.id, jobId));
+    const response = await ctx.file(key);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    await response.arrayBuffer();
+    await markFailed(db, jobId, 'failed', 'test', 'failed');
+    expect((await ctx.file(key)).status).toBe(404);
+  });
   it('serves an output replaced by hand under its new key, once the job succeeded', async () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());

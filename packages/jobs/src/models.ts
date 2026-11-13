@@ -40,6 +40,8 @@ export interface EffectSlot {
    * the main view. Segments with subjects send every view as that person's photos; elsewhere only the main view is used.
    */
   prep?: string | readonly string[];
+  /** One borderless 2x2 sheet, cropped into four views in row-major order. Mutually exclusive with prep; never hedged. */
+  prepSheet?: string;
 }
 
 /** What a slot's photo shows, as the user marked it; unmarked slots are people. */
@@ -191,6 +193,7 @@ export function pointsOf(entry: FacePoint | readonly FacePoint[]): readonly Face
 
 /** A slot's prep prompts, main view first. */
 export function prepViews(slot: EffectSlot): readonly string[] {
+  if (slot.prepSheet !== undefined) return Array.from({ length: 4 }, () => slot.prepSheet!);
   return slot.prep === undefined ? [] : typeof slot.prep === 'string' ? [slot.prep] : slot.prep;
 }
 
@@ -413,6 +416,8 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
     }
   }
   for (const slot of effect.slots) {
+    if (slot.prepSheet !== undefined && (slot.prep !== undefined || !slot.prepSheet.trim()))
+      throw new Error(`model ${modelId}: slot ${slot.id} needs either prep or a nonempty prepSheet`);
     const views = prepViews(slot);
     if (
       slot.prep !== undefined &&
@@ -441,7 +446,9 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
   const cents = (value: string) => Math.round(Number(value) * 10000);
   if (effect.prep && !(cents(effect.prep.maxCost) > 0))
     throw new Error(`model ${modelId}: prep needs a positive maxCost`);
-  const prepCount = effect.prep ? effect.slots.reduce((sum, slot) => sum + prepViews(slot).length, 0) : 0;
+  const prepCount = effect.prep
+    ? effect.slots.reduce((sum, slot) => sum + (slot.prepSheet ? 1 : prepViews(slot).length * 2), 0)
+    : 0;
   // A slow prep may run twice (runner PREP_HEDGE_MS).
   const total =
     effect.segments.reduce(
@@ -451,7 +458,7 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
         (segment.repair ? segment.repair.rounds * cents(segment.repair.maxCost) : 0),
       0,
     ) +
-    prepCount * 2 * (effect.prep ? cents(effect.prep.maxCost) : 0);
+    prepCount * (effect.prep ? cents(effect.prep.maxCost) : 0);
   if (effect.segments.some((segment) => !(cents(segment.maxCost) > 0)))
     throw new Error(`model ${modelId}: every segment needs a positive maxCost`);
   if (model.maxCost === undefined || total > cents(model.maxCost))
@@ -611,6 +618,8 @@ export interface JobPart {
   id: string;
   /** image for prep segments; defaults to the model's kind. Prep segments come before video segments and finish first. */
   kind?: 'image' | 'video';
+  /** Persisted plan: split this prep result into four views and disable speculative copies. */
+  prepSheet?: true;
   upstreamModel: string;
   prompt: string;
   /** Music only: the user's lyrics. */
@@ -676,10 +685,11 @@ export function effectParts(
       const prompts = prepViews(slot);
       if (prompts.length === 0) continue;
       views.set(slot.id, prompts.length);
-      for (const [view, prompt] of prompts.entries())
+      for (const [view, prompt] of (slot.prepSheet ? [slot.prepSheet] : prompts).entries())
         parts.push({
           id: prepPartId(slot.id, view),
           kind: 'image',
+          ...(slot.prepSheet ? { prepSheet: true as const } : {}),
           upstreamModel: prep.upstreamModel,
           prompt,
           references: [{ url: filled.get(slot.id)!, role: 'reference_image' }],

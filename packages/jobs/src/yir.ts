@@ -4,6 +4,7 @@ import type {
   StandardMusicGenerationRequest,
   StandardVideoGenerationRequest,
 } from '@yir-ai/sdk/shared';
+import { validateGeneration } from '@yir-ai/sdk/shared';
 import {
   type PollResult,
   type SubmitInput,
@@ -94,6 +95,21 @@ export class YirAdapter implements UpstreamAdapter {
       return { upstreamJobId: job.id };
     } catch (error) {
       throw error instanceof UpstreamError ? error : toUpstreamError(error);
+    }
+  }
+
+  validate(input: SubmitInput): void {
+    try {
+      validateGeneration(
+        input.kind === 'video'
+          ? 'generate_video'
+          : input.kind === 'music'
+            ? 'generate_music'
+            : 'generate_image',
+        buildYirRequest(input),
+      );
+    } catch (error) {
+      throw toUpstreamError(error);
     }
   }
 

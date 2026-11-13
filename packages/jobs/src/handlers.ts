@@ -386,7 +386,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
     async file(request: Request, key: string): Promise<Response> {
       // assets/ holds site-provided assets (effect reference videos etc.); file names are chosen by the site, read-only.
       if (
-        !/^(jobs\/job_[a-z0-9]+\/(\d+(-r\d+)?\.[a-z0-9]+|repair-[a-z0-9_-]+-\d+\.mp4)|uploads\/up_[a-z0-9]+\.(png|jpg|webp)|assets\/[a-z0-9][a-z0-9/_-]*\.(mp4|mp3|png|jpg|webp))$/.test(
+        !/^(jobs\/job_[a-z0-9]+\/(\d+(-r\d+)?\.[a-z0-9]+|repair-[a-z0-9_-]+-\d+\.mp4|prep-[A-Za-z0-9_-]+-[0-3]\.png)|uploads\/up_[a-z0-9]+\.(png|jpg|webp)|assets\/[a-z0-9][a-z0-9/_-]*\.(mp4|mp3|png|jpg|webp))$/.test(
           key,
         ) ||
         key.includes('..')
@@ -397,13 +397,14 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
       // Repair inputs (the frames a repair pass hands the upstream) are only served while the job runs.
       const jobId = key.startsWith('jobs/') ? key.split('/')[1] : null;
       const status = jobId ? (await loadJob(core.db, jobId))?.status : null;
-      if (jobId && status !== (key.includes('/repair-') ? 'submitted' : 'succeeded'))
+      const intermediate = key.includes('/repair-') || key.includes('/prep-');
+      if (jobId && status !== (intermediate ? 'submitted' : 'succeeded'))
         return errorResponse(404, 'not_found');
       const head = await env().OUTPUTS.head(key);
       if (!head) return errorResponse(404, 'not_found');
       const headers = new Headers();
       head.writeHttpMetadata(headers);
-      headers.set('cache-control', 'public, max-age=31536000, immutable');
+      headers.set('cache-control', intermediate ? 'no-store' : 'public, max-age=31536000, immutable');
       // Byte ranges: iPhone Safari needs 206 to play stored videos.
       return (await r2Response(env().OUTPUTS, key, request, headers)) ?? errorResponse(404, 'not_found');
     },

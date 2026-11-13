@@ -159,6 +159,9 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       timeoutMinutes: model.timeoutMinutes,
       createdAt: job.createdAt,
       parts,
+      sheets: partsOf(job, model)
+        .filter((part) => part.prepSheet)
+        .map((part) => part.id),
       prep: partsOf(job, model).filter((part) => part.kind === 'image' && model.kind === 'video').length,
       compose: Boolean(model.effect?.compose),
       // Video segments whose prompt waits for descriptions (effect.describe); cached loads from older versions have none.
@@ -257,11 +260,17 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
    * fell back to the same photo are sent once; a subject left with one site photo gets it again under a second URL, since subjects take
    * two photos or more.
    */
-  const submitInput = (job: JobRow, index: number): SubmitInput => {
+  const submitInput = (job: JobRow, index: number, preflight = false): SubmitInput => {
     const model = deps.models.find((m) => m.id === job.modelId)!;
     const part = partsOf(job, model)[index]!;
     const references = subjectPhotos(
-      part.references.map((ref) => ({ ...ref, url: resolve(part.id, ref.url) })),
+      part.references.map((ref) => ({
+        ...ref,
+        url:
+          preflight && ref.url.startsWith(PREP_REF)
+            ? `https://preflight.invalid/${encodeURIComponent(ref.url)}.png`
+            : resolve(part.id, ref.url),
+      })),
       deps.fileUrl?.(''),
     );
     return {
@@ -274,6 +283,31 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       ...(part.maxCost ? { maxCost: part.maxCost } : {}),
     };
   };
+  // Run the installed adapter's local schema validator before any paid image preparation.
+  const ready =
+    !adapter.validate && !setup.sheets?.length
+      ? true
+      : await step.do('preflight', async () => {
+          const job = await activeJob(deps.db, jobId);
+          if (!job) return false;
+          try {
+            if (setup.sheets?.length && (!deps.composer?.splitSheet || !deps.fileUrl))
+              throw new UpstreamError(
+                'prep_sheet_not_configured',
+                'sheet preparation requires a splitter and public file URLs',
+                false,
+              );
+            for (let index = 0; index < partIds.length; index++)
+              adapter.validate?.(submitInput(job, index, true));
+            return true;
+          } catch (error) {
+            if (!(error instanceof UpstreamError) || error.retryable) throw error;
+            await cancelAll(adapter, upstreamIds(job));
+            await markFailed(deps.db, jobId, 'failed', error.code, error.message);
+            return false;
+          }
+        });
+  if (!ready) return;
   /** Poll until done; an empty label uses the single-part step name. */
   const pollUntilDone = async (upstreamJobId: string, label: string | null) => {
     for (let attempt = 0; ; attempt++) {
@@ -331,7 +365,13 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           results: Object.fromEntries(open.map((part, i) => [part.partId, states[i]!])),
           // Decided inside the step: replaying a cached poll must never hedge a prep that has since finished.
           hedge: open
-            .filter((part, i) => late && states[i]!.state === 'running' && !hedged.has(part.partId))
+            .filter(
+              (part, i) =>
+                late &&
+                states[i]!.state === 'running' &&
+                !hedged.has(part.partId) &&
+                !setup.sheets?.includes(part.partId),
+            )
             .map((part) => part.partId),
         };
       });
@@ -560,7 +600,11 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           const model = deps.models.find((m) => m.id === job.modelId)!;
           return partsOf(job, model)[index]!.references[0]!.url;
         });
-        if (original) prepUrls.set(partId, original);
+        if (original) {
+          prepUrls.set(partId, original);
+          if (setup.sheets?.includes(partId))
+            for (let view = 1; view < 4; view++) prepUrls.set(`${partId}-v${view}`, original);
+        }
         return Boolean(original);
       };
       if (upstreamJobId.startsWith(SKIPPED)) {
@@ -586,9 +630,29 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
         return;
       }
       if (index < prepCount) {
-        // Prep results are only reference images for later video segments; not stored or delivered.
+        // Prep images are references, not deliverables; sheets are cropped and stored for the video model.
         const url = result.files[0]?.url;
-        if (url) prepUrls.set(partId, url);
+        if (url && setup.sheets?.includes(partId)) {
+          const urls = await step.do(`split:${partId}`, async () => {
+            if (!(await activeJob(deps.db, jobId))) return null;
+            const keys = Array.from({ length: 4 }, (_, view) => `jobs/${jobId}/${partId}-${view}.png`);
+            // A failed write can resume with the same keys without another upstream generation.
+            const existing = await Promise.all(keys.map((key) => deps.bucket.head(key)));
+            if (!existing.every(Boolean)) {
+              const response = await (deps.fetcher ?? fetch)(url);
+              if (!response.ok) throw new Error(`download prep sheet failed: ${response.status}`);
+              const images = await deps.composer!.splitSheet!({ jobId, image: await response.arrayBuffer() });
+              if (images.length !== 4 || images.some((image) => !image.byteLength))
+                throw new Error('sheet must produce four images');
+              for (const [view, key] of keys.entries())
+                await deps.bucket.put(key, images[view]!, { httpMetadata: { contentType: 'image/png' } });
+            }
+            return keys.map((key) => deps.fileUrl!(key));
+          });
+          if (!urls) return;
+          for (const [view, image] of urls.entries())
+            prepUrls.set(view === 0 ? partId : `${partId}-v${view}`, image);
+        } else if (url) prepUrls.set(partId, url);
         else if (!(await fallBack())) return;
         continue;
       }
