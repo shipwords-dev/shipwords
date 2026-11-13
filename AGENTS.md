@@ -54,6 +54,16 @@ pnpm check:public                          # always in CI: no private-looking va
 - Tests run in workerd with an in-memory D1: no ports, no shared database, safe to run in several worktrees at once.
 - Pure copy or style changes need no new tests.
 
+### Release gate for generation flow changes
+
+Changes to generation models or SDKs, media references, subject grouping, preparation/cropping, configuration merging, orchestration or request construction must pass the checks below before release. **Mock tests, typechecking and a successful build alone are not sufficient.**
+
+- **Exercise the actual site configuration through the full request path.** Load the site's `site.models.ts` and `src/models.server.ts`, then use the real configuration merge, job planner and adapter request builder. A handwritten equivalent fixture is not a substitute. Assert that new fields survive every layer, and check paid task counts, reference counts and roles, subject grouping, prep placeholder resolution and cost caps. Cover all enumerable seat combinations; for unbounded inputs, cover supported modes and boundaries.
+- **Validate with the installed real SDK.** Use the SDK version resolved by the project's lockfile to validate final request structures, including the site's actual combinations such as reference video plus multiple subjects. Verify that required capabilities are compatible with that version; do not mock the validation layer. When SDK validation covers only common structure, also check model-contract limits and do not claim that structural validity guarantees provider acceptance.
+- **Validate before spending.** Check downstream generation requests before any paid preparation. Future media may use structurally equivalent valid placeholder URLs for local validation only; submission must resolve them to real results. Fail deterministic parameter or compatibility errors early rather than spending repeatedly through retries or hedges.
+- **Keep cross-layer regression coverage.** Mocks remain useful for network behavior, races, failures and recovery, but must be accompanied by a repeatable automated check from actual configuration through real request construction to real SDK validation. Configuration and compatibility fixes need regression coverage on that path, not just isolated functions.
+- **Report the validation boundary.** Commit or release notes must identify the actual configuration, SDK version, scenarios and results, distinguishing static contract validation, simulated execution, real media processing and paid end-to-end tests. Static checks must not initiate paid generation by default; paid tests stay within the user's authorized budget. Do not claim end-to-end success without running it. A failed or missing required check blocks release.
+
 ## 5. Preview and deploy
 
 - Preview: in the site directory, `pnpm deploy:preview` (`wrangler versions upload`) returns a preview URL without touching production. Preview versions share the production D1 and R2.
