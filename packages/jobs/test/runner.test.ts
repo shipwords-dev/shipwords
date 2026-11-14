@@ -6,9 +6,10 @@ import { consumeQuota } from '@shipwords/core/quota/counters';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { sumUsd } from '../src/cost';
+import { FAILURE_STREAK, failureStreak } from '../src/failures';
 import { cancelQueued, loadJob, markFailed, markSubmitted, markSucceeded, spendKey } from '../src/lifecycle';
 import { defineModels } from '../src/models';
-import { emailOnFinish } from '../src/notify';
+import { emailFailures, emailOnFinish } from '../src/notify';
 import { runGeneration, type StepRunner } from '../src/runner';
 import { jobs } from '../src/schema';
 import {
@@ -621,5 +622,196 @@ describe('upstream cost', () => {
       settled: false,
     });
     expect(await reply(undefined)).toEqual({ usd: '0', settled: false });
+  });
+});
+
+describe('failure streak alerts', () => {
+  /** A job of the given user, inserted directly; terminal ones have ended at `endedAt`, running ones haven't. */
+  async function jobOf(
+    userId: string | null,
+    status: (typeof jobs.$inferInsert)['status'],
+    endedAt: number,
+    {
+      createdAt = endedAt - 100,
+      errorCode = status === 'failed' ? 'reference_subject_invalid' : null,
+      id = `job_${crypto.randomUUID().replaceAll('-', '')}`,
+      ended = true,
+    } = {},
+  ) {
+    const running = status === 'queued' || status === 'submitted';
+    await db.insert(jobs).values({
+      id,
+      userId,
+      guestId: userId ? null : 'g_1',
+      modelId: 'fast',
+      kind: 'image',
+      prompt: 'a cat',
+      inputJson: '{"references":[],"parameters":{}}',
+      upstream: 'yir',
+      status,
+      errorCode,
+      createdAt,
+      finishedAt: running || !ended ? null : endedAt,
+    });
+    return (await loadJob(db, id))!;
+  }
+  const someone = () => `u_${crypto.randomUUID().slice(0, 10)}`;
+  const alerting = async (rows: Awaited<ReturnType<typeof jobOf>>[]) => {
+    const hits: string[] = [];
+    for (const row of rows) if (await failureStreak(db, row)) hits.push(row.id);
+    return hits;
+  };
+
+  it('alerts once, on the third job to fail in a row; later failures stay quiet', async () => {
+    const userId = someone();
+    const first = await jobOf(userId, 'failed', 1_000);
+    expect(await failureStreak(db, first)).toBeNull();
+    const second = await jobOf(userId, 'failed', 2_000);
+    expect(await failureStreak(db, second)).toBeNull();
+    const third = await jobOf(userId, 'failed', 3_000);
+    expect((await failureStreak(db, third))?.map((job) => job.id)).toEqual([third.id, second.id, first.id]);
+    expect(await failureStreak(db, await jobOf(userId, 'failed', 4_000))).toBeNull();
+    expect(FAILURE_STREAK).toBe(3);
+  });
+
+  it('jobs created in one order and ending in the reverse order alert exactly once', async () => {
+    const userId = someone();
+    // A..F created in order, ending F first and A last (the review's counterexample: it used to alert 4 times out of 6).
+    const rows = [];
+    for (let i = 0; i < 6; i++)
+      rows.push(await jobOf(userId, 'failed', 10_000 - i * 1_000, { createdAt: 1_000 + i }));
+    const hits = await alerting(rows.toReversed());
+    expect(hits).toEqual([rows[3]!.id]);
+  });
+
+  it('checks that run late, after more jobs have ended, still alert exactly once', async () => {
+    const userId = someone();
+    // All four ended before any of them was checked (slow or retried notify steps), checked newest first.
+    const rows = [];
+    for (const at of [1_000, 2_000, 3_000, 4_000]) rows.push(await jobOf(userId, 'failed', at));
+    expect(await alerting(rows.toReversed())).toEqual([rows[2]!.id]);
+  });
+
+  it('a success starts a new count; failures that ended before it keep their own streak', async () => {
+    const userId = someone();
+    await jobOf(userId, 'failed', 1_000);
+    await jobOf(userId, 'failed', 2_000);
+    await jobOf(userId, 'succeeded', 4_000);
+    // Ended third in a row before the success, checked only after it: still that streak's alert.
+    const beforeSuccess = await jobOf(userId, 'failed', 3_000);
+    expect(await failureStreak(db, beforeSuccess)).toHaveLength(3);
+    await jobOf(userId, 'failed', 5_000);
+    const again = await jobOf(userId, 'failed', 6_000);
+    expect(await failureStreak(db, again)).toBeNull();
+    const third = await jobOf(userId, 'failed', 7_000);
+    expect(await failureStreak(db, third)).toHaveLength(3);
+  });
+
+  it('a success and a failure ending in the same millisecond are ordered by id, like the failures', async () => {
+    const userId = someone();
+    const tag = crypto.randomUUID().slice(0, 8);
+    // The review's case: success a and failure b both at 1000, a first by id; b, c, d are three failures after it.
+    await jobOf(userId, 'succeeded', 1_000, { id: `job_${tag}_a` });
+    const b = await jobOf(userId, 'failed', 1_000, { id: `job_${tag}_b` });
+    const c = await jobOf(userId, 'failed', 2_000);
+    const d = await jobOf(userId, 'failed', 3_000);
+    expect(await alerting([b, c, d])).toEqual([d.id]);
+    expect((await failureStreak(db, d))?.map((job) => job.id)).toEqual([d.id, c.id, b.id]);
+    // A failure at 1000 whose id sorts before the success ended before it: an older streak.
+    const other = someone();
+    await jobOf(other, 'failed', 500);
+    await jobOf(other, 'failed', 600);
+    const early = await jobOf(other, 'failed', 1_000, { id: `job_${tag}_0` });
+    await jobOf(other, 'succeeded', 1_000, { id: `job_${tag}_1` });
+    expect(await failureStreak(db, early)).toHaveLength(3);
+  });
+
+  it('failed rows without an end time (written before finishedAt existed) are not counted', async () => {
+    const userId = someone();
+    await jobOf(userId, 'failed', 1_000, { ended: false });
+    await jobOf(userId, 'failed', 2_000);
+    const second = await jobOf(userId, 'failed', 3_000);
+    expect(await failureStreak(db, second)).toBeNull();
+    expect(await failureStreak(db, await jobOf(userId, 'failed', 1_500, { ended: false }))).toBeNull();
+  });
+
+  it('canceled and still running jobs are not in the streak; a running one that fails later counts when it ends', async () => {
+    const userId = someone();
+    await jobOf(userId, 'failed', 1_000);
+    await jobOf(userId, 'canceled', 2_000);
+    const running = await jobOf(userId, 'submitted', 3_000, { createdAt: 500 });
+    await jobOf(userId, 'failed', 4_000);
+    const third = await jobOf(userId, 'failed', 5_000);
+    expect(await failureStreak(db, third)).toHaveLength(3);
+    // The running one (created first) fails now: the fourth to end, no second alert.
+    await markFailed(db, running.id, 'failed', 'YIR_EXECUTION_FAILED', 'down');
+    expect(await failureStreak(db, (await loadJob(db, running.id))!)).toBeNull();
+  });
+
+  it('never for guests, other users or jobs that did not fail', async () => {
+    const userId = someone();
+    await jobOf(userId, 'failed', 1_000);
+    await jobOf(someone(), 'failed', 2_000);
+    await jobOf(userId, 'failed', 3_000);
+    expect(await failureStreak(db, await jobOf(userId, 'succeeded', 4_000))).toBeNull();
+    for (const at of [1_000, 2_000]) await jobOf(null, 'failed', at);
+    expect(await failureStreak(db, await jobOf(null, 'failed', 3_000))).toBeNull();
+  });
+
+  it('the runner alerts after settle; an alert error leaves the failed, refunded job as it is', async () => {
+    const { userId, jobId } = await paidJob();
+    await jobOf(userId, 'failed', 1_000);
+    await jobOf(userId, 'failed', 2_000);
+    const adapter = new FakeAdapter();
+    adapter.polls = [{ state: 'failed', code: 'YIR_EXECUTION_FAILED', message: 'provider down' }];
+    const steps: string[] = [];
+    const alerts: string[][] = [];
+    await runGeneration(
+      {
+        ...deps(adapter),
+        failures: async (failed) => {
+          alerts.push(failed.map((job) => job.id));
+          throw new Error('smtp down');
+        },
+      },
+      jobId,
+      immediateSteps(steps),
+    );
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]![0]).toBe(jobId);
+    expect(steps.slice(-3)).toEqual(['settle', 'failures', 'cost:0']);
+    expect(steps).not.toContain('abort');
+    expect((await loadJob(db, jobId))?.status).toBe('failed');
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
+  it('the alert email names the user and every failed job', async () => {
+    const userId = someone();
+    const failed = [
+      await jobOf(userId, 'failed', Date.UTC(2026, 10, 13, 15, 14)),
+      await jobOf(userId, 'failed', Date.UTC(2026, 10, 13, 15, 9), { errorCode: 'YIR_EXECUTION_FAILED' }),
+    ];
+    const sent: { to: string; subject: string; text: string }[] = [];
+    const email = {
+      send: async (message: { to: string; subject: string; text: string }) => {
+        sent.push(message);
+        return { messageId: 'm1' };
+      },
+    } as unknown as SendEmail;
+    await emailFailures({
+      email,
+      from: 'noreply@example.com',
+      to: 'owner@example.com',
+      site: { name: 'Demo' },
+    })(failed);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      to: 'owner@example.com',
+      subject: `[Demo] 2 failed jobs in a row for user ${userId}`,
+    });
+    expect(sent[0]!.text).toContain(
+      `- ${failed[0]!.id} (fast) ended 2026-11-13T15:14:00.000Z: reference_subject_invalid`,
+    );
+    expect(sent[0]!.text).toContain('YIR_EXECUTION_FAILED');
   });
 });

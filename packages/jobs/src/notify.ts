@@ -47,6 +47,43 @@ export function emailReview(options: {
 }
 
 /**
+ * Email the site owner that a signed-in user's jobs keep failing (RunnerDeps.failures): the user and each failed job, newest first.
+ * Sent in English to the address in REVIEW_EMAIL, once per streak; the user only gets their normal failure emails.
+ */
+export function emailFailures(options: {
+  email: SendEmail;
+  from: string;
+  to: string;
+  site: Pick<SiteConfig, 'name'>;
+}) {
+  const { email, from, to, site } = options;
+  return async (failed: readonly JobRow[]) => {
+    const [latest] = failed;
+    if (!latest) return;
+    const lines = [
+      `User ${latest.userId} has had ${failed.length} jobs fail in a row with no success in between:`,
+      ...failed.map(
+        (job) =>
+          `- ${job.id} (${job.modelId}) ended ${job.finishedAt == null ? '?' : new Date(job.finishedAt).toISOString()}: ${job.errorCode ?? 'no code'}` +
+          (job.errorMessage ? ` ${job.errorMessage.slice(0, 200)}` : ''),
+      ),
+      '',
+      'No further alert for this user until one of their jobs succeeds.',
+    ];
+    const text = lines.join('\n');
+    const html = (value: string) =>
+      value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    await email.send({
+      to,
+      from: { email: from, name: site.name },
+      subject: `[${site.name}] ${failed.length} failed jobs in a row for user ${latest.userId}`,
+      text,
+      html: `<pre>${html(text)}</pre>`,
+    });
+  };
+}
+
+/**
  * When a job ends, email signed-in users so they don't wait on the page: on success a direct result link, on failure that nothing was
  * charged and the credits are back (the runner only notifies after the refund settled). Guest jobs have no email, so nothing is sent.
  * The copy follows the site's defaultLocale.

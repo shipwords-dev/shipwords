@@ -1,6 +1,7 @@
 import type { Db } from '@shipwords/core/db/client';
 import type { Composer } from './compose';
 import { recordCost } from './cost';
+import { failureStreak } from './failures';
 import {
   activeJob,
   appendUpstreamJob,
@@ -55,6 +56,11 @@ export interface RunnerDeps {
    * delivered either way; errors are only logged.
    */
   review?: (job: JobRow, reasons: readonly string[]) => Promise<void>;
+  /**
+   * Tell someone a signed-in user's jobs keep failing (failureStreak: FAILURE_STREAK in a row, the failed jobs newest first). Once
+   * per streak; errors are only logged and don't affect the job.
+   */
+  failures?: (failed: readonly JobRow[]) => Promise<void>;
   log?: (message: string, details: Record<string, unknown>) => void;
 }
 
@@ -100,6 +106,18 @@ export async function runGeneration(deps: RunnerDeps, jobId: string, step: StepR
         return true;
       })
       .catch((error: unknown) => deps.log?.('notify failed', { jobId, error: String(error) }));
+  }
+  const failures = deps.failures;
+  if (failures) {
+    // After settle, so the streak sees this job's final state. Best-effort like notify.
+    await step
+      .do('failures', async () => {
+        const job = await loadJob(deps.db, jobId);
+        const streak = job ? await failureStreak(deps.db, job) : null;
+        if (streak) await failures(streak);
+        return true;
+      })
+      .catch((error: unknown) => deps.log?.('failure alert failed', { jobId, error: String(error) }));
   }
   // Last, since it may wait for billing to settle. Best-effort like notify.
   await recordCost(deps, jobId, step).catch((error: unknown) =>

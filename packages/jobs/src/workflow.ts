@@ -6,7 +6,7 @@ import { workersAiDescribe } from './describe';
 import { markFailed } from './lifecycle';
 import { MockAdapter, mockComposer, mockMode } from './mock';
 import type { ModelDefinition } from './models';
-import { emailOnFinish, emailReview } from './notify';
+import { emailFailures, emailOnFinish, emailReview } from './notify';
 import { runGeneration } from './runner';
 import type { UpstreamAdapter } from './upstream';
 import { YirAdapter } from './yir';
@@ -113,6 +113,12 @@ export function defineGenerationWorkflow(
                     to: env.REVIEW_EMAIL,
                     site,
                     baseURL: baseURL!,
+                  }),
+                  failures: emailFailures({
+                    email: env.EMAIL,
+                    from: env.EMAIL_FROM,
+                    to: env.REVIEW_EMAIL,
+                    site,
                   }),
                 }
               : {}),
