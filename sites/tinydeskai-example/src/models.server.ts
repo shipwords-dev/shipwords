@@ -43,6 +43,9 @@ const list = (names: string[]) =>
  * The animal sentence only covers seats marked as pets (default stage dogs, photos with the paw on); people always get human hands: an all-people job grew furry hands.
  * Keys also shows in the lower right of the sax close-up (half a face) and needs his own sentence, or the original coach stays there.
  * Clothes are worn as in the photo, keeping colors, logos, letters and numbers: customers want their own team's jersey.
+ * The lead is alone in the close-up and holds no instrument: customers care most about those 6 seconds; on 11-14 one lineup was ordered 3 times
+ * and each close-up had a second face in the lower right, and on 11-13 a lead held the saxophone. No replaced performer takes an original
+ * performer's face: a customer in a white cap got the face of the original keyboard coach in his white cap (static validation only, not yet tested in a paid run).
  */
 function editPrompt(images: Readonly<Record<string, string>>, { kinds, describe }: PromptContext) {
   const filled = SEATS.filter((seat) => images[seat]);
@@ -58,6 +61,16 @@ function editPrompt(images: Readonly<Record<string, string>>, { kinds, describe 
         ]
       : []),
     'The lead singer appears only in the close-up shot; the wide band shots show only the keyboard player and the two backing singers, so do not add the lead singer or any other new character to them.',
+    ...(images.lead
+      ? [
+          `${name('lead')} is alone in the close-up shot: no second face, head or shoulder anywhere in that frame, including its edges. ${name('lead')} sings with empty hands there and holds no saxophone, mouthpiece or other instrument.`,
+        ]
+      : []),
+    ...(filled.length
+      ? [
+          'Each replaced performer has only the face from their own reference photos, never the face of a performer from @video_1, even when they wear a similar cap, glasses or clothes.',
+        ]
+      : []),
     ...(pets.length
       ? [
           `${list(pets.map(name))} ${pets.length > 1 ? 'are animals: each becomes' : 'is an animal and becomes'} that animal completely, with its fur, face and paws; every visible hand of that performer, including raised hands, clapping hands, hands on the keyboard and hands partly outside the frame edges, becomes the animal's furry paws with no human fingers or skin.`,
