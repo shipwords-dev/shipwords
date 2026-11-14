@@ -726,6 +726,31 @@ describe('failure streak alerts', () => {
     expect(await failureStreak(db, early)).toHaveLength(3);
   });
 
+  it('failures ended outside the runner pass the alert to the next failure the runner checks', async () => {
+    // The third failure is dispatch_failed (no check runs for it): the fourth, checked by the runner, alerts; the fifth stays quiet.
+    const userId = someone();
+    await jobOf(userId, 'failed', 1_000);
+    await jobOf(userId, 'failed', 2_000);
+    await jobOf(userId, 'failed', 3_000, { errorCode: 'dispatch_failed' });
+    const fourth = await jobOf(userId, 'failed', 4_000);
+    expect(await failureStreak(db, fourth)).toHaveLength(4);
+    expect(await failureStreak(db, await jobOf(userId, 'failed', 5_000))).toBeNull();
+    // Two stale ones in a row at the threshold: the fifth alerts.
+    const other = someone();
+    await jobOf(other, 'failed', 1_000);
+    await jobOf(other, 'failed', 2_000);
+    await jobOf(other, 'failed', 3_000, { errorCode: 'stale' });
+    await jobOf(other, 'failed', 4_000, { errorCode: 'stale' });
+    expect((await failureStreak(db, await jobOf(other, 'failed', 5_000)))?.[0]?.finishedAt).toBe(5_000);
+    // Once the third has alerted, unchecked failures after it don't reopen the alert.
+    const third = someone();
+    await jobOf(third, 'failed', 1_000);
+    await jobOf(third, 'failed', 2_000);
+    expect(await failureStreak(db, await jobOf(third, 'failed', 3_000))).toHaveLength(3);
+    await jobOf(third, 'failed', 4_000, { errorCode: 'dispatch_failed' });
+    expect(await failureStreak(db, await jobOf(third, 'failed', 5_000))).toBeNull();
+  });
+
   it('failed rows without an end time (written before finishedAt existed) are not counted', async () => {
     const userId = someone();
     await jobOf(userId, 'failed', 1_000, { ended: false });
