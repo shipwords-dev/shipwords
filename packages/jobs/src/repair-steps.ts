@@ -62,6 +62,19 @@ export interface RepairContext {
   ) => Promise<Exclude<PollResult, { state: 'running' }> | { state: 'stopped' } | { state: 'timeout' }>;
   /** Mark the job for a human look after it is delivered (people still missed or on the wrong face). */
   review: (reason: string) => void;
+  /** The prep result of a slot's view (repair.photoView), or undefined when the slot has no such view. */
+  prepPhoto: (slot: string, view: number) => string | undefined;
+}
+
+/** A slot's photo for repair passes and the likeness check: its repair.photoView prep view when it has one, else the image the segment sent. */
+function identityPhoto(
+  ctx: RepairContext,
+  view: number | undefined,
+  references: SubmitInput['references'],
+  slots: readonly string[],
+  slot: string,
+): string {
+  return (view !== undefined ? ctx.prepPhoto(slot, view) : undefined) ?? photoOf(references, slots, slot)!;
 }
 
 /** A likeness check: slots that don't look like their photo (or look more like someone else's), and slots that clearly do. */
@@ -114,7 +127,7 @@ async function unlike(
       // Site uploads (the photo itself when prep fell back to it) are read from the bucket, not over HTTP from the site.
       const files = deps.fileUrl?.('') ?? null;
       const photo = (slot: string) => {
-        const url = photoOf(references, filled, slot)!;
+        const url = identityPhoto(ctx, repair.photoView, references, filled, slot);
         return files && url.startsWith(files) ? { key: url.slice(files.length) } : { url };
       };
       // Per likeness slot: its own photo first, then each other filled slot's photo, all over the likeness slot's shots.
@@ -263,7 +276,7 @@ export async function repairOutputs(
         const slots = part.slots ?? [];
         return {
           slots,
-          photos: slots.map((slot) => photoOf(references, slots, slot)!),
+          photos: slots.map((slot) => identityPhoto(ctx, repair.photoView, references, slots, slot)),
           kinds: part.kinds ?? {},
         };
       });

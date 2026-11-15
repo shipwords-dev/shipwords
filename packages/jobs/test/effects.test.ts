@@ -1004,6 +1004,181 @@ describe('effect compose', () => {
     });
     const bytesOf = async (key: string) => new Uint8Array(await (await env.OUTPUTS.get(key))!.arrayBuffer());
 
+    describe('photoView: repair and likeness use a face view while the segment sends a composite', () => {
+      // solo is prepped into a two-panel composite (main view, sent to the video model) and a plain face (view 1).
+      const viewModel: ModelDefinition = {
+        ...repairModel,
+        id: 'demo-repair-views',
+        maxCost: '1.00',
+        effect: {
+          ...repairModel.effect!,
+          slots: repairModel.effect!.slots.map((slot) =>
+            slot.id === 'solo' ? { ...slot, prep: ['solo pair', 'solo face'] } : slot,
+          ),
+          prep: { upstreamModel: 'vendor/image', parameters: { resolution: '1K' }, maxCost: '0.01' },
+          segments: [
+            { ...band, repair: { ...repair, onMiss: 'deliver', likeness: { solo: 0.5 }, photoView: 1 } },
+          ],
+        },
+      };
+      const viewModels = defineModels([viewModel]);
+
+      async function viewJob() {
+        const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
+        const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
+        const parts = effectParts(viewModel, slotPhotos, upload, asset)!;
+        await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
+        await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
+          db.insert(jobs).values({
+            id: jobId,
+            userId,
+            modelId: 'demo-repair-views',
+            kind: 'video',
+            prompt: '',
+            inputJson: JSON.stringify({ parts }),
+            costCredits: 10,
+            upstream: 'yir',
+          }),
+        ]);
+        const adapter = new FakeAdapter();
+        const image = (url: string): PollResult => ({
+          state: 'succeeded',
+          files: [{ url, mediaType: 'image/png' }],
+        });
+        adapter.polls.set(`up_${jobId}:prep-solo`, [image('https://up/solo-pair.png')]);
+        adapter.polls.set(`up_${jobId}:prep-solo-v1`, [image('https://up/solo-face.png')]);
+        adapter.polls.set(`up_${jobId}:band`, [succeeded('band')]);
+        for (const round of [0, 1, 2])
+          adapter.polls.set(`up_${jobId}:band:repair:${round}`, [succeeded(`repair-${round}`)]);
+        return { jobId, adapter };
+      }
+
+      it('the video model gets the composite; the likeness check and the repair pass get the face view; others keep their photo', async () => {
+        const { jobId, adapter } = await viewJob();
+        const composer = new FakeComposer();
+        composer.likenessScores = [[0.4], [0.7]];
+        await runGeneration(
+          { ...deps(adapter), models: viewModels, composer, fileUrl },
+          jobId,
+          durableSteps(),
+        );
+        const video = adapter.submits.find((s) => s.key === `${jobId}:band`)!;
+        expect(
+          video.input.references.filter((ref) => ref.role === 'reference_image').map((ref) => ref.url),
+        ).toEqual([
+          'https://site/files/uploads/up_f.png',
+          'https://site/files/uploads/up_e.png',
+          'https://up/solo-pair.png',
+        ]);
+        expect(composer.likenessChecks[0]!.people.map((person) => person.photo)).toEqual([
+          { url: 'https://up/solo-face.png' },
+          { key: 'uploads/up_f.png' },
+          { key: 'uploads/up_e.png' },
+        ]);
+        const pass = adapter.submits.find((s) => s.key === `${jobId}:band:repair:0`)!;
+        expect(pass.input.references).toEqual([
+          { url: `https://site/files/jobs/${jobId}/repair-band-0.mp4`, role: 'reference_video' },
+          { url: 'https://up/solo-face.png', role: 'reference_image' },
+        ]);
+        expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+      });
+
+      it('a slot without that view keeps its own photo, even next to a slot named like the view', async () => {
+        // front has one prep view; a slot called front-v1 owns the part ID prep-front-v1, which must not become front's photo.
+        const twin: EffectSegment = {
+          ...band,
+          slots: ['front', 'front-v1', 'solo'],
+          check: {
+            ...band.check!,
+            faces: { front: [0.5, 0.5], 'front-v1': [0.1, 0.1], solo: [0.5, 0.4, 3] },
+          },
+          repair: {
+            ...repair,
+            shots: [['front', 'front-v1'], ['solo'], ['front', 'front-v1']],
+            crops: {},
+            onMiss: 'deliver',
+            likeness: { front: 0.5 },
+            photoView: 1,
+          },
+        };
+        const twinModel: ModelDefinition = {
+          ...viewModel,
+          id: 'demo-repair-twin',
+          effect: {
+            ...viewModel.effect!,
+            slots: [
+              { id: 'front', label: 'Front', required: false, prep: 'front prep' },
+              { id: 'front-v1', label: 'Twin', required: false, prep: 'twin prep' },
+              { id: 'solo', label: 'Solo', required: false, prep: ['solo pair', 'solo face'] },
+            ],
+            segments: [twin],
+          },
+        };
+        const twinModels = defineModels([twinModel]);
+        const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
+        const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
+        const photos = {
+          front: '/files/uploads/up_f.png',
+          'front-v1': '/files/uploads/up_t.png',
+          solo: '/files/uploads/up_s.png',
+        };
+        const parts = effectParts(twinModel, photos, upload, asset)!;
+        await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
+        await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
+          db.insert(jobs).values({
+            id: jobId,
+            userId,
+            modelId: 'demo-repair-twin',
+            kind: 'video',
+            prompt: '',
+            inputJson: JSON.stringify({ parts }),
+            costCredits: 10,
+            upstream: 'yir',
+          }),
+        ]);
+        const adapter = new FakeAdapter();
+        const image = (url: string): PollResult => ({
+          state: 'succeeded',
+          files: [{ url, mediaType: 'image/png' }],
+        });
+        adapter.polls.set(`up_${jobId}:prep-front`, [image('https://up/front.png')]);
+        adapter.polls.set(`up_${jobId}:prep-front-v1`, [image('https://up/twin.png')]);
+        adapter.polls.set(`up_${jobId}:prep-solo`, [image('https://up/solo-pair.png')]);
+        adapter.polls.set(`up_${jobId}:prep-solo-v1`, [image('https://up/solo-face.png')]);
+        adapter.polls.set(`up_${jobId}:band`, [succeeded('band')]);
+        const composer = new FakeComposer();
+        await runGeneration(
+          { ...deps(adapter), models: twinModels, composer, fileUrl },
+          jobId,
+          durableSteps(),
+        );
+        expect(composer.likenessChecks[0]!.people.map((person) => person.photo)).toEqual([
+          { url: 'https://up/front.png' },
+          { url: 'https://up/twin.png' },
+          { url: 'https://up/solo-face.png' },
+        ]);
+      });
+
+      it('config: photoView must be a prep view some slot of the segment has', () => {
+        const withView =
+          (photoView: number, model = viewModel) =>
+          () =>
+            defineModels([
+              {
+                ...model,
+                effect: {
+                  ...model.effect!,
+                  segments: [{ ...band, repair: { ...repair, onMiss: 'deliver' as const, photoView } }],
+                },
+              },
+            ]);
+        expect(withView(1)).not.toThrow();
+        expect(withView(2)).toThrow(/photoView/);
+        expect(withView(0)).toThrow(/photoView/);
+        expect(withView(1, { ...repairModel, maxCost: '1.00' })).toThrow(/photoView/);
+      });
+    });
+
     it('a missed edge person: whole wide shots with everyone in them first, then their box alone, then delivered', async () => {
       const { userId, jobId, adapter } = await repairJob();
       const composer = new FakeComposer();

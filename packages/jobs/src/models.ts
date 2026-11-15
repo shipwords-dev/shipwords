@@ -166,6 +166,13 @@ export interface EffectRepair {
    * faces score low even when right.
    */
   likeness?: Readonly<Record<string, number>>;
+  /**
+   * Prep view (1–3) to use as each slot's photo in repair passes and the likeness check, instead of the image the segment sent. For a segment
+   * that sends a composite per person (a two-panel image: face and outfit), point this at a plain face view, so the replace model and the
+   * face check get one face. A slot without that view (no prep, fewer views) uses the image the segment sent; a failed view prep falls back
+   * to the original photo like any prep.
+   */
+  photoView?: number;
 }
 
 export interface EffectCheck {
@@ -570,6 +577,16 @@ function validateRepair(modelId: string, effect: EffectSpec, segment: EffectSegm
   // One likeness call scores each likeness slot against every filled slot's photo; the compose container takes at most CONTAINER_LIMIT.
   if (Object.keys(repair.likeness ?? {}).length * segment.slots.length > CONTAINER_LIMIT)
     throw new Error(`${where}.likeness: slots × segment slots must be at most ${CONTAINER_LIMIT}`);
+  if (
+    repair.photoView !== undefined &&
+    (!Number.isInteger(repair.photoView) ||
+      repair.photoView < 1 ||
+      !effect.prep ||
+      !segment.slots.some(
+        (slotId) => prepViews(effect.slots.find((slot) => slot.id === slotId)!).length > repair.photoView!,
+      ))
+  )
+    throw new Error(`${where}.photoView must be a prep view (1–3) that some slot of this segment has`);
   for (const [slot, min] of Object.entries(repair.likeness ?? {})) {
     if (repair.onMiss !== 'deliver') throw new Error(`${where}.likeness needs onMiss 'deliver'`);
     if (!shots.some((slots) => slots.includes(slot)) || !(min > 0 && min < 1))

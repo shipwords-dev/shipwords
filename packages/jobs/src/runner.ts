@@ -15,7 +15,7 @@ import {
   settleFailure,
   upstreamIds,
 } from './lifecycle';
-import { fillDescriptions, type ModelDefinition, PREP_REF, partsOf } from './models';
+import { fillDescriptions, type ModelDefinition, PREP_REF, partsOf, prepPartId, prepViews } from './models';
 import { composeOutputs, storeOutputs } from './outputs';
 import { checkPoints, checkWindows, judgeCheck } from './repair';
 import { type RepairContext, repairOutputs, type SegmentCheck } from './repair-steps';
@@ -707,6 +707,11 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       submitInput,
       pollUntilDone,
       review: (reason) => reviews.push(reason),
+      // Only a view the slot really has: prep-<slot>-v1 is also the main view's ID of a slot named <slot>-v1.
+      prepPhoto: (slot, view) => {
+        const spec = deps.models.find((m) => m.id === setup.model)?.effect?.slots.find((s) => s.id === slot);
+        return spec && view < prepViews(spec).length ? prepUrls.get(prepPartId(slot, view)) : undefined;
+      },
     };
     for (const [index, partId] of partIds.entries()) {
       const check = setup.checks?.[partId];

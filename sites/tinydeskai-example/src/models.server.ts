@@ -67,7 +67,8 @@ function editPrompt(images: Readonly<Record<string, string>>, { kinds, describe 
   const pets = filled.filter((seat) => kinds[seat] === 'pet');
   const people = filled.filter((seat) => kinds[seat] !== 'pet');
   return [
-    'Edit @video_1. Keep its four shots, exact camera cuts, framing, background, instruments, microphones, headsets, lighting and timing.',
+    'Edit @video_1. Keep its four shots, exact camera cuts, camera movement, framing, background, instruments, microphones, headsets, lighting, timing and video duration.',
+    'The wide shots show only the keyboard player and the two backing singers: do not add the lead singer or any other new person to them.',
     'Each reference image shows one performer. When it has two panels, the left panel is their face and the right panel is their outfit seen from the neck down (for an animal, its body); use both for that performer only and never show the panels themselves.',
     ...filled.map((seat) => `${ROLE[seat]} is ${name(seat)}${describe(seat)}. ${WHERE[seat]}`),
     ...(empty.length
@@ -122,7 +123,7 @@ function repairPrompt(slots: readonly string[], kinds: Readonly<Record<string, S
 const CLIP = 'assets/tinydesk/full-17s.mp4';
 
 /**
- * Each photo becomes one two-panel reference image: a front head-and-shoulders close-up on the left (a large, sharp face) and the front of the outfit
+ * Each photo becomes two prep images (one prep each). The first is a two-panel reference image, sent whole to Kling: a front head-and-shoulders close-up on the left (a large, sharp face) and the front of the outfit
  * from the neck to the waist on the right (jersey number in frame, no second face). A refused or failed prep falls back to the original photo. Outfits
  * stay as is (logos, numbers, wigs, hats): "plain clothes, no logos" erased customers' jerseys (two complaints on 11-09). The base wording was tested on
  * those 10 photos (close-up vs original 0.75–0.88); the two-panel version on three photos: one face each, 0.85–0.95 vs the originals, but drawn down
@@ -130,6 +131,8 @@ const CLIP = 'assets/tinydesk/full-17s.mp4';
  */
 const PREP_BASE =
   'Make a realistic reference photo of the main person or animal in this image, for a character reference sheet. Keep exactly the same individual: the same face and features, skin tone or fur, age, hairstyle, glasses and facial hair, with natural skin or fur texture. Only this one subject: remove any other people or animals and their arms or hands, phone status bars, app interface, captions, stickers and watermarks. Keep their own outfit exactly as in the photo, including any wig, hat, glasses and accessories, and keep every logo, letter, number and team mark on the clothes exactly as it is. Plain light wall background, soft even daylight, sharp focus, no added text, labels or borders.';
+/** The second: a plain face, used only as the identity photo for repair (Pruna) and the likeness check (repair.photoView), never sent to Kling; the replace model would take the two-panel image's headless torso for a second person. */
+const PREP_FACE = `${PREP_BASE} Output one front-facing head-and-shoulders portrait of this individual, centered, relaxed natural smile, face large and sharp, nobody else in the image.`;
 const PREP_PAIR = `${PREP_BASE} Output exactly one borderless 1 by 2 character reference sheet: two equal portrait panels side by side covering the entire canvas, divided exactly at 50% width, with no gap or line between them. Each panel shows the same individual independently, wholly inside its own panel. Left panel: front-facing head-and-shoulders close-up, relaxed natural smile, face large and sharp. Right panel: the same individual front-facing, framed from the neck down to the waist so the face is not shown again; for a person, the whole front of their top with its logo, letters or number and any badge or accessory clearly visible; for an animal, its body and coat. Show only what the photo shows: do not add trousers, shoes or other clothing that is not visible in it. Keep identical skin tone or fur, outfit, colors, letters, numbers and team marks in both panels. Do not mirror or invent visible clothing details. Same pale background and lighting in both panels. No labels, captions or borders.`;
 
 export default serverModels(catalog, {
@@ -138,7 +141,8 @@ export default serverModels(catalog, {
     upstreamModel: 'klingai/kling-4.0',
     // Kling is quoted at $3.06 (billed as 18 s), capped at 3.40. A missed swap does not rerun Kling: Pruna repairs it, up to 4 rounds at 0.40 each.
     // Once Kling has charged, credits are not refunded: if someone is still missed after the repairs, the version with the fewest misses is delivered and REVIEW_EMAIL gets a review alert.
-    // Prep: one two-panel image per person, five cost $0.0425; a slow one gets a hedge copy, so the cap counts two each: $0.15.
+    // Prep: two images per person (two-panel and face), five people cost $0.085; a slow one gets a hedge copy, so the cap counts two each: $0.30.
+    // Caps add up to Kling 3.40 + repair 4×0.40 + prep 0.30 = 5.30.
     // The job cap of 5.60 stays below the net per video of the cheapest pack (10 for $59.99, about 5.80 after fees), so even a fully repaired job breaks even.
     maxCost: '5.60',
     // Usually about 8 minutes (6 to generate, 2 for the face check and compose); each repair round adds a few minutes, plus room for upstream queues.
@@ -146,17 +150,18 @@ export default serverModels(catalog, {
     effect: {
       slots: catalog
         .find((model) => model.id === 'tiny-desk')!
-        .effect!.slots.map((slot) => ({ ...slot, prep: PREP_PAIR })),
+        .effect!.slots.map((slot) => ({ ...slot, prep: [PREP_PAIR, PREP_FACE] })),
       prep: {
         upstreamModel: 'openai/gpt-image-2.5-sunburst',
-        // Two 3:4 portrait panels side by side make 3:2 (1536×1024).
+        // Two 3:4 portrait panels side by side make 3:2 (1536×1024); the ratio applies to every prep, so the face is 3:2 too, centered.
         parameters: { resolution: '1K', aspect_ratio: '3:2' },
         maxCost: '0.015',
       },
-      // Describe the two-panel image (view 0): it shows both face and clothes. Tested with Llama 4 Scout: it names the hairstyle, glasses, jersey colors and number.
+      // Describe the two-panel image (view 0): it shows both face and clothes. The instruction says both panels are one individual, so the
+      // answer doesn't read 'a man shown twice' or 'a headless torso' inside the video prompt. Tested with Llama 4 Scout: it names the hairstyle, glasses, jersey colors and number.
       describe: {
         instruction:
-          'Describe the person or animal in this photo in one short phrase of at most 20 words: for a person their gender, approximate age, hair, facial hair, glasses and outfit with its colors, team name, logos and numbers; for an animal its species, breed and colors. No names and no guesses about who it is. Output only the phrase.',
+          'Describe the person or animal in this photo in one short phrase of at most 20 words. If the photo has two panels, both show the same single individual (a face close-up and their outfit from the neck down): describe that one individual, not the panels. For a person give their gender, approximate age, hair, facial hair, glasses and outfit with its colors, team name, logos and numbers; for an animal its species, breed and colors. No names and no guesses about who it is. Output only the phrase.',
         view: 0,
       },
       segments: [
@@ -210,6 +215,8 @@ export default serverModels(catalog, {
             // Also repair a lead close-up unlike the photo or more like someone else: in six jobs on 10-30/31 the lead scored 0.44–0.66 vs the prepped photo; 0.44 drew a "can't recognize him" complaint.
             // The sax is a side view while playing (always 0.33–0.36) and faces in the wide shots are small, so those scores are unreliable and have no threshold.
             likeness: { lead: 0.5 },
+            // Repair and the likeness check use the second prep image (the face), not the two-panel image sent to Kling.
+            photoView: 1,
           },
         },
       ],
