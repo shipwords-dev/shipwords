@@ -72,6 +72,12 @@ export interface EffectPrep {
   parameters: Readonly<Record<string, unknown>>;
   /** Cost cap per prep run (USD string). */
   maxCost: string;
+  /**
+   * false: a prep still running after PREP_HEDGE_MS never gets a second copy, and the job cap counts one run per prep instead of two.
+   * For sites that would rather wait than pay twice, or whose prep copies could differ (a person image the video model binds to).
+   * Sheets never hedge either way.
+   */
+  hedge?: boolean;
 }
 
 export interface EffectSegment {
@@ -90,6 +96,11 @@ export interface EffectSegment {
    * subject's photo and the prompt refers to it as @Name instead of @imageN. Names are letters, digits and _ (1–32, starting with a letter).
    */
   subjects?: Readonly<Record<string, string>>;
+  /**
+   * How the prompt names the nth reference image (1-based) of a slot without a subject; default `@image${n}`. Upstreams differ: Kling 4.0
+   * on Yir expects `@image_${n}`. Names must start with @ and be distinct.
+   */
+  imageName?: (n: number) => string;
   /** images only contains filled slots; values are how the prompt refers to them (e.g. @image1, or @Lead for a subject). */
   prompt: (images: Readonly<Record<string, string>>, context: PromptContext) => string;
   parameters: Readonly<Record<string, unknown>>;
@@ -407,6 +418,16 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
       if (!slotIds.has(slot))
         throw new Error(`model ${modelId}: segment ${segment.id} uses unknown slot ${slot}`);
     }
+    if (segment.imageName) {
+      const names = segment.slots.map((_, i) => segment.imageName!(i + 1));
+      if (
+        names.some((name) => !/^@[A-Za-z][A-Za-z0-9_]{0,31}$/.test(name)) ||
+        new Set(names).size !== names.length
+      )
+        throw new Error(
+          `model ${modelId}: segment ${segment.id} imageName must give distinct @names (letters, digits, _)`,
+        );
+    }
     if (segment.subjects) {
       const names = Object.values(segment.subjects);
       if (
@@ -458,7 +479,11 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
   if (effect.prep && !(cents(effect.prep.maxCost) > 0))
     throw new Error(`model ${modelId}: prep needs a positive maxCost`);
   const prepCount = effect.prep
-    ? effect.slots.reduce((sum, slot) => sum + (slot.prepSheet ? 1 : prepViews(slot).length * 2), 0)
+    ? effect.slots.reduce(
+        (sum, slot) =>
+          sum + (slot.prepSheet ? 1 : prepViews(slot).length * (effect.prep!.hedge === false ? 1 : 2)),
+        0,
+      )
     : 0;
   // A slow prep may run twice (runner PREP_HEDGE_MS).
   const total =
@@ -731,7 +756,10 @@ export function effectParts(
     rendered++;
     const subject = (slotId: string) => segment.subjects?.[slotId];
     const names = Object.fromEntries(
-      used.map((slotId, i) => [slotId, subject(slotId) ? `@${subject(slotId)}` : `@image${i + 1}`]),
+      used.map((slotId, i) => [
+        slotId,
+        subject(slotId) ? `@${subject(slotId)}` : (segment.imageName?.(i + 1) ?? `@image${i + 1}`),
+      ]),
     );
     const usedKinds = Object.fromEntries(used.map((slotId) => [slotId, kinds[slotId]!]));
     // Only a slot with a prep image can be described; the slots the prompt asked about are the ones it gets descriptions for.

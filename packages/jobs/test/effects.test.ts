@@ -107,6 +107,30 @@ describe('effect slot resolution', () => {
     ]);
   });
 
+  it('imageName renames ungrouped images for upstreams with their own naming; bad names fail at defineModels', () => {
+    const named = (imageName: (n: number) => string) => ({
+      ...effectModel,
+      effect: {
+        ...effectModel.effect!,
+        segments: effectModel.effect!.segments.map((segment) => ({
+          ...segment,
+          imageName,
+          prompt: (images: Readonly<Record<string, string>>) => Object.values(images).join(' '),
+        })),
+      },
+    });
+    const parts = effectParts(
+      named((n) => `@image_${n}`),
+      { left: '/files/uploads/up_a.png', right: '/files/uploads/up_b.png' },
+      upload,
+      asset,
+    )!;
+    expect(parts.find((part) => part.id === 'group')!.prompt).toBe('@image_1 @image_2');
+    expect(() => defineModels([named((n) => `@image_${n}`)])).not.toThrow();
+    expect(() => defineModels([named(() => '@same')])).toThrow(/imageName/);
+    expect(() => defineModels([named((n) => `image ${n}`)])).toThrow(/imageName/);
+  });
+
   it('with all slots optional any combination works: renders segments containing uploaded slots, rejects when none uploaded', () => {
     const open: ModelDefinition = {
       ...effectModel,
@@ -2106,6 +2130,16 @@ describe('prep and reference audio', () => {
 
   it('config validation: prep cost counts twice toward the job cap (hedge copy), reference audio only accepts assets/*.mp3 or https', () => {
     expect(() => defineModels([{ ...prepModel, maxCost: '0.87' }])).toThrow(/exceeds model maxCost/);
+    // Without hedging each prep counts once: 0.04 less fits.
+    expect(() =>
+      defineModels([
+        {
+          ...prepModel,
+          maxCost: '0.84',
+          effect: { ...prepModel.effect!, prep: { ...prepModel.effect!.prep!, hedge: false } },
+        },
+      ]),
+    ).not.toThrow();
     expect(() =>
       defineModels([
         {
@@ -2412,6 +2446,36 @@ describe('prep and reference audio', () => {
         return poll(id);
       };
     };
+
+    it('hedge: false — a prep still running past the hedge time is waited for, never copied', async () => {
+      const { jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
+      const adapter = new FakeAdapter();
+      adapter.polls.set(`up_${jobId}:prep-left`, [
+        { state: 'running' },
+        { state: 'running' },
+        image('https://up/left-prep.png'),
+      ]);
+      finishVideo(adapter, jobId);
+      lateClock(adapter);
+      const noHedge = defineModels([
+        {
+          ...prepModel,
+          effect: { ...prepModel.effect!, prep: { ...prepModel.effect!.prep!, hedge: false } },
+        },
+      ]);
+      try {
+        await runGeneration({ ...deps(adapter), models: noHedge }, jobId, durableSteps());
+      } finally {
+        vi.restoreAllMocks();
+      }
+      expect(adapter.submits.map((s) => s.key)).toEqual([
+        `${jobId}:prep-left`,
+        `${jobId}:left`,
+        `${jobId}:group`,
+      ]);
+      expect(adapter.submits[1]!.input.references[1]!.url).toBe('https://up/left-prep.png');
+      expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+    });
 
     it('prep still running past the hedge time: submits one copy, the first to finish is used, the other is canceled, the copy is not recorded', async () => {
       const { userId, jobId } = await prepJob({ left: '/files/uploads/up_a.png' });

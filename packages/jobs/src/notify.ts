@@ -3,6 +3,7 @@ import { user } from '@shipwords/core/db/schema';
 import { emailCopy } from '@shipwords/core/email/copy';
 import type { SiteConfig } from '@shipwords/core/site';
 import { eq } from 'drizzle-orm';
+import { ALERT_LIST } from './failures';
 import type { StoredOutput } from './lifecycle';
 import type { JobRow } from './schema';
 
@@ -60,8 +61,10 @@ export function emailFailures(options: {
   return async (failed: readonly JobRow[]) => {
     const [latest] = failed;
     if (!latest) return;
+    // failureStreak lists at most ALERT_LIST jobs: a full list means the streak may be longer.
+    const howMany = failed.length >= ALERT_LIST ? `${ALERT_LIST}+` : String(failed.length);
     const lines = [
-      `User ${latest.userId} has had ${failed.length} jobs fail in a row with no success in between:`,
+      `User ${latest.userId} has had ${howMany} jobs fail in a row with no success in between (newest first):`,
       ...failed.map(
         (job) =>
           `- ${job.id} (${job.modelId}) ended ${job.finishedAt == null ? '?' : new Date(job.finishedAt).toISOString()}: ${job.errorCode ?? 'no code'}` +
@@ -76,7 +79,7 @@ export function emailFailures(options: {
     await email.send({
       to,
       from: { email: from, name: site.name },
-      subject: `[${site.name}] ${failed.length} failed jobs in a row for user ${latest.userId}`,
+      subject: `[${site.name}] ${howMany} failed jobs in a row for user ${latest.userId}`,
       text,
       html: `<pre>${html(text)}</pre>`,
     });

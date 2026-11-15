@@ -15,7 +15,15 @@ import {
   settleFailure,
   upstreamIds,
 } from './lifecycle';
-import { fillDescriptions, type ModelDefinition, PREP_REF, partsOf, prepPartId, prepViews } from './models';
+import {
+  fillDescriptions,
+  type JobPart,
+  type ModelDefinition,
+  PREP_REF,
+  partsOf,
+  prepPartId,
+  prepViews,
+} from './models';
 import { composeOutputs, storeOutputs } from './outputs';
 import { checkPoints, checkWindows, judgeCheck } from './repair';
 import { type RepairContext, repairOutputs, type SegmentCheck } from './repair-steps';
@@ -273,33 +281,17 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     if (!resolved) throw new Error(`part ${partId} needs ${url} before it is ready`);
     return resolved;
   };
-  /**
-   * Upstream request for segment `index`: prep placeholders replaced with prep results, and descriptions filled in. A subject's views that
-   * fell back to the same photo are sent once; a subject left with one site photo gets it again under a second URL, since subjects take
-   * two photos or more.
-   */
+  /** Upstream request for segment `index` (partInput): prep results, or before any prep is paid, preflightUrl stand-ins. */
   const submitInput = (job: JobRow, index: number, preflight = false): SubmitInput => {
     const model = deps.models.find((m) => m.id === job.modelId)!;
     const part = partsOf(job, model)[index]!;
-    const references = subjectPhotos(
-      part.references.map((ref) => ({
-        ...ref,
-        url:
-          preflight && ref.url.startsWith(PREP_REF)
-            ? `https://preflight.invalid/${encodeURIComponent(ref.url)}.png`
-            : resolve(part.id, ref.url),
-      })),
+    return partInput(
+      part,
+      model,
+      (url) => (preflight && url.startsWith(PREP_REF) ? preflightUrl(url) : resolve(part.id, url)),
       deps.fileUrl?.(''),
+      part.describe ? (descriptions.get(part.id) ?? {}) : undefined,
     );
-    return {
-      upstreamModel: part.upstreamModel,
-      kind: part.kind ?? model.kind,
-      prompt: part.describe ? fillDescriptions(part.prompt, descriptions.get(part.id) ?? {}) : part.prompt,
-      ...(part.lyrics ? { lyrics: part.lyrics } : {}),
-      references,
-      parameters: part.parameters,
-      ...(part.maxCost ? { maxCost: part.maxCost } : {}),
-    };
   };
   // Run the installed adapter's local schema validator before any paid image preparation.
   const ready =
@@ -377,7 +369,10 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
             );
           }),
         );
-        const late = Date.now() - setup.createdAt > PREP_HEDGE_MS;
+        // The current config may turn hedging off (effect.prep.hedge); decided here, inside the cached step, like the clock.
+        const late =
+          Date.now() - setup.createdAt > PREP_HEDGE_MS &&
+          deps.models.find((m) => m.id === setup.model)?.effect?.prep?.hedge !== false;
         return {
           state: 'polled' as const,
           results: Object.fromEntries(open.map((part, i) => [part.partId, states[i]!])),
@@ -744,6 +739,39 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       })
       .catch((error: unknown) => deps.log?.('review notice failed', { jobId, error: String(error) }));
   }
+}
+
+/** Stand-in URL for a prep image that doesn't exist yet, of the same shape, so requests can be validated before any prep is paid. */
+export function preflightUrl(ref: string): string {
+  return `https://preflight.invalid/${encodeURIComponent(ref)}.png`;
+}
+
+/**
+ * The upstream request for a job part: every reference URL through `resolve` (the runner maps prep placeholders to prep results, or to
+ * preflightUrl stand-ins before any prep is paid), descriptions filled in when given. A subject's views that fell back to the same photo
+ * are sent once; a subject left with one site photo gets it again under a second URL, since subjects take two photos or more.
+ * Exported so a site's contract test builds requests exactly as the runner does.
+ */
+export function partInput(
+  part: JobPart,
+  model: Pick<ModelDefinition, 'kind'>,
+  resolve: (url: string) => string,
+  files: string | undefined,
+  descriptions?: Readonly<Record<string, string>>,
+): SubmitInput {
+  const references = subjectPhotos(
+    part.references.map((ref) => ({ ...ref, url: resolve(ref.url) })),
+    files,
+  );
+  return {
+    upstreamModel: part.upstreamModel,
+    kind: part.kind ?? model.kind,
+    prompt: descriptions ? fillDescriptions(part.prompt, descriptions) : part.prompt,
+    ...(part.lyrics ? { lyrics: part.lyrics } : {}),
+    references,
+    parameters: part.parameters,
+    ...(part.maxCost ? { maxCost: part.maxCost } : {}),
+  };
 }
 
 /**

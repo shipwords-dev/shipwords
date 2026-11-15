@@ -6,7 +6,7 @@ import { consumeQuota } from '@shipwords/core/quota/counters';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { sumUsd } from '../src/cost';
-import { FAILURE_STREAK, failureStreak } from '../src/failures';
+import { ALERT_LIST, FAILURE_STREAK, failureStreak } from '../src/failures';
 import { cancelQueued, loadJob, markFailed, markSubmitted, markSucceeded, spendKey } from '../src/lifecycle';
 import { defineModels } from '../src/models';
 import { emailFailures, emailOnFinish } from '../src/notify';
@@ -751,6 +751,27 @@ describe('failure streak alerts', () => {
     expect(await failureStreak(db, await jobOf(third, 'failed', 5_000))).toBeNull();
   });
 
+  it('the Workflow outer catch (workflow_failed) on the threshold passes the alert on too', async () => {
+    const userId = someone();
+    await jobOf(userId, 'failed', 1_000);
+    await jobOf(userId, 'failed', 2_000);
+    await jobOf(userId, 'failed', 3_000, { errorCode: 'workflow_failed' });
+    expect(await failureStreak(db, await jobOf(userId, 'failed', 4_000))).toHaveLength(4);
+    expect(await failureStreak(db, await jobOf(userId, 'failed', 5_000))).toBeNull();
+  });
+
+  it('however long a run of unchecked failures, the first runner failure after it alerts, listing at most ALERT_LIST jobs', async () => {
+    const userId = someone();
+    for (let i = 0; i < 60; i++)
+      await jobOf(userId, 'failed', 1_000 + i, {
+        errorCode: i < 2 ? 'YIR_EXECUTION_FAILED' : 'dispatch_failed',
+      });
+    const streak = await failureStreak(db, await jobOf(userId, 'failed', 5_000));
+    expect(streak).toHaveLength(ALERT_LIST);
+    expect(streak![0]!.finishedAt).toBe(5_000);
+    expect(await failureStreak(db, await jobOf(userId, 'failed', 6_000))).toBeNull();
+  });
+
   it('failed rows without an end time (written before finishedAt existed) are not counted', async () => {
     const userId = someone();
     await jobOf(userId, 'failed', 1_000, { ended: false });
@@ -838,5 +859,25 @@ describe('failure streak alerts', () => {
       `- ${failed[0]!.id} (fast) ended 2026-11-13T15:14:00.000Z: reference_subject_invalid`,
     );
     expect(sent[0]!.text).toContain('YIR_EXECUTION_FAILED');
+  });
+
+  it('a full list says the streak may be longer', async () => {
+    const userId = someone();
+    const failed = [];
+    for (let i = 0; i < ALERT_LIST; i++) failed.push(await jobOf(userId, 'failed', 10_000 - i));
+    const sent: { subject: string; text: string }[] = [];
+    const email = {
+      send: async (message: { subject: string; text: string }) => {
+        sent.push(message);
+        return { messageId: 'm1' };
+      },
+    } as unknown as SendEmail;
+    await emailFailures({
+      email,
+      from: 'noreply@example.com',
+      to: 'owner@example.com',
+      site: { name: 'Demo' },
+    })(failed);
+    expect(sent[0]!.subject).toBe(`[Demo] ${ALERT_LIST}+ failed jobs in a row for user ${userId}`);
   });
 });

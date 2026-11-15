@@ -42,7 +42,8 @@ const WHERE: Record<Seat, string> = {
   backRight:
     "They stand at the back on the viewer's right in both wide shots (0 to 5.333 seconds and 15.000 seconds to the end).",
 };
-const ROLE: Record<Seat, string> = {
+/** How the prompt calls each seat; the contract test reads it from here instead of keeping its own copy. */
+export const ROLE: Record<Seat, string> = {
   lead: 'The lead singer',
   sax: 'The saxophone player',
   keys: 'The keyboard player',
@@ -53,7 +54,7 @@ const ROLE: Record<Seat, string> = {
 /**
  * The one-image-per-person prompt, from the tested run: start with Edit @video_1 (written as Reference it becomes reference-to-video), say that each
  * reference image is one person with the face on the left and the outfit on the right, then give each seat who, which time span and which spot; empty
- * seats stay as in the original. The engine names ungrouped images @image1…, while Kling 4.0 expects @image_1, so the names are rewritten here.
+ * seats stay as in the original. The segment's imageName gives the images the @image_1… names Kling 4.0 expects.
  * Each name is followed by an appearance description (a vision model describes the prepped image; left out if that fails) to tell look-alikes apart.
  * The lead is alone in the close-up and holds no instrument (customers care most about those 6 seconds; one lineup was reordered 3 times over a second
  * face there), and no one takes an original performer's face (a customer in a white cap got the original keyboard coach's face). The animal sentence
@@ -63,7 +64,7 @@ const ROLE: Record<Seat, string> = {
 function editPrompt(images: Readonly<Record<string, string>>, { kinds, describe }: PromptContext) {
   const filled = SEATS.filter((seat) => images[seat]);
   const empty = SEATS.filter((seat) => !images[seat]);
-  const name = (seat: Seat) => images[seat]!.replace(/^@image(\d+)$/, '@image_$1');
+  const name = (seat: Seat) => images[seat]!;
   const pets = filled.filter((seat) => kinds[seat] === 'pet');
   const people = filled.filter((seat) => kinds[seat] !== 'pet');
   return [
@@ -141,8 +142,8 @@ export default serverModels(catalog, {
     upstreamModel: 'klingai/kling-4.0',
     // Kling is quoted at $3.06 (billed as 18 s), capped at 3.40. A missed swap does not rerun Kling: Pruna repairs it, up to 4 rounds at 0.40 each.
     // Once Kling has charged, credits are not refunded: if someone is still missed after the repairs, the version with the fewest misses is delivered and REVIEW_EMAIL gets a review alert.
-    // Prep: two images per person (two-panel and face), five people cost $0.085; a slow one gets a hedge copy, so the cap counts two each: $0.30.
-    // Caps add up to Kling 3.40 + repair 4×0.40 + prep 0.30 = 5.30.
+    // Prep: two images per person (two-panel and face), five people cost $0.085, capped at $0.15; a slow one gets no hedge copy (prep.hedge: false),
+    // since two copies could look different. Caps add up to Kling 3.40 + repair 4×0.40 + prep 0.15 = 5.15.
     // The job cap of 5.60 stays below the net per video of the cheapest pack (10 for $59.99, about 5.80 after fees), so even a fully repaired job breaks even.
     maxCost: '5.60',
     // Usually about 8 minutes (6 to generate, 2 for the face check and compose); each repair round adds a few minutes, plus room for upstream queues.
@@ -156,6 +157,7 @@ export default serverModels(catalog, {
         // Two 3:4 portrait panels side by side make 3:2 (1536×1024); the ratio applies to every prep, so the face is 3:2 too, centered.
         parameters: { resolution: '1K', aspect_ratio: '3:2' },
         maxCost: '0.015',
+        hedge: false,
       },
       // Describe the two-panel image (view 0): it shows both face and clothes. The instruction says both panels are one individual, so the
       // answer doesn't read 'a man shown twice' or 'a headless torso' inside the video prompt. Tested with Llama 4 Scout: it names the hairstyle, glasses, jersey colors and number.
@@ -170,6 +172,8 @@ export default serverModels(catalog, {
           referenceVideo: CLIP,
           slots: ['lead', 'sax', 'keys', 'backLeft', 'backRight'],
           prompt: editPrompt,
+          // Kling 4.0 (through Yir) names images @image_1, not the engine's default @image1.
+          imageName: (n) => `@image_${n}`,
           // duration must be a whole number: the 17.688 s reference asks for 18 s, which comes back as 18.04 s with each cut 1–6 frames late; compose re-aligns shot by shot.
           // generate_audio can only be on with Yir; compose swaps the original song back in.
           parameters: { duration: 18, resolution: '720p', aspect_ratio: 'auto' },

@@ -133,7 +133,8 @@ export function defineGenerationWorkflow(
       } catch (error) {
         // runGeneration has its own fallback; this catches errors outside steps (e.g. failing to construct the adapter).
         await step.do('abort:outer', async () => {
-          await markFailed(db, event.payload.jobId, 'failed', 'internal_error', String(error));
+          // Its own code: the runner never ran, so no failure-streak check ran for it (failures.ts UNCHECKED_FAILURES).
+          await markFailed(db, event.payload.jobId, 'failed', 'workflow_failed', String(error));
           return true;
         });
       }
