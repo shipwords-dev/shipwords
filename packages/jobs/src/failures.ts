@@ -30,6 +30,9 @@ export const ALERT_LIST = 20;
  */
 export async function failureStreak(db: Db, job: JobRow): Promise<JobRow[] | null> {
   if (job.status !== 'failed' || !job.userId || job.finishedAt == null) return null;
+  // An unchecked failure never alerts itself, even when its Workflow resumes after a handler marked it stale and runs the check: the
+  // next runner failure, counting it as unchecked, alerts instead. Both alerting would send two for one streak.
+  if (job.errorCode && UNCHECKED_FAILURES.includes(job.errorCode)) return null;
   const { userId, finishedAt, id } = job;
   /** Rows that ended before (at, key) in end order: finishedAt, then id for jobs that ended in the same millisecond. */
   const endedBefore = (at: number, key: string) =>

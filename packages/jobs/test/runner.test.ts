@@ -751,6 +751,15 @@ describe('failure streak alerts', () => {
     expect(await failureStreak(db, await jobOf(third, 'failed', 5_000))).toBeNull();
   });
 
+  it('a stale job whose Workflow resumes and runs the check never alerts itself; the next runner failure alerts once', async () => {
+    const userId = someone();
+    await jobOf(userId, 'failed', 1_000);
+    await jobOf(userId, 'failed', 2_000);
+    const stale = await jobOf(userId, 'failed', 3_000, { errorCode: 'stale' });
+    expect(await failureStreak(db, stale)).toBeNull();
+    expect(await failureStreak(db, await jobOf(userId, 'failed', 4_000))).toHaveLength(4);
+  });
+
   it('the Workflow outer catch (workflow_failed) on the threshold passes the alert on too', async () => {
     const userId = someone();
     await jobOf(userId, 'failed', 1_000);
