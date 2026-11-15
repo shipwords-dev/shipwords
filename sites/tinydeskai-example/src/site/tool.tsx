@@ -223,6 +223,7 @@ export function TinyDeskTool({
   const filled = SLOTS.filter((slot) => photos[slot.id]).map((slot) => slot.id);
   const own = filled.filter((id) => !isOpen(photos[id]));
   const dogsLeft = filled.filter((id) => isDog(photos[id])).length;
+  const coachesLeft = SLOTS.length - filled.length;
 
   async function onPick(slotId: string, file: File | undefined, via: 'picker' | 'drop') {
     if (!file) return;
@@ -576,6 +577,10 @@ export function TinyDeskTool({
       {/* With only some seats swapped, say the remaining dogs stay in the video: a complaint came from an order that swapped only the lead and expected the other seats not to count. */}
       {own.length > 0 && dogsLeft > 0 && (
         <p className="notice">{m.common_tool_dogs_left({ count: dogsLeft, total: SLOTS.length })}</p>
+      )}
+      {/* A cleared spot keeps the original coach: say so before paying (an order with 3 of 5 photos got the coaches singing backup). */}
+      {own.length > 0 && coachesLeft > 0 && (
+        <p className="notice">{m.common_tool_coaches_left({ count: coachesLeft, total: SLOTS.length })}</p>
       )}
       <div className="hero-actions">
         <button type="submit" className="primary" disabled={submitting || preparing}>

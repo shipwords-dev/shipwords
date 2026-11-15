@@ -106,6 +106,7 @@
   "common_tool_pet": "这张{member}照片是宠物",
   "common_tool_tips": "点任意一只狗就能换成你的照片，也可以把电脑里的照片直接拖到它身上；拖动照片可换位置。每张照片只放一个人，脸清楚、朝向镜头：视频照着你的照片做。点 × 换回狗狗，狗狗上再点 × 就保留爆款视频里的教练；🐾 把你的照片标成宠物。",
   "common_tool_dogs_left": "还有 {count}/{total} 个位置是狗，成片里也会是狗。点一只狗换上照片。",
+  "common_tool_coaches_left": "还有 {count}/{total} 个位置是空的，成片里会保留原片的教练。点空位换上照片。",
   "common_tool_status": "你的照片 {filled}/{total} · 整段一次出片 · {price}",
   "common_tool_consent": "这是恶搞：照片里的每个人都已满 18 岁，我不会把它当成真的传播。",
   "common_tool_starting": "启动中…",

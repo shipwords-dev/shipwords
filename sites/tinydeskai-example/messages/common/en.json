@@ -106,6 +106,7 @@
   "common_tool_pet": "This {member} photo is a pet",
   "common_tool_tips": "Tap any dog to swap in your photo, or drop a photo from your computer onto it; drag a photo to move it. One person per photo, face clear and facing the camera: the video follows your photos. × puts the dog back, and × on a dog keeps the coach from the viral video, and 🐾 marks your photo as a pet.",
   "common_tool_dogs_left": "{count} of {total} spots are still dogs and will be dogs in your video. Tap a dog to swap in a photo.",
+  "common_tool_coaches_left": "{count} of {total} spots are empty and will keep the coaches from the original video. Tap an empty spot to add a photo.",
   "common_tool_status": "your photos {filled}/{total} · whole video in one go · {price}",
   "common_tool_consent": "It's a parody: everyone in these photos is 18 or older, and I won't pass it off as real.",
   "common_tool_starting": "Starting…",
