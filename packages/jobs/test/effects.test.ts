@@ -13,7 +13,7 @@ import type {
 } from '../src/compose';
 import { appendUpstreamJob, loadJob, markFailed, spendKey } from '../src/lifecycle';
 import { defineModels, type EffectSegment, effectParts, type ModelDefinition } from '../src/models';
-import { PREP_HEDGE_MS, runGeneration, type StepRunner } from '../src/runner';
+import { KEEP_TIMEOUT_MS, PREP_HEDGE_MS, runGeneration, type StepRunner } from '../src/runner';
 import { jobs } from '../src/schema';
 import { type PollResult, type SubmitInput, type UpstreamAdapter, UpstreamError } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
@@ -2156,7 +2156,7 @@ describe('prep and reference audio', () => {
     ).toThrow(/referenceAudio/);
   });
 
-  it('execution: video segments submit after prep finishes, placeholders replaced with prep results, prep images not stored, output numbered from 0', async () => {
+  it('execution: video segments submit after prep finishes, placeholders replaced with prep results, prep images kept but not outputs, output numbered from 0', async () => {
     const { userId, jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
     const adapter = new FakeAdapter();
     adapter.polls.set(`up_${jobId}:prep-left`, [{ state: 'running' }, image('https://up/left-prep.png')]);
@@ -2197,7 +2197,107 @@ describe('prep and reference audio', () => {
       `jobs/${jobId}/0.mp4`,
       `jobs/${jobId}/1.mp4`,
     ]);
+    // The prep image is kept in R2 to look back at, as a copy of what the upstream returned; it is not an output.
+    const kept = await env.OUTPUTS.get(`jobs/${jobId}/kept/prep-left.png`);
+    expect(kept?.httpMetadata?.contentType).toBe('image/png');
     expect((await getBalance(db, userId)).available).toBe(40);
+  });
+
+  it('a prep copy that fails to download is skipped: no retry, the video segments still run, the job succeeds', async () => {
+    const { jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
+    const adapter = new FakeAdapter();
+    adapter.polls.set(`up_${jobId}:prep-left`, [image('https://up/left-prep.png')]);
+    adapter.polls.set(`up_${jobId}:left`, [succeeded('left')]);
+    adapter.polls.set(`up_${jobId}:group`, [succeeded('group')]);
+    const downloads: string[] = [];
+    const fetcher: typeof fetch = async (input) => {
+      const url = String(input);
+      downloads.push(url);
+      return url.includes('left-prep') ? new Response('gone', { status: 403 }) : outputFetcher(input);
+    };
+    const names: string[] = [];
+    await runGeneration({ ...prepDeps(adapter), fetcher }, jobId, durableSteps(new Map(), names));
+    expect(downloads.filter((url) => url.includes('left-prep'))).toHaveLength(1);
+    expect(names.filter((n) => n === 'keep:0')).toHaveLength(1);
+    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-left.png`)).toBeNull();
+    expect(adapter.submits.map((s) => s.key)).toEqual([
+      `${jobId}:prep-left`,
+      `${jobId}:left`,
+      `${jobId}:group`,
+    ]);
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+  });
+
+  it('a prep copy that never answers gives up after its timeout; the job goes on', async () => {
+    const { jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
+    const adapter = new FakeAdapter();
+    adapter.polls.set(`up_${jobId}:prep-left`, [image('https://up/left-prep.png')]);
+    adapter.polls.set(`up_${jobId}:left`, [succeeded('left')]);
+    adapter.polls.set(`up_${jobId}:group`, [succeeded('group')]);
+    // The download hangs forever (it ignores the abort signal too).
+    const fetcher: typeof fetch = async (input) =>
+      String(input).includes('left-prep') ? new Promise<Response>(() => {}) : outputFetcher(input);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const run = runGeneration({ ...prepDeps(adapter), fetcher }, jobId, durableSteps());
+      await vi.advanceTimersByTimeAsync(KEEP_TIMEOUT_MS + 1_000);
+      await run;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-left.png`)).toBeNull();
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+  });
+
+  it('a batch that ends early still keeps the prep images that came back before it ended', async () => {
+    // left and right both have prep; left comes back, right fails while the user cancels, so its fallback ends the loop early.
+    const twoPrep: ModelDefinition = {
+      ...prepModel,
+      maxCost: '0.96',
+      effect: {
+        ...prepModel.effect!,
+        slots: prepModel.effect!.slots.map((slot) => ({ ...slot, prep: `${slot.id} outfit` })),
+      },
+    };
+    const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
+    const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
+    const parts = effectParts(
+      twoPrep,
+      { left: '/files/uploads/up_a.png', right: '/files/uploads/up_b.png' },
+      upload,
+      asset,
+    )!;
+    await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
+    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
+      db.insert(jobs).values({
+        id: jobId,
+        userId,
+        modelId: 'demo-prep',
+        kind: 'video',
+        prompt: '',
+        inputJson: JSON.stringify({ parts }),
+        costCredits: 10,
+        upstream: 'yir',
+      }),
+    ]);
+    const adapter = new FakeAdapter();
+    adapter.polls.set(`up_${jobId}:prep-left`, [image('https://up/left-prep.png')]);
+    const poll = adapter.poll.bind(adapter);
+    adapter.poll = async (id: string) => {
+      if (!id.endsWith('prep-right')) return poll(id);
+      await markFailed(db, jobId, 'canceled', 'canceled', 'by user');
+      return { state: 'failed' as const, code: 'YIR_EXECUTION_FAILED', message: 'down' };
+    };
+    const names: string[] = [];
+    await runGeneration(
+      { ...deps(adapter), models: defineModels([twoPrep]) },
+      jobId,
+      durableSteps(new Map(), names),
+    );
+    expect(names).toContain('keep:0');
+    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-left.png`)).not.toBeNull();
+    expect(adapter.submits.map((s) => s.key)).toEqual([`${jobId}:prep-left`, `${jobId}:prep-right`]);
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'canceled' });
   });
 
   describe('subjects and descriptions', () => {
@@ -2881,6 +2981,49 @@ describe('four-view sheets', () => {
     expect((await loadJob(db, jobId))?.status).toBe('failed');
     expect((await getBalance(db, userId)).available).toBe(50);
   });
+  it('a sheet split that keeps failing ahead of a plain prep still keeps the plain prep image', async () => {
+    // left is a sheet and comes first in the batch; right is a plain prep that came back too.
+    const mixed: ModelDefinition = {
+      ...model,
+      maxCost: '1.00',
+      effect: {
+        ...model.effect!,
+        slots: [
+          ...model.effect!.slots,
+          { id: 'right', label: 'Right', required: false, prep: 'right outfit' },
+        ],
+        segments: effectModel.effect!.segments.map((segment) =>
+          segment.slots.includes('left') ? { ...segment, subjects: { left: 'Lead' } } : segment,
+        ),
+      },
+    };
+    const photos = { left: '/files/uploads/up_a.png', right: '/files/uploads/up_b.png' };
+    const parts = effectParts(mixed, photos, upload, asset)!;
+    expect(parts.slice(0, 2).map((part) => part.id)).toEqual(['prep-left', 'prep-right']);
+    const { jobId, userId } = await effectJob(photos, { inputJson: JSON.stringify({ parts }) });
+    const adapter = new FakeAdapter();
+    adapter.polls.set(`up_${jobId}:prep-left`, [succeeded('sheet')]);
+    adapter.polls.set(`up_${jobId}:prep-right`, [
+      { state: 'succeeded', files: [{ url: 'https://up/right-prep.png', mediaType: 'image/png' }] },
+    ]);
+    const split = splitSheet();
+    split.mockRejectedValue(new Error('bad image'));
+    await runGeneration(
+      {
+        ...deps(adapter),
+        models: defineModels([mixed]),
+        fileUrl: asset,
+        composer: { splitSheet: split } as unknown as Composer,
+      },
+      jobId,
+      durableSteps(),
+    );
+    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-right.png`)).not.toBeNull();
+    // The job itself fails and refunds as before, with no video spending.
+    expect(adapter.submits.map((s) => s.key)).toEqual([`${jobId}:prep-left`, `${jobId}:prep-right`]);
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
   it('split failure prevents video spending and refunds once', async () => {
     const { jobId, userId, adapter, runDeps, split } = await setup();
     split.mockRejectedValue(new Error('bad image'));

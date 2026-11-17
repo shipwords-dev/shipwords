@@ -83,6 +83,16 @@ describe('GET /files', () => {
     await markFailed(db, jobId, 'failed', 'test', 'failed');
     expect((await ctx.file(key)).status).toBe(404);
   });
+  it('never serves kept prep copies, whatever the job state', async () => {
+    const ctx = await setup();
+    const jobId = await createdId(await ctx.create());
+    const key = `jobs/${jobId}/kept/prep-left-0.png`;
+    await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    for (const status of ['queued', 'submitted', 'succeeded'] as const) {
+      await db.update(jobs).set({ status }).where(eq(jobs.id, jobId));
+      expect((await ctx.file(key)).status).toBe(404);
+    }
+  });
   it('serves an output replaced by hand under its new key, once the job succeeded', async () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());

@@ -76,6 +76,14 @@ const POLL_WAIT_SECONDS = 20;
 const POLL_PAUSE_MS = 3_000;
 /** Prep images usually finish in about 35 s; one still running past this gets a second copy, and whichever finishes first is used. */
 export const PREP_HEDGE_MS = 60_000;
+/** Longest a kept prep image copy (keep:<from>) may take; it is only for looking back, never worth holding a job up. */
+export const KEEP_TIMEOUT_MS = 20_000;
+/** File extension of a kept prep image (keep:<from>) by media type; anything else is stored as .png. */
+const PREP_EXTENSIONS: Readonly<Record<string, string>> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+};
 
 /**
  * Each Workflow step retries on its own; once retries are exhausted step.do throws. This fallback marks the job failed and refunds,
@@ -499,6 +507,45 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     return false;
   };
 
+  /**
+   * Keep a copy of each prep image the upstream returned (sheets are already stored as crops) at jobs/<id>/kept/<part>.<ext>, to look back
+   * at what the video model got after the upstream URL expires; /files never serves that folder. One step per batch, copies in parallel,
+   * each within KEEP_TIMEOUT_MS. Best effort: the step never throws or hangs, so it never retries, and a step failure is only logged, so a
+   * copy never holds up the video segments beyond the timeout or fails the job.
+   */
+  const keepPreps = (from: number, kept: readonly { partId: string; url: string; mediaType: string }[]) =>
+    step
+      .do(`keep:${from}`, async () => {
+        const copy = async ({ partId, url, mediaType }: (typeof kept)[number]) => {
+          const key = `jobs/${jobId}/kept/${partId}.${PREP_EXTENSIONS[mediaType] ?? 'png'}`;
+          if (await deps.bucket.head(key)) return;
+          const response = await (deps.fetcher ?? fetch)(url, {
+            signal: AbortSignal.timeout(KEEP_TIMEOUT_MS),
+          });
+          if (!response.ok || !response.body)
+            throw new Error(`download ${partId} failed: ${response.status}`);
+          await deps.bucket.put(key, response.body, { httpMetadata: { contentType: mediaType } });
+        };
+        const results = await Promise.allSettled(
+          kept.map((image) => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const timeout = new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error('copy timed out')), KEEP_TIMEOUT_MS);
+            });
+            return Promise.race([copy(image), timeout]).finally(() => clearTimeout(timer));
+          }),
+        );
+        const failed = results.flatMap((result, i) =>
+          result.status === 'rejected' ? [kept[i]!.partId] : [],
+        );
+        if (failed.length) deps.log?.('prep copy failed', { jobId, parts: failed });
+        return failed.length === 0;
+      })
+      .catch((error: unknown) => {
+        deps.log?.('prep copy step failed', { jobId, error: String(error) });
+        return false;
+      });
+
   // Run prep segments first, then video segments (which use the prep results). Within a phase, submit one by one so segments render upstream in parallel, then poll in turn.
   // Idempotency key is jobId for single-part, jobId:segment ID for multi-part.
   for (const [from, to] of [
@@ -602,84 +649,102 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       }
     }
 
-    for (let index = from; index < to; index++) {
-      const partId = partIds[index]!;
-      const upstreamJobId = submittedIds[index]!;
-      /** When prep yields no image (rejected, failed, empty result), fall back to the user's original photo instead of failing the job. */
-      const fallBack = async () => {
-        const original = await step.do(`prep-fallback:${partId}`, async () => {
-          const job = await activeJob(deps.db, jobId);
-          if (!job) return null;
-          const model = deps.models.find((m) => m.id === job.modelId)!;
-          return partsOf(job, model)[index]!.references[0]!.url;
-        });
-        if (original) {
-          prepUrls.set(partId, original);
-          if (setup.sheets?.includes(partId))
-            for (let view = 1; view < 4; view++) prepUrls.set(`${partId}-v${view}`, original);
-        }
-        return Boolean(original);
-      };
-      if (upstreamJobId.startsWith(SKIPPED)) {
-        if (!(await fallBack())) return;
-        continue;
-      }
-      const result =
-        index < prepCount
-          ? prepResults.get(partId)!
-          : await pollUntilDone(upstreamJobId, single ? null : partId);
-      if (result.state === 'stopped') return;
-      if (result.state === 'failed') {
-        if (index < prepCount) {
-          deps.log?.('prep failed, using original photo', { jobId, part: partId, code: result.code });
+    /**
+     * Prep images the upstream returned in this batch, copied to R2 after it (keep:<from>). Collected from the finished polls up front, so
+     * an early exit from the loop below (a sheet split that keeps failing, a canceled job) still keeps images it hadn't reached yet.
+     */
+    const kept = [...prepResults].flatMap(([partId, result]) => {
+      const file = result.state === 'succeeded' ? result.files[0] : undefined;
+      return file?.url && !setup.sheets?.includes(partId)
+        ? [{ partId, url: file.url, mediaType: file.mediaType }]
+        : [];
+    });
+    try {
+      for (let index = from; index < to; index++) {
+        const partId = partIds[index]!;
+        const upstreamJobId = submittedIds[index]!;
+        /** When prep yields no image (rejected, failed, empty result), fall back to the user's original photo instead of failing the job. */
+        const fallBack = async () => {
+          const original = await step.do(`prep-fallback:${partId}`, async () => {
+            const job = await activeJob(deps.db, jobId);
+            if (!job) return null;
+            const model = deps.models.find((m) => m.id === job.modelId)!;
+            return partsOf(job, model)[index]!.references[0]!.url;
+          });
+          if (original) {
+            prepUrls.set(partId, original);
+            if (setup.sheets?.includes(partId))
+              for (let view = 1; view < 4; view++) prepUrls.set(`${partId}-v${view}`, original);
+          }
+          return Boolean(original);
+        };
+        if (upstreamJobId.startsWith(SKIPPED)) {
           if (!(await fallBack())) return;
           continue;
         }
-        await fail(result.code, result.message);
-        return;
+        const result =
+          index < prepCount
+            ? prepResults.get(partId)!
+            : await pollUntilDone(upstreamJobId, single ? null : partId);
+        if (result.state === 'stopped') return;
+        if (result.state === 'failed') {
+          if (index < prepCount) {
+            deps.log?.('prep failed, using original photo', { jobId, part: partId, code: result.code });
+            if (!(await fallBack())) return;
+            continue;
+          }
+          await fail(result.code, result.message);
+          return;
+        }
+        if (result.state === 'timeout') {
+          await timeOut();
+          return;
+        }
+        if (index < prepCount) {
+          // Prep images are references, not deliverables; sheets are cropped and stored for the video model.
+          const url = result.files[0]?.url;
+          if (url && setup.sheets?.includes(partId)) {
+            const urls = await step.do(`split:${partId}`, async () => {
+              if (!(await activeJob(deps.db, jobId))) return null;
+              const keys = Array.from({ length: 4 }, (_, view) => `jobs/${jobId}/${partId}-${view}.png`);
+              // A failed write can resume with the same keys without another upstream generation.
+              const existing = await Promise.all(keys.map((key) => deps.bucket.head(key)));
+              if (!existing.every(Boolean)) {
+                const response = await (deps.fetcher ?? fetch)(url);
+                if (!response.ok) throw new Error(`download prep sheet failed: ${response.status}`);
+                const images = await deps.composer!.splitSheet!({
+                  jobId,
+                  image: await response.arrayBuffer(),
+                });
+                if (images.length !== 4 || images.some((image) => !image.byteLength))
+                  throw new Error('sheet must produce four images');
+                for (const [view, key] of keys.entries())
+                  await deps.bucket.put(key, images[view]!, { httpMetadata: { contentType: 'image/png' } });
+              }
+              return keys.map((key) => deps.fileUrl!(key));
+            });
+            if (!urls) return;
+            for (const [view, image] of urls.entries())
+              prepUrls.set(view === 0 ? partId : `${partId}-v${view}`, image);
+          } else if (url) prepUrls.set(partId, url);
+          else if (!(await fallBack())) return;
+          continue;
+        }
+        const start = outputs.length;
+        const stored = await step.do(name('store', partId), () =>
+          storeOutputs(deps, jobId, result.files, start),
+        );
+        if (stored[0]) partKeys.set(partId, stored[0].key);
+        outputs.push(...stored);
+        const check = setup.checks?.[partId];
+        if (!check) continue;
+        const verdict = await verify(partId, index, check);
+        if (verdict === false) return;
+        if (verdict !== true) toRepair.set(partId, verdict);
       }
-      if (result.state === 'timeout') {
-        await timeOut();
-        return;
-      }
-      if (index < prepCount) {
-        // Prep images are references, not deliverables; sheets are cropped and stored for the video model.
-        const url = result.files[0]?.url;
-        if (url && setup.sheets?.includes(partId)) {
-          const urls = await step.do(`split:${partId}`, async () => {
-            if (!(await activeJob(deps.db, jobId))) return null;
-            const keys = Array.from({ length: 4 }, (_, view) => `jobs/${jobId}/${partId}-${view}.png`);
-            // A failed write can resume with the same keys without another upstream generation.
-            const existing = await Promise.all(keys.map((key) => deps.bucket.head(key)));
-            if (!existing.every(Boolean)) {
-              const response = await (deps.fetcher ?? fetch)(url);
-              if (!response.ok) throw new Error(`download prep sheet failed: ${response.status}`);
-              const images = await deps.composer!.splitSheet!({ jobId, image: await response.arrayBuffer() });
-              if (images.length !== 4 || images.some((image) => !image.byteLength))
-                throw new Error('sheet must produce four images');
-              for (const [view, key] of keys.entries())
-                await deps.bucket.put(key, images[view]!, { httpMetadata: { contentType: 'image/png' } });
-            }
-            return keys.map((key) => deps.fileUrl!(key));
-          });
-          if (!urls) return;
-          for (const [view, image] of urls.entries())
-            prepUrls.set(view === 0 ? partId : `${partId}-v${view}`, image);
-        } else if (url) prepUrls.set(partId, url);
-        else if (!(await fallBack())) return;
-        continue;
-      }
-      const start = outputs.length;
-      const stored = await step.do(name('store', partId), () =>
-        storeOutputs(deps, jobId, result.files, start),
-      );
-      if (stored[0]) partKeys.set(partId, stored[0].key);
-      outputs.push(...stored);
-      const check = setup.checks?.[partId];
-      if (!check) continue;
-      const verdict = await verify(partId, index, check);
-      if (verdict === false) return;
-      if (verdict !== true) toRepair.set(partId, verdict);
+    } finally {
+      // Also when the loop returns early or throws: the images that already came back are kept before the job moves on.
+      if (kept.length > 0) await keepPreps(from, kept);
     }
   }
   let finalOutputs = outputs;

@@ -207,8 +207,12 @@ describe('mock runs a full effect job', () => {
     );
     const job = await loadJob(db, jobId);
     expect(job?.status).toBe('succeeded');
-    // Only the right segment renders, so its reference video is what gets stored; the earlier left segment uses its base clip, skips the upstream, and isn't used for the output.
-    expect(fetched).toEqual(['http://localhost:5464/files/assets/demo/right.mp4']);
+    // The prep result (the original photo, in mock) is copied to R2 first; then only the right segment renders, so its reference video is
+    // what gets stored; the earlier left segment uses its base clip, skips the upstream, and isn't used for the output.
+    expect(fetched).toEqual([
+      'http://localhost:5464/files/uploads/up_a.png',
+      'http://localhost:5464/files/assets/demo/right.mp4',
+    ]);
     const outputs = JSON.parse(job!.outputsJson!) as { key: string }[];
     expect(outputs).toHaveLength(2);
     const song = await env.OUTPUTS.get(outputs[0]!.key);
