@@ -1,8 +1,10 @@
-// Serve an R2 object with HTTP byte ranges. iPhone Safari refuses to play <video> from a server that
-// answers a Range request with 200 + whole file, so every endpoint that streams a stored video must go
-// through here. R2 reads only the requested slice; nothing is buffered in the Worker.
+import type { ByteRange, ObjectStore } from './store';
 
-export type ByteRange = { offset: number; length: number };
+// Serve a stored object with HTTP byte ranges. iPhone Safari refuses to play <video> from a server that
+// answers a Range request with 200 + whole file, so every endpoint that streams a stored video must go
+// through here. The store reads only the requested slice.
+
+export type { ByteRange };
 
 /** Parse a single-range `Range` header against a known size. null: no usable range (serve the whole object). */
 export function parseRange(header: string | null, size: number): ByteRange | 'unsatisfiable' | null {
@@ -20,8 +22,8 @@ export function parseRange(header: string | null, size: number): ByteRange | 'un
  * (content type, cache control, disposition); Accept-Ranges, Content-Length and Content-Range are set here.
  * Returns null when the object does not exist.
  */
-export async function r2Response(
-  bucket: R2Bucket,
+export async function objectResponse(
+  bucket: ObjectStore,
   key: string,
   request: Request,
   headers: HeadersInit = {},
@@ -30,7 +32,7 @@ export async function r2Response(
   if (!head) return null;
   const out = new Headers(headers);
   out.set('Accept-Ranges', 'bytes');
-  out.set('ETag', head.httpEtag);
+  out.set('ETag', head.etag);
   const range = parseRange(request.headers.get('Range'), head.size);
   if (range === 'unsatisfiable') {
     out.set('Content-Range', `bytes */${head.size}`);

@@ -1,5 +1,6 @@
 import { getBalance, grantCredits, spendCredits } from '@shipwords/core/credits/ledger';
 import { user } from '@shipwords/core/db/schema';
+import type { Mailer } from '@shipwords/core/email/mailer';
 import { consumeQuota } from '@shipwords/core/quota/counters';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
@@ -132,7 +133,7 @@ describe('generation jobs', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     const notify = emailOnFinish({
       db,
       email,
@@ -197,7 +198,7 @@ describe('generation jobs', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     const notify = emailOnFinish({
       db,
       email,
@@ -943,7 +944,7 @@ describe('failure streak alerts', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     await emailFailures({
       email,
       from: 'noreply@example.com',
@@ -971,7 +972,7 @@ describe('failure streak alerts', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     await emailFailures({
       email,
       from: 'noreply@example.com',

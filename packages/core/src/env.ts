@@ -3,10 +3,11 @@
 export interface CoreEnv {
   /** Postgres connection string, e.g. postgres://site:secret@db:5432/site. */
   DATABASE_URL: string;
-  /** send_email binding for Cloudflare Email Service. */
-  EMAIL: SendEmail;
-  /** Sender address; its domain must be enabled in Email Service. */
+  /** Sender address; its domain must be enabled in Cloudflare Email Service. */
   EMAIL_FROM: string;
+  /** Cloudflare account and an API token with Email Sending (and Workers AI, for image descriptions) permission. */
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CLOUDFLARE_API_TOKEN?: string;
   /** Overrides site.url in local dev, e.g. http://localhost:5173. */
   APP_URL?: string;
 

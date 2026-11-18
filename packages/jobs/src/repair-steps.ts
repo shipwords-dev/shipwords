@@ -225,7 +225,7 @@ export async function repairOutputs(
         const object = await deps.bucket.get(source);
         if (!object) throw new Error(`repair output missing: ${source}`);
         await deps.bucket.put(output.key, await object.arrayBuffer(), {
-          httpMetadata: { contentType: 'video/mp4' },
+          contentType: 'video/mp4',
         });
       }
       return true;
@@ -303,7 +303,7 @@ export async function repairOutputs(
       const cut = { jobId, key: current, ...planned.geometry };
       const clip = await step.do(`${label}:extract`, async () => {
         const bytes = await deps.composer!.extract(cut);
-        await deps.bucket.put(work(String(round)), bytes, { httpMetadata: { contentType: 'video/mp4' } });
+        await deps.bucket.put(work(String(round)), bytes, { contentType: 'video/mp4' });
         return work(String(round));
       });
       const position = ctx.partCount + round;
@@ -369,7 +369,7 @@ export async function repairOutputs(
         if (!response.ok || !response.body)
           throw new Error(`download repair ${round} failed: ${response.status}`);
         await deps.bucket.put(work(`${round}-out`), response.body, {
-          httpMetadata: { contentType: 'video/mp4' },
+          contentType: 'video/mp4',
         });
         return work(`${round}-out`);
       });
@@ -379,7 +379,7 @@ export async function repairOutputs(
           name: `${jobId}-repair-${partId}-${round}`,
           patchKey,
         });
-        const meta = { httpMetadata: { contentType: 'video/mp4' } };
+        const meta = { contentType: 'video/mp4' };
         await deps.bucket.put(work(`${round}-song`), song, meta);
         await deps.bucket.put(work(`${round}-silent`), quiet, meta);
         return { song: work(`${round}-song`), silent: work(`${round}-silent`) };

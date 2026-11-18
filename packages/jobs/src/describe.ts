@@ -16,13 +16,25 @@ async function dataUrl(url: string, fetcher: typeof fetch): Promise<string> {
   return `data:${type};base64,${btoa(binary)}`;
 }
 
-export function workersAiDescribe(ai: Ai, options: { fetcher?: typeof fetch } = {}) {
+export interface WorkersAiConfig {
+  accountId: string;
+  /** An API token with Workers AI permission. */
+  apiToken: string;
+}
+
+/**
+ * Describe with Workers AI over its REST API (POST /accounts/{id}/ai/run/{model}). The request body is the one the Workers binding
+ * took for this model (OpenAI-style messages with an image_url part), which the REST endpoint accepts as the model's input.
+ */
+export function workersAiDescribe(config: WorkersAiConfig, options: { fetcher?: typeof fetch } = {}) {
   const fetcher = options.fetcher ?? fetch;
+  const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(config.accountId)}/ai/run/${DESCRIBE_MODEL}`;
   return async (imageUrl: string, instruction: string): Promise<string> => {
     const image = await dataUrl(imageUrl, fetcher);
-    const result = (await ai.run(
-      DESCRIBE_MODEL as never,
-      {
+    const response = await fetcher(url, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${config.apiToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
         messages: [
           {
             role: 'user',
@@ -33,8 +45,10 @@ export function workersAiDescribe(ai: Ai, options: { fetcher?: typeof fetch } = 
           },
         ],
         max_tokens: 80,
-      } as never,
-    )) as { response?: unknown };
-    return typeof result?.response === 'string' ? result.response : '';
+      }),
+    });
+    if (!response.ok) throw new Error(`describe failed: ${response.status} ${await response.text()}`);
+    const body = (await response.json()) as { result?: { response?: unknown } };
+    return typeof body.result?.response === 'string' ? body.result.response : '';
   };
 }

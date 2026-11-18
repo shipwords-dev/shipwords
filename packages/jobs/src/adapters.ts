@@ -1,25 +1,24 @@
+import type { MailerEnv } from '@shipwords/core/email/mailer';
 import { MockAdapter, mockMode } from './mock';
+import type { StoreEnv } from './store';
 import type { UpstreamAdapter } from './upstream';
 import { YirAdapter } from './yir';
 
-// Bindings and secrets the generation runtime reads, and the upstream adapters built from them.
+// Settings and secrets the generation runtime reads, and the upstream adapters built from them.
 
-export interface JobsEnv {
+export interface JobsEnv extends StoreEnv, MailerEnv {
   DATABASE_URL: string;
-  OUTPUTS: R2Bucket;
   YIR_API_KEY: string;
   YIR_BASE_URL?: string;
   /** Yir referral code included for people deploying this starter; optional for your own sites. */
   YIR_REFERRAL_CODE?: string;
-  /** Effect compose container (Durable Object binding of the Container class); sites without effect compose don't need it. */
-  COMPOSE?: DurableObjectNamespace;
-  /** For job-finished emails; shares the send_email binding and sender address with sign-in codes. */
-  EMAIL?: SendEmail;
+  /** The compose service (packages/jobs/compose), e.g. http://compose:8080; sites without effect compose don't need it. */
+  COMPOSE_URL?: string;
+  /** Sender of job emails, the same address as sign-in codes. Sending uses CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN. */
   EMAIL_FROM?: string;
   /** Where to send notes about delivered jobs that need a human look (people the repair passes couldn't swap); unset sends none. */
   REVIEW_EMAIL?: string;
-  /** Workers AI, for describing the people in effect prep images (effect.describe); without it descriptions are left out. */
-  AI?: Ai;
+  /** Describing the people in effect prep images (effect.describe) uses Workers AI with the same Cloudflare credentials; without them descriptions are left out. */
   APP_URL?: string;
   /** For testing flows locally or on a test-mode demo, see mock.ts. */
   UPSTREAM_MOCK?: string;

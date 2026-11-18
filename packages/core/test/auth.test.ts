@@ -23,6 +23,7 @@ const auth = (secret: string | undefined) =>
     site,
     baseURL: 'https://test.example',
     log: () => {},
+    mailer: { send: async () => {} },
   });
 
 describe('auth secret', () => {

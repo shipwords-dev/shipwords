@@ -13,6 +13,7 @@ import { appendUpstreamJob, loadJob, markFailed, spendKey } from '../src/lifecyc
 import { defineModels, type EffectSegment, effectParts, type ModelDefinition } from '../src/models';
 import { KEEP_TIMEOUT_MS, PREP_HEDGE_MS, runGeneration, type StepRunner } from '../src/runner';
 import { jobs } from '../src/schema';
+import type { ObjectStore } from '../src/store';
 import { type PollResult, type SubmitInput, type UpstreamAdapter, UpstreamError } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
 import { bucket } from './bucket';
@@ -2260,7 +2261,7 @@ describe('prep and reference audio', () => {
     ]);
     // The prep image is kept in R2 to look back at, as a copy of what the upstream returned; it is not an output.
     const kept = await bucket.get(`jobs/${jobId}/kept/prep-left.png`);
-    expect(kept?.httpMetadata?.contentType).toBe('image/png');
+    expect(kept?.contentType).toBe('image/png');
     expect((await getBalance(db, userId)).available).toBe(40);
   });
 
@@ -3138,7 +3139,7 @@ describe('four-view sheets', () => {
     const flaky = new Proxy(bucket, {
       get(target, key) {
         if (key === 'put')
-          return async (...args: Parameters<R2Bucket['put']>) => {
+          return async (...args: Parameters<ObjectStore['put']>) => {
             if (args[0].endsWith('prep-left-1.png') && !interrupted) {
               interrupted = true;
               throw new Error('write interrupted');

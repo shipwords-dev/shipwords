@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { enqueueRun } from '../src/lifecycle';
 import { defineModels } from '../src/models';
 import { jobRuns, jobSteps, jobs } from '../src/schema';
+import { memoryStore } from '../src/store';
 import { startJobWorker } from '../src/worker';
 import { adminUrl, freshDatabase } from './pg';
 
@@ -51,7 +52,7 @@ describe.skipIf(!adminUrl)('job workers on one queue', () => {
         });
         await enqueueRun(tx, id);
       });
-    const deps = { db, bucket: {} as R2Bucket, models, adapters: {} };
+    const deps = { db, bucket: memoryStore(), models, adapters: {} };
     const logs: string[] = [];
     const log = (message: string, details: Record<string, unknown>) =>
       logs.push(`${message} ${JSON.stringify(details)}`);

@@ -29,6 +29,7 @@ import { composeOutputs, storeOutputs } from './outputs';
 import { checkPoints, checkWindows, judgeCheck } from './repair';
 import { type RepairContext, repairOutputs, type SegmentCheck } from './repair-steps';
 import type { JobRow } from './schema';
+import type { ObjectStore } from './store';
 import type { PollResult, SubmitInput, UpstreamAdapter } from './upstream';
 import { UpstreamError } from './upstream';
 
@@ -47,7 +48,7 @@ export interface StepRunner {
 
 export interface RunnerDeps {
   db: Db;
-  bucket: R2Bucket;
+  bucket: ObjectStore;
   models: readonly ModelDefinition[];
   adapters: Record<string, UpstreamAdapter>;
   /** Effect compose (effect.compose); empty when the site binds no container, and jobs that need compose fail with a refund. */
@@ -619,7 +620,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           const response = await (deps.fetcher ?? fetch)(url, { signal: AbortSignal.timeout(ms) });
           if (!response.ok) throw new Error(`download failed: ${response.status}`);
           const image = await response.arrayBuffer();
-          await deps.bucket.put(key, image, { httpMetadata: { contentType: mediaType } });
+          await deps.bucket.put(key, image, { contentType: mediaType });
         };
         const failed: { part: string; error: string }[] = [];
         for (const image of kept) {
@@ -839,7 +840,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
                 if (images.length !== 4 || images.some((image) => !image.byteLength))
                   throw new Error('sheet must produce four images');
                 for (const [view, key] of keys.entries())
-                  await deps.bucket.put(key, images[view]!, { httpMetadata: { contentType: 'image/png' } });
+                  await deps.bucket.put(key, images[view]!, { contentType: 'image/png' });
               }
               return keys.map((key) => deps.fileUrl!(key));
             });

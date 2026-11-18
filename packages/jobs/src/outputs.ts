@@ -33,7 +33,7 @@ export async function storeOutputs(
     const body = isMp3(mediaType)
       ? stripAudioTags(new Uint8Array(await response.arrayBuffer()))
       : response.body;
-    await deps.bucket.put(key, body, { httpMetadata: { contentType: mediaType } });
+    await deps.bucket.put(key, body, { contentType: mediaType });
     stored.push({ key, mediaType });
   }
   return stored;
@@ -82,7 +82,7 @@ export async function composeOutputs(
   });
   const song = `jobs/${jobId}/${startIndex}.mp4`;
   const silent = `jobs/${jobId}/${startIndex + 1}.mp4`;
-  const meta = { httpMetadata: { contentType: 'video/mp4' } };
+  const meta = { contentType: 'video/mp4' };
   await deps.bucket.put(song, result.song, meta);
   await deps.bucket.put(silent, result.silent, meta);
   return [

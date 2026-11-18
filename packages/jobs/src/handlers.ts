@@ -28,8 +28,9 @@ import {
   referenceRoleOf,
   sanitizeParameters,
 } from './models';
-import { r2Response } from './r2-range';
+import { objectResponse } from './object-range';
 import { type JobRow, jobRuns, jobSteps, jobs } from './schema';
+import { type ObjectStore, storeFromEnv } from './store';
 
 const MAX_PROMPT = 4000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -79,6 +80,8 @@ function withCookie(response: Response, setCookie: string | null): Response {
 export interface JobsOptions {
   /** Tell this process's job worker a run is waiting (worker.wake); without it the worker finds the run on its next poll. */
   wake?: () => void;
+  /** Where uploads and outputs live; defaults to the store the environment configures (storeFromEnv). */
+  store?: ObjectStore;
 }
 
 export function createJobs(core: Core, models: readonly ModelDefinition[], options: JobsOptions = {}) {
@@ -91,6 +94,8 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
     }
   };
   const env = () => core.env as unknown as JobsEnv & { GUEST_COOKIE_SECRET: string; APP_URL?: string };
+  let configured: ObjectStore | null = options.store ?? null;
+  const store = () => (configured ??= storeFromEnv(env()));
   const baseURL = () => (env().APP_URL ?? core.site.url).replace(/\/$/, '');
 
   /** Identity of the current request: signed-in user, or a guest with a signed cookie. Signed-in users also claim this device's guest jobs. */
@@ -393,7 +398,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
       }
       const ext = type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg';
       const key = `uploads/${newId('up')}.${ext}`;
-      await env().OUTPUTS.put(key, bytes, { httpMetadata: { contentType: type } });
+      await store().put(key, bytes, { contentType: type });
       return withCookie(
         json({ path: `/files/${key}`, url: `${baseURL()}/files/${key}` }, { status: 201 }),
         guest?.setCookie ?? null,
@@ -401,7 +406,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
     },
 
     /**
-     * GET /files/<key>: read outputs and uploads from R2. Keys contain a random ID and can't be enumerated. An output replaced by hand
+     * GET /files/<key>: read outputs and uploads from the object store. Keys contain a random ID and can't be enumerated. An output replaced by hand
      * after a redo (tools/replace-output.mjs) gets a new key, <n>-r<timestamp>.<ext>, since outputs are cached as immutable.
      */
     async file(request: Request, key: string): Promise<Response> {
@@ -421,15 +426,15 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
       const intermediate = key.includes('/repair-') || key.includes('/prep-');
       if (jobId && status !== (intermediate ? 'submitted' : 'succeeded'))
         return errorResponse(404, 'not_found');
-      const head = await env().OUTPUTS.head(key);
+      const head = await store().head(key);
       if (!head) return errorResponse(404, 'not_found');
       const headers = new Headers();
-      head.writeHttpMetadata(headers);
+      if (head.contentType) headers.set('content-type', head.contentType);
       // Customer uploads are deleted by a lifecycle rule after a few days; a cached copy must not outlive that, so they are never cached.
       const uncached = intermediate || key.startsWith('uploads/');
       headers.set('cache-control', uncached ? 'no-store' : 'public, max-age=31536000, immutable');
       // Byte ranges: iPhone Safari needs 206 to play stored videos.
-      return (await r2Response(env().OUTPUTS, key, request, headers)) ?? errorResponse(404, 'not_found');
+      return (await objectResponse(store(), key, request, headers)) ?? errorResponse(404, 'not_found');
     },
   };
 }

@@ -35,10 +35,10 @@ async function setup(balance = 10) {
       log: () => {},
       env: {
         GUEST_COOKIE_SECRET: 'test-secret',
-        OUTPUTS: bucket,
       },
     } as unknown as Core,
     [model],
+    { store: bucket },
   );
   const request = (path: string, body?: unknown) =>
     new Request(`https://test.example${path}`, {
@@ -67,7 +67,7 @@ describe('GET /files', () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
     const key = `jobs/${jobId}/prep-backLeft-3.png`;
-    await bucket.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    await bucket.put(key, new Uint8Array([1]), { contentType: 'image/png' });
     expect((await ctx.file(key)).status).toBe(404);
     await db.update(jobs).set({ status: 'submitted' }).where(eq(jobs.id, jobId));
     const response = await ctx.file(key);
@@ -82,7 +82,7 @@ describe('GET /files', () => {
     const jobId = await createdId(await ctx.create());
     const keys = [`jobs/${jobId}/kept/prep-left-0.png`, `jobs/${jobId}/kept/uploads/up_a.png`];
     for (const key of keys)
-      await bucket.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+      await bucket.put(key, new Uint8Array([1]), { contentType: 'image/png' });
     for (const status of ['queued', 'submitted', 'succeeded'] as const) {
       await db.update(jobs).set({ status }).where(eq(jobs.id, jobId));
       for (const key of keys) expect((await ctx.file(key)).status).toBe(404);
@@ -90,14 +90,14 @@ describe('GET /files', () => {
   });
   it('serves uploads uncached, so no copy outlives the lifecycle deletion; outputs stay cacheable', async () => {
     const ctx = await setup();
-    await bucket.put('uploads/up_cachetest.png', new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    await bucket.put('uploads/up_cachetest.png', new Uint8Array([1]), { contentType: 'image/png' });
     const upload = await ctx.file('uploads/up_cachetest.png');
     expect(upload.status).toBe(200);
     expect(upload.headers.get('cache-control')).toBe('no-store');
     await upload.arrayBuffer();
     const jobId = await createdId(await ctx.create());
     const output = `jobs/${jobId}/0.mp4`;
-    await bucket.put(output, new Uint8Array([1]), { httpMetadata: { contentType: 'video/mp4' } });
+    await bucket.put(output, new Uint8Array([1]), { contentType: 'video/mp4' });
     await markSucceeded(db, jobId, [{ key: output, mediaType: 'video/mp4' }]);
     const served = await ctx.file(output);
     expect(served.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
@@ -108,7 +108,7 @@ describe('GET /files', () => {
     const jobId = await createdId(await ctx.create());
     const replaced = `jobs/${jobId}/0-r1794301409744.mp4`;
     await bucket.put(replaced, new Uint8Array([1, 2, 3]), {
-      httpMetadata: { contentType: 'video/mp4' },
+      contentType: 'video/mp4',
     });
     expect((await ctx.file(replaced)).status).toBe(404);
     await markSucceeded(db, jobId, [{ key: replaced, mediaType: 'video/mp4' }]);

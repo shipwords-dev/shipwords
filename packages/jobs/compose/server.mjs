@@ -1,4 +1,4 @@
-// HTTP server for the compose container (runs in Cloudflare Containers; image in Dockerfile).
+// HTTP server for the compose service: one long-running container per machine, reached over the internal network (image in Dockerfile).
 // POST /compose  multipart: manifest (JSON: { id, segments: [{ target, fit, cuts? }], audio: { start, duration }, width, height, fps }),
 //   segment-0…segment-N (segment videos), audio (original track). Stitches, retimes and mixes, returns an MP4 with the track; results also stay in /tmp/compose/<id>/.
 //   A segment with cuts is split at the scene cuts found in its video and each shot is retimed to its length; a missing cut fails the request.
@@ -14,11 +14,13 @@
 // POST /patch  multipart: manifest (as extract plus id), video, patch (the repaired clip). Returns video with the repaired frames
 //   put back: a whole-frame clip covers the frame and replaces them; a box is lined up frame by frame on the background (align.py;
 //   stretched over the box if that fails). Results also stay in /tmp/compose/<id>/ (song.mp4, silent.mp4) like compose.
-// Repeating compose with the same id overwrites the same files, so Workflow retries are idempotent.
+// Repeating compose with the same id overwrites the same files, so step retries are idempotent.
+// Heavy requests run at most MAX_JOBS (default 2) at a time; the rest wait. Work directories are removed KEEP_MS (default 2 h)
+// after they were last written, since no container teardown cleans them any more.
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -392,21 +394,48 @@ async function splitSheet(req) {
   }
 }
 
-// The process stops itself rather than trusting the platform to stop it: sleepAfter in @cloudflare/containers can renew
-// forever (an unread response body keeps its in-flight count up; re-creating an evicted Durable Object resets the timer),
-// and a running instance bills memory whether or not it works. Calls within one job step come seconds apart, while
-// waits on the upstream model between repair rounds take 75 s or more, so a minute idle means the step is done.
-// The lifetime cap ends even a stuck process; a request cut off by it fails its Workflow step, which retries on a fresh instance.
-const IDLE_EXIT_MS = Number(process.env.IDLE_EXIT_MS) || 60_000;
-const MAX_LIFETIME_MS = Number(process.env.MAX_LIFETIME_MS) || 10 * 60_000;
+// Optional self-stop, for platforms that bill an idle instance (it was needed on Cloudflare Containers, where sleepAfter could
+// renew forever). Off unless IDLE_EXIT_MS / MAX_LIFETIME_MS are set: as a long-running service it just keeps running.
+const IDLE_EXIT_MS = Number(process.env.IDLE_EXIT_MS) || 0;
+const MAX_LIFETIME_MS = Number(process.env.MAX_LIFETIME_MS) || 0;
 let inFlight = 0;
 let idleTimer;
 const armIdleExit = () => {
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => process.exit(0), IDLE_EXIT_MS);
+  if (IDLE_EXIT_MS > 0) idleTimer = setTimeout(() => process.exit(0), IDLE_EXIT_MS);
 };
 armIdleExit();
-setTimeout(() => process.exit(0), MAX_LIFETIME_MS);
+if (MAX_LIFETIME_MS > 0) setTimeout(() => process.exit(0), MAX_LIFETIME_MS);
+
+// ffmpeg and the face checks are CPU-heavy: a few at a time, the rest queue.
+const MAX_JOBS = Math.max(1, Number(process.env.MAX_JOBS) || 2);
+let running = 0;
+const waiting = [];
+async function limited(work) {
+  if (running >= MAX_JOBS) await new Promise((resolve) => waiting.push(resolve));
+  running++;
+  try {
+    return await work();
+  } finally {
+    running--;
+    waiting.shift()?.();
+  }
+}
+
+// Work directories left by compose, patch, faces and extract: removed once untouched for KEEP_MS.
+const KEEP_MS = Number(process.env.KEEP_MS) || 2 * 3_600_000;
+async function sweep() {
+  for (const root of [ROOT, '/tmp/faces', '/tmp/extract']) {
+    const entries = await readdir(root).catch(() => []);
+    for (const entry of entries) {
+      const dir = join(root, entry);
+      const info = await stat(dir).catch(() => null);
+      if (info && Date.now() - info.mtimeMs > KEEP_MS)
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+setInterval(() => void sweep(), 10 * 60_000).unref();
 
 createServer(async (req, res) => {
   // Health probes are not work and must not keep the instance alive.
@@ -420,27 +449,27 @@ createServer(async (req, res) => {
   }
   try {
     if (req.method === 'POST' && req.url === '/split-sheet') {
-      const body = JSON.stringify({ images: await splitSheet(req) });
+      const body = JSON.stringify({ images: await limited(() => splitSheet(req)) });
       return res.writeHead(200, { 'content-type': 'application/json' }).end(body);
     }
     if (req.method === 'POST' && req.url === '/compose') {
-      const song = await compose(req);
+      const song = await limited(() => compose(req));
       return sendFile(res, song, (await stat(song)).size);
     }
     if (req.method === 'POST' && req.url === '/extract') {
-      const clip = await extract(req);
+      const clip = await limited(() => extract(req));
       return res.writeHead(200, { 'content-type': 'video/mp4', 'content-length': clip.length }).end(clip);
     }
     if (req.method === 'POST' && req.url === '/patch') {
-      const song = await patch(req);
+      const song = await limited(() => patch(req));
       return sendFile(res, song, (await stat(song)).size);
     }
     if (req.method === 'POST' && req.url === '/faces') {
-      const body = JSON.stringify({ similarity: await faces(req) });
+      const body = JSON.stringify({ similarity: await limited(() => faces(req)) });
       return res.writeHead(200, { 'content-type': 'application/json' }).end(body);
     }
     if (req.method === 'POST' && req.url === '/likeness') {
-      const body = JSON.stringify({ similarity: await likeness(req) });
+      const body = JSON.stringify({ similarity: await limited(() => likeness(req)) });
       return res.writeHead(200, { 'content-type': 'application/json' }).end(body);
     }
     const match = req.method === 'GET' && req.url?.match(/^\/files\/([a-z0-9_-]{1,80})\/(song|silent)\.mp4$/);
@@ -457,6 +486,6 @@ createServer(async (req, res) => {
   }
 }).listen(8080);
 
-// Node runs as PID 1 here, and PID 1 ignores SIGTERM unless it has a handler: without this, the stop signal sent after
-// sleepAfter does nothing and the instance keeps billing memory for hours. The idle exit above is the primary stop.
+// Node runs as PID 1 here, and PID 1 ignores SIGTERM unless it has a handler: without this, docker stop waits for its timeout and
+// then kills the process.
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => process.exit(0));

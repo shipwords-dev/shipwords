@@ -1,12 +1,14 @@
 import { createDb, type Db } from '@shipwords/core/db/client';
+import { type Mailer, mailerFromEnv } from '@shipwords/core/email/mailer';
 import type { SiteConfig } from '@shipwords/core/site';
 import { createAdapters, fixedMockResult, type JobsEnv } from './adapters';
-import { containerComposer } from './compose';
+import { httpComposer } from './compose';
 import { workersAiDescribe } from './describe';
 import { mockComposer, mockMode } from './mock';
 import type { ModelDefinition } from './models';
 import { emailFailures, emailOnFinish, emailReview } from './notify';
 import type { RunnerDeps } from './runner';
+import { type ObjectStore, storeFromEnv } from './store';
 import { type JobWorker, startJobWorker, type WorkerOptions } from './worker';
 
 export interface SiteRunnerOptions {
@@ -23,38 +25,45 @@ export function runnerDeps(
   db: Db,
   models: readonly ModelDefinition[],
   site?: SiteConfig,
-  options: SiteRunnerOptions = {},
+  options: SiteRunnerOptions & { store?: ObjectStore; mailer?: Mailer } = {},
 ): RunnerDeps {
-  const baseURL = (env.APP_URL ?? site?.url)?.replace(/\/$/, '');
+  const appUrl = env.APP_URL ?? site?.url;
+  const baseURL = appUrl?.endsWith('/') ? appUrl.slice(0, -1) : appUrl;
+  const log = (message: string, details: Record<string, unknown>) =>
+    console.log(JSON.stringify({ level: 'info', message, ...details }));
+  const store = options.store ?? storeFromEnv(env);
+  const mailer = options.mailer ?? mailerFromEnv(env, log);
+  const from = env.EMAIL_FROM;
   return {
     db,
-    bucket: env.OUTPUTS,
+    bucket: store,
     models,
     adapters: createAdapters(env),
     ...(mockMode(env)
-      ? { composer: mockComposer(env.OUTPUTS, fixedMockResult(env)) }
-      : env.COMPOSE
-        ? { composer: containerComposer(env.COMPOSE, env.OUTPUTS) }
+      ? { composer: mockComposer(store, fixedMockResult(env)) }
+      : env.COMPOSE_URL
+        ? { composer: httpComposer(env.COMPOSE_URL, store) }
         : {}),
     // Served by the site's /files route (handlers.ts file), the same origin the upload URLs use.
     ...(baseURL ? { fileUrl: (key: string) => `${baseURL}/files/${key}` } : {}),
-    ...(site && options.emails !== false && env.EMAIL && env.EMAIL_FROM
-      ? { notify: emailOnFinish({ db, email: env.EMAIL, from: env.EMAIL_FROM, site, baseURL: baseURL! }) }
+    ...(site && options.emails !== false && from
+      ? { notify: emailOnFinish({ db, email: mailer, from, site, baseURL: baseURL! }) }
       : {}),
-    ...(env.AI ? { describe: workersAiDescribe(env.AI) } : {}),
-    ...(site && env.EMAIL && env.EMAIL_FROM && env.REVIEW_EMAIL
+    ...(env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_API_TOKEN
       ? {
-          review: emailReview({
-            email: env.EMAIL,
-            from: env.EMAIL_FROM,
-            to: env.REVIEW_EMAIL,
-            site,
-            baseURL: baseURL!,
+          describe: workersAiDescribe({
+            accountId: env.CLOUDFLARE_ACCOUNT_ID,
+            apiToken: env.CLOUDFLARE_API_TOKEN,
           }),
-          failures: emailFailures({ email: env.EMAIL, from: env.EMAIL_FROM, to: env.REVIEW_EMAIL, site }),
         }
       : {}),
-    log: (message, details) => console.log(JSON.stringify({ level: 'info', message, ...details })),
+    ...(site && from && env.REVIEW_EMAIL
+      ? {
+          review: emailReview({ email: mailer, from, to: env.REVIEW_EMAIL, site, baseURL: baseURL! }),
+          failures: emailFailures({ email: mailer, from, to: env.REVIEW_EMAIL, site }),
+        }
+      : {}),
+    log,
   };
 }
 

@@ -1,6 +1,8 @@
+import type { ObjectStore } from './store';
+
 // Effect video compose: stitch segments (model outputs or base clips) in order into one video, mix in the original track, plus a silent version.
-// The actual ffmpeg runs in Cloudflare Containers (image in packages/jobs/compose/); this side only
-// fetches files from R2, hands them to the container and stores the results.
+// The actual ffmpeg runs in the compose service (packages/jobs/compose/); this side only reads files from the object store, hands
+// them to the service and stores the results.
 
 import type { CropBox, FacePoint } from './models';
 
@@ -102,23 +104,24 @@ export interface Composer {
   patch(input: PatchInput): Promise<{ song: ArrayBuffer; silent: ArrayBuffer }>;
 }
 
-async function blobOf(bucket: R2Bucket, key: string): Promise<Blob> {
+async function blobOf(bucket: ObjectStore, key: string): Promise<Blob> {
   const object = await bucket.get(key);
   if (!object) throw new Error(`compose input missing: ${key}`);
   return new Blob([await object.arrayBuffer()], { type: 'application/octet-stream' });
 }
 
 /**
- * The site binds the Container class as a Durable Object (e.g. COMPOSE) and picks an instance by jobId:
- * retries of the same job hit the same container instance, so a second request can read the previous result files.
+ * The compose service (packages/jobs/compose) over HTTP at baseUrl. One service per machine: compose and patch leave their results
+ * in the service's work directory under the job or pass name, and the silent copy is fetched from there right after.
  */
-export function containerComposer(namespace: DurableObjectNamespace, bucket: R2Bucket): Composer {
+export function httpComposer(baseUrl: string, bucket: ObjectStore, fetcher: typeof fetch = fetch): Composer {
+  const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  const call = (path: string, init?: RequestInit) => fetcher(`${base}${path}`, init);
   return {
     async splitSheet(input) {
       const form = new FormData();
       form.set('image', new Blob([input.image]), 'sheet');
-      const stub = namespace.get(namespace.idFromName(input.jobId));
-      const response = await stub.fetch('http://compose/split-sheet', { method: 'POST', body: form });
+      const response = await call('/split-sheet', { method: 'POST', body: form });
       if (!response.ok) throw new Error(`split sheet failed: ${response.status} ${await response.text()}`);
       const { images } = (await response.json()) as { images: string[] };
       if (
@@ -151,12 +154,10 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       }
       form.set('audio', await blobOf(bucket, input.audio.key), 'audio');
 
-      const stub = namespace.get(namespace.idFromName(input.jobId));
-      const composed = await stub.fetch('http://compose/compose', { method: 'POST', body: form });
+      const composed = await call('/compose', { method: 'POST', body: form });
       if (!composed.ok) throw new Error(`compose failed: ${composed.status} ${await composed.text()}`);
       const song = await composed.arrayBuffer();
-      const silent = await stub.fetch(`http://compose/files/${input.jobId}/silent.mp4`);
-      // Read or cancel every body: an unread one keeps the container's in-flight count up and it never sleeps.
+      const silent = await call(`/files/${input.jobId}/silent.mp4`);
       if (!silent.ok) throw new Error(`compose silent copy failed: ${silent.status} ${await silent.text()}`);
       return { song, silent: await silent.arrayBuffer() };
     },
@@ -167,8 +168,7 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       if (input.windows) form.set('windows', JSON.stringify(input.windows));
       form.set('video', await blobOf(bucket, input.key), 'video.mp4');
       form.set('original', await blobOf(bucket, input.originalKey), 'original.mp4');
-      const stub = namespace.get(namespace.idFromName(input.jobId));
-      const response = await stub.fetch('http://compose/faces', { method: 'POST', body: form });
+      const response = await call('/faces', { method: 'POST', body: form });
       if (!response.ok) throw new Error(`faces failed: ${response.status} ${await response.text()}`);
       const { similarity } = (await response.json()) as { similarity?: unknown };
       if (
@@ -204,8 +204,7 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       };
       const photos = await Promise.all(input.people.map(({ photo }) => blobFor(photo)));
       for (const [i, blob] of photos.entries()) form.set(`photo-${i}`, blob, 'photo');
-      const stub = namespace.get(namespace.idFromName(input.jobId));
-      const response = await stub.fetch('http://compose/likeness', { method: 'POST', body: form });
+      const response = await call('/likeness', { method: 'POST', body: form });
       if (!response.ok) throw new Error(`likeness failed: ${response.status} ${await response.text()}`);
       const { similarity } = (await response.json()) as { similarity?: unknown };
       if (
@@ -220,8 +219,7 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       const form = new FormData();
       form.set('manifest', JSON.stringify(cutManifest(input)));
       form.set('video', await blobOf(bucket, input.key), 'video.mp4');
-      const stub = namespace.get(namespace.idFromName(input.jobId));
-      const response = await stub.fetch('http://compose/extract', { method: 'POST', body: form });
+      const response = await call('/extract', { method: 'POST', body: form });
       if (!response.ok) throw new Error(`extract failed: ${response.status} ${await response.text()}`);
       return response.arrayBuffer();
     },
@@ -230,11 +228,10 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
       form.set('manifest', JSON.stringify({ ...cutManifest(input), id: input.name }));
       form.set('video', await blobOf(bucket, input.key), 'video.mp4');
       form.set('patch', await blobOf(bucket, input.patchKey), 'patch.mp4');
-      const stub = namespace.get(namespace.idFromName(input.jobId));
-      const response = await stub.fetch('http://compose/patch', { method: 'POST', body: form });
+      const response = await call('/patch', { method: 'POST', body: form });
       if (!response.ok) throw new Error(`patch failed: ${response.status} ${await response.text()}`);
       const song = await response.arrayBuffer();
-      const silent = await stub.fetch(`http://compose/files/${input.name}/silent.mp4`);
+      const silent = await call(`/files/${input.name}/silent.mp4`);
       if (!silent.ok) throw new Error(`patch silent copy failed: ${silent.status} ${await silent.text()}`);
       return { song, silent: await silent.arrayBuffer() };
     },

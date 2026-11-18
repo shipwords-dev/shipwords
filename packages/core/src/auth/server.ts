@@ -7,6 +7,7 @@ import { grantCredits } from '../credits/ledger';
 import type { Db } from '../db/client';
 import * as schema from '../db/schema';
 import { emailCopy } from '../email/copy';
+import type { Mailer } from '../email/mailer';
 import type { CoreEnv } from '../env';
 import { clientIp, ipBucket } from '../http';
 import { consumeQuota, dayWindow, type QuotaRule, releaseQuota } from '../quota/counters';
@@ -19,6 +20,8 @@ export const ATTRIBUTION_COOKIE = 'sh_attr';
 export interface AuthDeps {
   db: Db;
   env: CoreEnv;
+  /** Sends sign-in codes. */
+  mailer: Mailer;
   site: SiteConfig;
   baseURL: string;
   log: (message: string, details: Record<string, unknown>) => void;
@@ -133,7 +136,7 @@ export function createAuth(deps: AuthDeps) {
         otpLength: 6,
         expiresIn: 600,
         async sendVerificationOTP({ email, otp }) {
-          await env.EMAIL.send({
+          await deps.mailer.send({
             to: email,
             from: { email: env.EMAIL_FROM, name: site.name },
             ...emailCopy(site.defaultLocale).signInCode({ siteName: site.name, otp }),

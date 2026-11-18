@@ -1,3 +1,4 @@
+import type { Mailer } from '@shipwords/core/email/mailer';
 import { describe, expect, it } from 'vitest';
 import { DESCRIBE_MODEL, workersAiDescribe } from '../src/describe';
 import {
@@ -345,24 +346,26 @@ describe('repair planning by shot groups', () => {
 });
 
 describe('describe and review helpers', () => {
-  it('sends the image as a data URL with the instruction and returns the answer', async () => {
-    const calls: unknown[] = [];
-    const ai = {
-      run: async (model: string, input: unknown) => {
-        calls.push([model, input]);
-        return { response: 'a man in a red shirt' };
-      },
-    } as unknown as Ai;
-    const fetcher = (async () =>
-      new Response(new Uint8Array([1, 2, 3]), {
-        headers: { 'content-type': 'image/png' },
-      })) as unknown as typeof fetch;
-    const describe = workersAiDescribe(ai, { fetcher });
+  it('sends the image as a data URL with the instruction to Workers AI and returns the answer', async () => {
+    const calls: { url: string; auth: string | null; body: unknown }[] = [];
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === 'https://up/front.png')
+        return new Response(new Uint8Array([1, 2, 3]), { headers: { 'content-type': 'image/png' } });
+      calls.push({
+        url,
+        auth: new Headers(init?.headers).get('authorization'),
+        body: JSON.parse(String(init?.body)),
+      });
+      return Response.json({ success: true, result: { response: 'a man in a red shirt' } });
+    }) as typeof fetch;
+    const describe = workersAiDescribe({ accountId: 'acc', apiToken: 'tok' }, { fetcher });
     expect(await describe('https://up/front.png', 'who is this')).toBe('a man in a red shirt');
     expect(calls).toEqual([
-      [
-        DESCRIBE_MODEL,
-        {
+      {
+        url: `https://api.cloudflare.com/client/v4/accounts/acc/ai/run/${DESCRIBE_MODEL}`,
+        auth: 'Bearer tok',
+        body: {
           messages: [
             {
               role: 'user',
@@ -374,17 +377,28 @@ describe('describe and review helpers', () => {
           ],
           max_tokens: 80,
         },
-      ],
+      },
     ]);
-    const broken = workersAiDescribe(ai, {
-      fetcher: (async () => new Response('', { status: 404 })) as unknown as typeof fetch,
-    });
+    const broken = workersAiDescribe(
+      { accountId: 'acc', apiToken: 'tok' },
+      { fetcher: (async () => new Response('', { status: 404 })) as unknown as typeof fetch },
+    );
     await expect(broken('https://up/x.png', 'x')).rejects.toThrow(/404/);
+    const refused = workersAiDescribe(
+      { accountId: 'acc', apiToken: 'tok' },
+      {
+        fetcher: (async (input: RequestInfo | URL) =>
+          String(input).startsWith('https://up/')
+            ? new Response(new Uint8Array([1]), { headers: { 'content-type': 'image/png' } })
+            : new Response('{"success":false}', { status: 403 })) as typeof fetch,
+      },
+    );
+    await expect(refused('https://up/x.png', 'x')).rejects.toThrow(/403/);
   });
 
   it('emails the owner which job needs a look, why and where the result is', async () => {
     const sent: { to: string; subject: string; text: string; html: string }[] = [];
-    const email = { send: async (message: never) => void sent.push(message) } as unknown as SendEmail;
+    const email = { send: async (message: never) => void sent.push(message) } as unknown as Mailer;
     const review = emailReview({
       email,
       from: 'noreply@site.example',

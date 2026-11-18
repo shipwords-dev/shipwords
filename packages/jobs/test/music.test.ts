@@ -1,5 +1,6 @@
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
 import { user } from '@shipwords/core/db/schema';
+import type { Mailer } from '@shipwords/core/email/mailer';
 import type { Core } from '@shipwords/core/server';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
@@ -265,7 +266,7 @@ describe('running a music job', () => {
       db,
       email: {
         send: async (message: { subject: string }) => void sent.push(message),
-      } as unknown as SendEmail,
+      } as unknown as Mailer,
       from: 'no-reply@music.test',
       site: { name: 'Music', defaultLocale: 'en' },
       baseURL: BASE,
@@ -280,7 +281,7 @@ describe('running a music job', () => {
       db,
       email: {
         send: async (message: { subject: string; text: string }) => void sent.push(message),
-      } as unknown as SendEmail,
+      } as unknown as Mailer,
       from: 'no-reply@music.test',
       site: { name: 'AI作曲', defaultLocale: 'ja' },
       baseURL: BASE,
