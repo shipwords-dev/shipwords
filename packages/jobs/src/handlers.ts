@@ -29,7 +29,7 @@ import {
   sanitizeParameters,
 } from './models';
 import { r2Response } from './r2-range';
-import { type JobRow, jobSteps, jobs } from './schema';
+import { type JobRow, jobRuns, jobSteps, jobs } from './schema';
 
 const MAX_PROMPT = 4000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -321,9 +321,11 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
       const job = await ownedJob(request, jobId);
       if (!job) return errorResponse(404, 'job_not_found');
       // A submit that has started may have reached the upstream even though no task ID was recorded yet (its process can die in
-      // between): the job counts as started, or a refund here could leave a billed task running with nothing to cancel it.
-      if (job.status === 'queued') {
-        const [begun] = await core.db
+      // between): the job counts as started, or a refund here could leave a billed task running with nothing to cancel it. The check
+      // and the cancel hold the run row, which a step also locks to start an attempt, so a submit can't begin between them.
+      const outcome = await core.db.transaction(async (tx) => {
+        await tx.select({ id: jobRuns.id }).from(jobRuns).where(eq(jobRuns.id, jobId)).for('update');
+        const [begun] = await tx
           .select({ name: jobSteps.name })
           .from(jobSteps)
           .where(
@@ -333,9 +335,11 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
             ),
           )
           .limit(1);
-        if (begun) return errorResponse(409, 'job_started');
-      }
-      const updated = await cancelQueued(core.db, jobId);
+        if (begun) return 'started' as const;
+        return cancelQueued(tx as unknown as typeof core.db, jobId);
+      });
+      if (outcome === 'started') return errorResponse(409, 'job_started');
+      const updated = outcome;
       if (updated?.status === 'submitted') return errorResponse(409, 'job_started');
       if (updated?.status === 'canceled') {
         // The run is not stopped: it may be inside the first submit, the upstream already holding the task. Left running, it sees

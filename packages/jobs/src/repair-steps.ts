@@ -335,11 +335,13 @@ export async function repairOutputs(
           const { upstreamJobId } = await adapter.submit(input, `${jobId}:${partId}:repair:${round}`);
           if (await appendUpstreamJob(deps.db, jobId, position, upstreamJobId, deps.fence))
             return { upstreamJobId };
-          // The slot was filled meanwhile, or the job ended: keep the recorded task, cancel a different one this call placed.
+          // The slot was filled meanwhile, or the job ended: keep the recorded task, cancel a different one this call placed. With
+          // the job active and the slot empty, this run may have lost the job to another that recovers this very task: retry.
           const now = await recorded();
-          if (!now || 'done' in now || now.upstreamJobId !== upstreamJobId)
+          if (!now) throw new Error(`could not record repair task ${upstreamJobId} at ${position}`);
+          if ('done' in now || now.upstreamJobId !== upstreamJobId)
             await adapter.cancel(upstreamJobId).catch(() => undefined);
-          return now ?? { done: true as const };
+          return now;
         } catch (error) {
           // A late error from an attempt another one already got past must not end the pass.
           const now = await recorded();

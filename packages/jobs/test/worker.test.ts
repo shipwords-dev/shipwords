@@ -16,7 +16,7 @@ import { defineModels } from '../src/models';
 import type { RunnerDeps } from '../src/runner';
 import { jobRuns, jobSteps, jobs } from '../src/schema';
 import type { PollResult, SubmitInput, UpstreamAdapter } from '../src/upstream';
-import { type JobWorker, type Lease, leasedSteps, RunLost, startJobWorker } from '../src/worker';
+import { guardCancel, type JobWorker, type Lease, leasedSteps, RunLost, startJobWorker } from '../src/worker';
 import { bucket } from './bucket';
 import { db } from './db';
 
@@ -314,6 +314,38 @@ describe('fenced outcome writes', () => {
     expect((await getBalance(db, userId)).available).toBe(50);
   });
 
+  it('a last attempt that succeeded but could not save is retried, whatever an earlier attempt failed with', async () => {
+    const { runId, steps } = await heldRun('w1:1', { retries: 1 });
+    // Attempt 1 failed; attempt 2 began (clearing that error) and its process died before saving.
+    let calls = 0;
+    await expect(
+      steps.do('submit', async () => {
+        calls++;
+        throw new Error('first-attempt-error');
+      }),
+    ).rejects.toThrow('first-attempt-error');
+    await db.update(jobSteps).set({ attempts: 2, error: null }).where(eq(jobSteps.runId, runId));
+    await takeOver(runId, 'w2:1');
+    const lease: Lease = { runId, token: 'w2:1', abort: new AbortController(), until: Date.now() + 60_000 };
+    expect(await leasedSteps(db, lease, { ...stepOptions, retries: 1 }).do('submit', async () => 'ok')).toBe(
+      'ok',
+    );
+    expect(calls).toBe(2);
+  });
+
+  it("starting an attempt clears the previous one's error", async () => {
+    const { runId, steps } = await heldRun('w1:1', { retries: 3 });
+    let calls = 0;
+    let errorDuringSecond: string | null | undefined;
+    await steps.do('flaky', async () => {
+      calls++;
+      if (calls === 1) throw new Error('boom');
+      errorDuringSecond = (await stepOf(runId, 'flaky'))?.error;
+      return 'ok';
+    });
+    expect(errorDuringSecond).toBeNull();
+  });
+
   it('a step budget is spent only by failed attempts, not by one cut off without an error', async () => {
     const { runId, steps } = await heldRun('w1:1');
     await db.insert(jobSteps).values({ runId, name: 'cut', attempts: 3 });
@@ -580,6 +612,73 @@ describe('job worker', () => {
       async () => (await db.select().from(jobRuns).where(eq(jobRuns.id, jobId))).at(0)?.status === 'done',
     );
     expect((await loadJob(db, jobId))?.status).toBe('succeeded');
+  });
+
+  it('a guarded adapter passes cancel on only while the claim is owned; other calls go straight through', async () => {
+    const adapter = new FakeAdapter();
+    let owned = false;
+    const guarded = guardCancel(adapter, async () => owned);
+    await guarded.cancel('up_1');
+    expect(adapter.cancelled).toEqual([]);
+    owned = true;
+    await guarded.cancel('up_2');
+    expect(adapter.cancelled).toEqual(['up_2']);
+    await guarded.submit(
+      { upstreamModel: 'm', kind: 'image', prompt: 'p', references: [], parameters: {} },
+      'k',
+    );
+    expect(adapter.submits).toHaveLength(1);
+  });
+
+  it('does not renew a lease that already expired', async () => {
+    const { jobId } = await paidJob();
+    const download = gated(imageResponse);
+    download.hold();
+    const w = worker({
+      db,
+      bucket,
+      models,
+      adapters: { yir: new FakeAdapter() },
+      fetcher: () => download.call(),
+    });
+    await until(async () => download.calls() > 0);
+    // Expired, and nobody claimed it yet: the next heartbeat must treat it as lost, not revive it.
+    const token = (await runOf(jobId)).lockedBy;
+    await db
+      .update(jobRuns)
+      .set({ lockedUntil: Date.now() - 1 })
+      .where(eq(jobRuns.id, jobId));
+    await until(async () => w.active === 0);
+    expect((await runOf(jobId)).lockedUntil).toBeLessThan(Date.now());
+    expect((await runOf(jobId)).lockedBy).toBe(token);
+    download.release();
+  });
+
+  it('retries the start-up backfill until it succeeds', async () => {
+    const { jobId } = await paidJob();
+    await db.delete(jobRuns).where(eq(jobRuns.id, jobId));
+    let failures = 2;
+    const flaky = new Proxy(db, {
+      get(target, key) {
+        if (key === 'execute' && failures > 0)
+          return async () => {
+            failures--;
+            throw new Error('connection reset');
+          };
+        return Reflect.get(target, key);
+      },
+    });
+    worker({
+      db: flaky,
+      bucket,
+      models,
+      adapters: { yir: new FakeAdapter() },
+      fetcher: async () => imageResponse(),
+    });
+    await until(
+      async () => (await db.select().from(jobRuns).where(eq(jobRuns.id, jobId))).at(0)?.status === 'done',
+    );
+    expect(failures).toBe(0);
   });
 
   it('refuses lease settings that would let a lease run out between heartbeats', () => {

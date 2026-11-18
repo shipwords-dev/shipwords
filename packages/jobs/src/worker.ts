@@ -210,7 +210,11 @@ export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRun
         await tx
           .insert(jobSteps)
           .values({ runId, name, attempts: attempt })
-          .onConflictDoUpdate({ target: [jobSteps.runId, jobSteps.name], set: { attempts: attempt } });
+          // A new attempt clears the last one's error: the budget check reads the error of the latest attempt only.
+          .onConflictDoUpdate({
+            target: [jobSteps.runId, jobSteps.name],
+            set: { attempts: attempt, error: null },
+          });
       }),
     );
     // stop() or the heartbeat may have aborted the lease while the query was in flight.
@@ -290,6 +294,21 @@ export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRun
       await settle(name, { done: true });
     },
   };
+}
+
+/**
+ * The adapter with cancel passed on only while `owned` says so: a call still running after its run was taken over must not cancel a
+ * task the new holder may be recovering under the same idempotency key. Everything else goes straight to the adapter.
+ */
+export function guardCancel<A extends RunnerDeps['adapters'][string]>(
+  adapter: A,
+  owned: () => Promise<boolean>,
+): A {
+  const guarded = Object.create(adapter) as A;
+  guarded.cancel = async (id: string) => {
+    if (await owned()) await adapter.cancel(id);
+  };
+  return guarded;
 }
 
 /**
@@ -397,8 +416,8 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
   }
 
   /** Upstream task IDs a run placed: those recorded on the job, plus prep hedge copies, which only live in step results. */
-  async function upstreamTasks(runId: string, recorded: readonly string[]): Promise<string[]> {
-    const hedges = await db
+  async function upstreamTasks(runId: string, recorded: readonly string[], on: Db = db): Promise<string[]> {
+    const hedges = await on
       .select({ result: jobSteps.result })
       .from(jobSteps)
       .where(and(eq(jobSteps.runId, runId), like(jobSteps.name, 'hedge:%'), isNotNull(jobSteps.doneAt)));
@@ -430,26 +449,55 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
    * claim holds the lease: another worker may have taken the run over, and the failure write is fenced on the claim as well.
    */
   async function bury(lease: Lease, why: string) {
-    if (!(await stillHeld(lease))) return;
-    const fence: Fence = { runId: lease.runId, token: lease.token };
-    const job = await loadJob(db, lease.runId);
-    if (job && !TERMINAL.includes(job.status)) {
-      const adapter = deps.adapters[job.upstream];
-      if (adapter)
-        await within(CANCEL_LIMIT_MS, cancelAll(adapter, await upstreamTasks(lease.runId, upstreamIds(job))));
-    }
-    // A job that already ended keeps its state; settlement is idempotent and completes in case the last run died before settle.
-    if (job) await markFailed(db, lease.runId, 'failed', 'stale', why, fence);
-    await end(lease, 'dead');
+    // One transaction holding the run row: while it runs, no other worker can claim the run (claims skip locked rows) and the
+    // lease can't move, so checking it, canceling upstream, failing the job and ending the run happen as one owner's act.
+    await db.transaction(async (tx) => {
+      const [row] = await tx
+        .select({ id: jobRuns.id })
+        .from(jobRuns)
+        .where(
+          and(
+            eq(jobRuns.id, lease.runId),
+            eq(jobRuns.lockedBy, lease.token),
+            eq(jobRuns.status, 'pending'),
+            sql`${jobRuns.lockedUntil} > ${now()}`,
+          ),
+        )
+        .for('update');
+      if (!row) return;
+      const job = await loadJob(tx as unknown as Db, lease.runId);
+      if (job && !TERMINAL.includes(job.status)) {
+        const adapter = deps.adapters[job.upstream];
+        const tasks = await upstreamTasks(lease.runId, upstreamIds(job), tx as unknown as Db);
+        if (adapter) await within(CANCEL_LIMIT_MS, cancelAll(adapter, tasks));
+      }
+      // A job that already ended keeps its state; settlement is idempotent and completes in case the last run died before settle.
+      if (job) await markFailed(tx as unknown as Db, lease.runId, 'failed', 'stale', why);
+      await tx
+        .update(jobRuns)
+        .set({ status: 'dead', lockedBy: null, lockedUntil: null, finishedAt: now() })
+        .where(eq(jobRuns.id, lease.runId));
+    });
   }
 
-  /** A job that ended without a result: cancel prep hedge copies its run placed (the runner only cancels what the job row lists). */
-  async function cancelLeftovers(runId: string) {
-    const job = await loadJob(db, runId);
+  /**
+   * A job that ended without a result: cancel prep hedge copies its run placed (the runner only cancels what the job row lists).
+   * Reading them is the worker's own database work: if it fails the run is handed back, not finished without the cleanup.
+   */
+  async function cancelLeftovers(lease: Lease) {
+    const job = await quiet(lease, () => loadJob(db, lease.runId));
     if (!job || job.status === 'succeeded' || !TERMINAL.includes(job.status)) return;
     const adapter = deps.adapters[job.upstream];
-    const copies = await upstreamTasks(runId, []);
+    const copies = await quiet(lease, () => upstreamTasks(lease.runId, []));
     if (adapter && copies.length > 0) await within(CANCEL_LIMIT_MS, cancelAll(adapter, copies));
+  }
+
+  /** The run's adapters, with cancel going upstream only while this claim still holds the lease. */
+  function guardedAdapters(lease: Lease): RunnerDeps['adapters'] {
+    const owned = async () => !lease.abort.signal.aborted && (await stillHeld(lease).catch(() => false));
+    return Object.fromEntries(
+      Object.entries(deps.adapters).map(([name, adapter]) => [name, guardCancel(adapter, owned)]),
+    );
   }
 
   /** The worker's own database work outside steps: a failure hands the run back, like one inside a step. */
@@ -482,7 +530,7 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
       const fence: Fence = { runId: run.id, token: run.token };
       const steps = leasedSteps(db, lease, stepOptions);
       try {
-        await runGeneration({ ...deps, fence }, run.id, steps);
+        await runGeneration({ ...deps, adapters: guardedAdapters(lease), fence }, run.id, steps);
       } catch (error) {
         if (error instanceof RunLost) throw error;
         // runGeneration has its own fallback; this catches what escapes it.
@@ -499,9 +547,7 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
         log('job run ended with the job unfinished', { jobId: run.id, status: job.status });
         return;
       }
-      await cancelLeftovers(run.id).catch((error: unknown) =>
-        log('canceling leftover upstream tasks failed', { jobId: run.id, error: String(error) }),
-      );
+      await cancelLeftovers(lease);
       await quiet(lease, () => end(lease, 'done'));
     } catch (error) {
       if (error instanceof RunLost) {
@@ -546,6 +592,8 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
             leases.map((lease) => lease.token),
           ),
           eq(jobRuns.status, 'pending'),
+          // An expired lease is lost even if nobody claimed the run yet: a fenced write may already have been refused.
+          sql`${jobRuns.lockedUntil} > ${t}`,
         ),
       )
       .returning({ id: jobRuns.id });
@@ -573,6 +621,8 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
 
   async function poll() {
     if (stopping) return;
+    if (!backfilled)
+      await backfill().catch((error: unknown) => log('job run backfill failed', { error: String(error) }));
     const free = slots - held.size;
     if (free > 0) {
       for (const run of await claim(free)) {
@@ -609,15 +659,14 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
       });
   }
 
-  if (options.backfill !== false) {
-    // Jobs created before job_runs existed (or by an older version) have no run; without one nothing would ever run or settle them.
-    void Promise.resolve()
-      .then(() =>
-        db.execute(
-          sql`insert into ${jobRuns} (id) select ${jobs.id} from ${jobs} where ${jobs.status} in ('queued', 'submitted') on conflict do nothing`,
-        ),
-      )
-      .catch((error: unknown) => log('job run backfill failed', { error: String(error) }));
+  // Jobs created before job_runs existed (or by an older version) have no run; without one nothing would ever run or settle them.
+  // Done once per process, retried on each poll until it succeeds.
+  let backfilled = options.backfill === false;
+  async function backfill() {
+    await db.execute(
+      sql`insert into ${jobRuns} (id) select ${jobs.id} from ${jobs} where ${jobs.status} in ('queued', 'submitted') on conflict do nothing`,
+    );
+    backfilled = true;
   }
 
   const beat = setInterval(() => {

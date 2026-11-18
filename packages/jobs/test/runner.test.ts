@@ -285,6 +285,25 @@ describe('generation jobs', () => {
     expect((await getBalance(db, userId)).available).toBe(40);
   });
 
+  it('a submit whose record is refused while the slot is still empty retries instead of canceling or ending', async () => {
+    const { jobId } = await paidJob();
+    const adapter = new FakeAdapter();
+    // The run lost the job between submit and record: the fenced write is refused and the slot stays empty.
+    const deps2 = { ...deps(adapter), fence: { runId: jobId, token: 'not-the-holder' } };
+    await expect(
+      runGeneration(deps2, jobId, {
+        do: async (name, fn) => {
+          if (name === 'abort' || name === 'settle') throw new Error('stop here');
+          return fn();
+        },
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow('stop here');
+    expect(adapter.submits).toHaveLength(1);
+    expect(adapter.cancelled).toEqual([]);
+    expect((await loadJob(db, jobId))?.status).toBe('queued');
+  });
+
   it('a submit replayed past the deadline recovers the task an earlier attempt may have placed, then cancels it', async () => {
     const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
     const adapter = new FakeAdapter();

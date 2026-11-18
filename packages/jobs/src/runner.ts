@@ -506,6 +506,8 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
             );
             return upstreamJobId;
           } catch (error) {
+            // Recovering a copy an earlier attempt may have placed: retry, or its ID (needed to cancel it) would be lost.
+            if (Date.now() > deadline && (info?.attempt ?? 1) > 1) throw error;
             deps.log?.('prep hedge failed', { jobId, part: partId, error: String(error) });
             return null;
           }
@@ -693,6 +695,10 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           return { upstreamJobId };
         const now = await activeJob(deps.db, jobId);
         const recorded = now ? upstreamIds(now)[index] : undefined;
+        // Still active with an empty slot: this run may no longer hold the job (its write was fenced off), and whoever does may be
+        // recovering this very task with the same key. Leave the task alone and retry the step instead of ending it.
+        if (now && !recorded)
+          throw new Error(`could not record upstream task ${upstreamJobId} for segment ${index}`);
         if (recorded !== upstreamJobId && !upstreamJobId.startsWith(SKIPPED))
           await adapter.cancel(upstreamJobId).catch(() => undefined);
         return recorded ? { upstreamJobId: recorded } : { done: true as const };

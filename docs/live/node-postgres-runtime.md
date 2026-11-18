@@ -1,6 +1,6 @@
 # Node and Postgres runtime
 
-Status: in progress. Step 2 (database) is done; steps 3–7 are not started. Work happens on the `node-postgres` branch and merges into `main` once a real site runs on it; the last Cloudflare Workers release is tag `v0.2.0`. When done, fold into `docs/architecture.md` §2, §6 and §8, and rewrite `docs/local-development.md` and `docs/site-launch.md`.
+Status: in progress. Steps 2 (database) and 3 (job runs) are done; steps 4–7 are not started. Work happens on the `node-postgres` branch and merges into `main` once a real site runs on it; the last Cloudflare Workers release is tag `v0.2.0`. When done, fold into `docs/architecture.md` §2, §6 and §8, and rewrite `docs/local-development.md` and `docs/site-launch.md`.
 
 A site becomes a Node server in a Docker container with a Postgres database. Cloudflare Workers, D1, Workflows and Containers stop being a runtime; Cloudflare stays in front as DNS, CDN and WAF, and R2 stays as object storage.
 
@@ -87,7 +87,17 @@ It extends `locked_until` every 20 s for the runs it holds and runs `runGenerati
 - **Poison runs.** A run claimed more than 10 times is marked `dead`, and the job is failed `stale` and settled without running the runner. The read-time stale check in `handlers.ts` stays as a second backstop. This also closes a known gap: a stuck job nobody looks at is now refunded by the loop.
 - **Cleanup.** Step rows of finished runs are deleted after 30 days.
 
-Estimated size: about 300 lines for the loop and step runner.
+As built (2026-11-18, after four review rounds) the design above changed in these ways:
+
+- **Claim tokens.** Each claim writes its own token into `locked_by`; step writes, heartbeats and releases match that claim, and a process never claims a run it is still executing.
+- **Fenced outcome writes.** `markFailed`, `markSucceeded`, `markSubmitted`/`appendUpstreamJob` and `markForReview` take an optional `Fence` (run ID + claim token) and apply only while that claim holds an unexpired lease. The worker passes each run's fence to the runner, and wraps its adapters so `cancel` reaches the upstream only while the claim is held. Handlers write without a fence.
+- **Attempts.** `step.do` records each attempt under the lease before running it and passes the attempt number to the step. A submit (main, repair, hedge) past the deadline places nothing on a first attempt; on a later one it submits again with the same key to recover a task the upstream may hold, and the timeout cancels it. The retry budget is spent only by attempts that failed with an error.
+- **No per-step timeout.** A slow call is never retried around (it would race its own retry). A run still going 15 minutes after its job's deadline is buried by the heartbeat: in one transaction holding the run row, upstream tasks (including hedge copies) are canceled, the job is failed `stale` and refunded, and the run ends.
+- **The worker's own database errors** hand the run back after a delay without counting toward poison.
+- **Cancel vs. submit.** A user cancel holds the run row (as a step does to start an attempt) and is refused once a submit has started.
+- **Backfill.** At start, and on each poll until it succeeds, the worker queues a run for every job in progress that has none.
+
+Known limit: a lease is time-based. A worker that loses it while still alive (frozen for longer than the lease, or cut off from the database for heartbeats but not for other writes) can still finish one statement it had already started: a fenced write that began before the takeover, or an upstream call already in flight. Each such window is bounded by one statement or one call, and with one worker process per site and `SIGTERM` then `SIGKILL` on deploy it needs a paused process. Closing it fully would mean holding run ownership with a Postgres session-level advisory lock instead of a time lease.
 
 ## 3. Bindings become interfaces
 
