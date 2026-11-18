@@ -18,18 +18,18 @@ A site becomes a Node server in a Docker container with a Postgres database. Clo
 
 ## What changes
 
-| Concern          | Today                                        | After                                                                  |
-| ---------------- | -------------------------------------------- | ---------------------------------------------------------------------- |
-| Server           | One Worker per site                          | One Node process per site, in a container: pages, API and job worker   |
-| Database         | D1, `drizzle-orm/d1`, SQLite dialect         | Postgres, one database per site, Drizzle `pg-core`                     |
-| Job runtime      | Cloudflare Workflows                         | `job_runs` and `job_steps` tables, a worker loop in the site process   |
-| Compose          | Cloudflare Container per job (Durable Object) | One long-running compose service per machine, reached over HTTP        |
-| Object storage   | R2 binding                                   | `ObjectStore` interface; S3 API against the same R2 bucket             |
-| Email            | `send_email` binding                         | `Mailer` interface; Cloudflare Email Service REST API by default       |
-| Describe         | Workers AI binding                           | Workers AI REST API behind the existing `RunnerDeps.describe`          |
-| Config, secrets  | `wrangler.jsonc`, `.dev.vars`, Worker `env`  | `process.env`, validated once at start; `.env` files outside the repo  |
-| Tests            | workerd with in-memory D1                    | Node with PGlite per test file; a small suite against a real Postgres  |
-| Preview, deploy  | `wrangler versions upload`, `wrangler deploy` | Build an image; the owner runs it                                      |
+| Concern         | Today                                         | After                                                                 |
+| --------------- | --------------------------------------------- | --------------------------------------------------------------------- |
+| Server          | One Worker per site                           | One Node process per site, in a container: pages, API and job worker  |
+| Database        | D1, `drizzle-orm/d1`, SQLite dialect          | Postgres, one database per site, Drizzle `pg-core`                    |
+| Job runtime     | Cloudflare Workflows                          | `job_runs` and `job_steps` tables, a worker loop in the site process  |
+| Compose         | Cloudflare Container per job (Durable Object) | One long-running compose service per machine, reached over HTTP       |
+| Object storage  | R2 binding                                    | `ObjectStore` interface; S3 API against the same R2 bucket            |
+| Email           | `send_email` binding                          | `Mailer` interface; Cloudflare Email Service REST API by default      |
+| Describe        | Workers AI binding                            | Workers AI REST API behind the existing `RunnerDeps.describe`         |
+| Config, secrets | `wrangler.jsonc`, `.dev.vars`, Worker `env`   | `process.env`, validated once at start; `.env` files outside the repo |
+| Tests           | workerd with in-memory D1                     | Node with PGlite per test file; a small suite against a real Postgres |
+| Preview, deploy | `wrangler versions upload`, `wrangler deploy` | Build an image; the owner runs it                                     |
 
 Sites stay isolated at runtime: each has its own container, database, bucket prefix, secrets and payment account. Only the machine, the Postgres instance and the compose service are shared.
 
@@ -74,14 +74,13 @@ It extends `locked_until` every 20 s for the runs it holds and runs `runGenerati
 
 **Step runner**
 
-| Workflows behavior                     | Here                                                                                                                                  |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| A finished step returns its saved result | `do` reads `job_steps`; a row with `done_at` returns `result` without running `fn`                                                    |
-| Step retries: 5, from 10 s, exponential | On a throw, `attempts` is saved; the same process waits 10 s × 2^(n−1) and runs `fn` again; after 5 retries the error goes to the runner |
-| `sleep`                                | Awaited in process (the runner sleeps 3 s and 30 s), then recorded so a replay doesn't sleep again                                    |
-| Resume after a crash                   | The lease expires, another loop claims the run and replays it; finished steps return from the table                                   |
-| One instance per ID                    | The primary key, plus the lease                                                                                                       |
-
+| Workflows behavior                       | Here                                                                                                                                     |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| A finished step returns its saved result | `do` reads `job_steps`; a row with `done_at` returns `result` without running `fn`                                                       |
+| Step retries: 5, from 10 s, exponential  | On a throw, `attempts` is saved; the same process waits 10 s × 2^(n−1) and runs `fn` again; after 5 retries the error goes to the runner |
+| `sleep`                                  | Awaited in process (the runner sleeps 3 s and 30 s), then recorded so a replay doesn't sleep again                                       |
+| Resume after a crash                     | The lease expires, another loop claims the run and replays it; finished steps return from the table                                      |
+| One instance per ID                      | The primary key, plus the lease                                                                                                          |
 - **At least once.** A step whose `fn` finished but whose row was not written runs again after a crash. Workflows has the same property and the runner's steps are already idempotent.
 - **Lease check.** Before running any `fn` and in the transaction that records a step, the runner confirms it still holds the lease. If it does not, `do` throws without running `fn`. This matters because `runGeneration` catches errors and runs an `abort` step: with the check, that step throws too, so a process that lost its lease can never fail and refund a job another process is finishing.
 - **Shutdown.** On SIGTERM the loop stops claiming, lets steps in flight finish within the container's stop grace period, then releases its leases so the next process picks the runs up at once. Stopping uses the same throw-before-`fn` path as a lost lease. Deploys no longer need zero jobs in flight; step names must stay stable across versions, as today (`runner.test.ts` and `effects.test.ts` lock them).
