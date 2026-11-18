@@ -18,7 +18,7 @@ exports[`effect compose > output check > swapped: checks each segment once, only
 ]
 `;
 
-exports[`effect compose > repair passes > a missed edge person: whole wide shots with everyone in them first, then their box alone, then delivered 1`] = `
+exports[`effect compose > repair passes > a missed edge person: whole wide shots with their photo alone first, then their box alone, then delivered 1`] = `
 [
   "load",
   "submit",
@@ -27,6 +27,7 @@ exports[`effect compose > repair passes > a missed edge person: whole wide shots
   "check:band:0",
   "compose",
   "repair:band:0:plan",
+  "repair:band:0:pass",
   "repair:band:0:extract",
   "repair:band:0:submit",
   "poll:repair:band:0:0",
@@ -34,6 +35,7 @@ exports[`effect compose > repair passes > a missed edge person: whole wide shots
   "repair:band:0:patch",
   "repair:band:0:check",
   "repair:band:1:plan",
+  "repair:band:1:pass",
   "repair:band:1:extract",
   "repair:band:1:submit",
   "poll:repair:band:1:0",

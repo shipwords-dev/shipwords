@@ -1,7 +1,8 @@
 // Repair planning for effect segments whose output check found original people (segment.repair): which shots and slots the next pass covers.
 // Pure functions; the runner executes the passes and the compose container cuts and blends the frames.
 
-import { type CropBox, type EffectRepair, type FacePoint, pointsOf } from './models';
+import { type CropBox, type EffectRepair, type FacePoint, pointsOf, type SlotKind } from './models';
+import type { SubmitInput } from './upstream';
 
 /** The check points of the given slots, flattened in slot order, and whose each one is. */
 export function checkPoints(
@@ -78,6 +79,31 @@ export interface RepairPass {
   crop?: CropBox;
 }
 
+/**
+ * The upstream request of one repair pass: the cut-out shots (with their soundtrack) as reference_video and the photo of each slot the
+ * pass replaces as reference_image, in the pass's slot order. A new seed each pass: the same frames with the same seed may come back the same.
+ */
+export function repairInput(
+  repair: EffectRepair,
+  pass: RepairPass,
+  kinds: Readonly<Record<string, SlotKind>>,
+  clipUrl: string,
+  photos: readonly string[],
+  round: number,
+): SubmitInput {
+  return {
+    upstreamModel: repair.upstreamModel,
+    kind: 'video',
+    prompt: repair.prompt(pass.slots, kinds, pass.shots),
+    references: [
+      { url: clipUrl, role: 'reference_video' },
+      ...photos.map((url) => ({ url, role: 'reference_image' })),
+    ],
+    parameters: { ...repair.parameters, seed: round + 1 },
+    maxCost: repair.maxCost,
+  };
+}
+
 /** Shots with the same people, in order of first appearance: one pass re-renders a group with the photos of everyone in it. */
 export function shotGroups(shots: readonly (readonly string[])[]): { shots: number[]; slots: string[] }[] {
   const groups: { key: string; shots: number[]; slots: string[] }[] = [];
@@ -91,11 +117,14 @@ export function shotGroups(shots: readonly (readonly string[])[]): { shots: numb
 }
 
 /**
- * The next pass for the first still-failing slot, or null when no failing slot can be repaired.
- * A pass re-renders one group of shots (shotGroups) with the photos of every filled slot in it; the model replaces the most prominent
- * people first, and handing it everyone keeps it from putting one person's face on another. Groups where the check saw the original
- * (where: slot → shot indices) come first, then the slot's other groups not yet re-rendered. After that, when the slot has a crop box and
- * its first group has had a whole-frame pass, the pass repairs that box alone; otherwise the slot's groups take turns again (with a new seed).
+ * The next pass for the still-failing slot that has had the fewest passes (the first in `failing` order on a tie), or null when no
+ * failing slot can be repaired: with one person per pass, a person who keeps failing must not use up the rounds of another.
+ * A pass re-renders one group of shots (shotGroups) and replaces that one slot, with its photo alone: the replace model redraws whole
+ * people, and given several photos at once it rewrote mouths and gestures of everyone in the frame. Shots of a group share their
+ * framing, so a person gets one face and one set of accessories across them. Groups where the check saw the original
+ * (where: slot → shot indices) come first, then the slot's other groups it has not had a pass on. After that, when the slot has a crop
+ * box and its first group has had a whole-frame pass for it, the pass repairs that box alone; otherwise the slot's groups take turns
+ * again (with a new seed).
  */
 export function nextRepairPass(
   repair: EffectRepair,
@@ -104,17 +133,23 @@ export function nextRepairPass(
   done: readonly RepairPass[],
   where: Readonly<Record<string, readonly number[]>> = {},
 ): RepairPass | null {
-  const slot = failing.find((candidate) => repair.shots.some((slots) => slots.includes(candidate)));
+  // Unfilled slots keep the original person on purpose and are never repaired.
+  const candidates = failing.filter(
+    (candidate) => filled.includes(candidate) && repair.shots.some((slots) => slots.includes(candidate)),
+  );
+  const tries = (candidate: string) => done.filter((pass) => pass.slots.includes(candidate)).length;
+  const slot = candidates.reduce<string | undefined>(
+    (best, candidate) => (best === undefined || tries(candidate) < tries(best) ? candidate : best),
+    undefined,
+  );
   if (!slot) return null;
   const groups = shotGroups(repair.shots).filter((group) => group.slots.includes(slot));
   const same = (pass: RepairPass, group: { shots: number[] }) => pass.shots.join() === group.shots.join();
-  const covered = (group: { shots: number[] }) => done.some((pass) => !pass.crop && same(pass, group));
+  const mine = done.filter((pass) => pass.slots.includes(slot));
+  const covered = (group: { shots: number[] }) => mine.some((pass) => !pass.crop && same(pass, group));
   const seen = where[slot] ?? [];
   const flagged = groups.filter((group) => group.shots.some((shot) => seen.includes(shot)));
-  const whole = (group: { shots: number[]; slots: string[] }): RepairPass => ({
-    slots: filled.filter((candidate) => group.slots.includes(candidate)),
-    shots: group.shots,
-  });
+  const whole = (group: { shots: number[] }): RepairPass => ({ slots: [slot], shots: group.shots });
   const fresh = [...flagged, ...groups].find((group) => !covered(group));
   if (fresh) return whole(fresh);
   const crop = repair.crops?.[slot];
@@ -122,7 +157,7 @@ export function nextRepairPass(
   if (crop && (flagged.length === 0 || flagged.includes(first)))
     return { slots: [slot], shots: first.shots, crop };
   const turn = flagged.length > 0 ? flagged : groups;
-  const before = done.filter((pass) => turn.some((group) => same(pass, group))).length;
+  const before = mine.filter((pass) => turn.some((group) => same(pass, group))).length;
   return whole(turn[before % turn.length]!);
 }
 

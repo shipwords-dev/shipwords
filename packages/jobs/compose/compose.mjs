@@ -98,23 +98,69 @@ export function parseCutTimes(stderr) {
 }
 
 /**
- * Match each expected cut to the nearest detected cut within tolerance seconds, keeping them in order.
- * Extra detected cuts (flashes, fast motion) are ignored. Returns null if any expected cut has no match.
+ * Match the expected cuts to detected ones, in order. The whole render may run late or early by up to `shift` seconds (Kling pads the
+ * start, so all its cuts land 0.2–0.5 s late together), so for each candidate offset every expected cut must find its own detected cut
+ * within `tolerance` of cut + offset. Candidates are 0 and, clamped to ±shift, each detected-minus-expected difference and its ends
+ * ± tolerance: if any offset fits an assignment, one of those does. For each offset the assignment is the in-order one with the least
+ * total distance (a flash near one cut can't take the next cut's match); the least total wins, a tie keeps the smaller offset (late before early).
+ * Extra detected cuts (flashes, fast motion) are ignored. Returns null if nothing matches every expected cut, so a render whose shots
+ * drifted apart still fails: in 63 live Kling renders the good ones sat within ±0.19 s of one offset, the broken one (a cut on time,
+ * the later ones a second late) ±0.58 s.
  */
-export function matchCuts(expected, detected, tolerance = 0.5) {
-  const matched = [];
-  let after = 0;
-  for (const cut of expected) {
-    let best = null;
-    for (const time of detected) {
-      if (time <= after || Math.abs(time - cut) > tolerance) continue;
-      if (best === null || Math.abs(time - cut) < Math.abs(best - cut)) best = time;
+export function matchCuts(expected, detected, tolerance = 0.3, shift = 0.5) {
+  if (expected.length === 0) return [];
+  const clamp = (value) => Math.max(-shift, Math.min(shift, value));
+  const candidates = new Set([0]);
+  for (const cut of expected)
+    for (const time of detected)
+      for (const value of [time - cut, time - cut - tolerance, time - cut + tolerance])
+        candidates.add(Number(clamp(value).toFixed(9)));
+  // Smaller offsets first; between equal sizes, late first (renders pad the start, they don't trim it).
+  const offsets = [...candidates].sort((x, y) => Math.abs(x) - Math.abs(y) || y - x);
+  // Distinct times only: scene detection can log one cut twice, and two cuts at the same time would make a zero-length shot.
+  const times = [...new Set(detected)].sort((x, y) => x - y);
+  let best = null;
+  let bestError = Infinity;
+  for (const offset of offsets) {
+    const found = assign(expected, times, offset, tolerance);
+    if (found && found.error < bestError - 1e-9) {
+      best = found.matched;
+      bestError = found.error;
     }
-    if (best === null) return null;
-    matched.push(best);
-    after = best;
   }
-  return matched;
+  return best;
+}
+
+/** Least-distance in-order assignment of expected cuts (shifted by offset) to distinct, increasing detected times; null if none. */
+function assign(expected, times, offset, tolerance) {
+  // cost[i][j]: least total distance with expected cut i matched to times[j]; from[i][j]: the previous cut's match.
+  const cost = expected.map(() => times.map(() => Infinity));
+  const from = expected.map(() => times.map(() => -1));
+  expected.forEach((cut, i) => {
+    times.forEach((time, j) => {
+      const distance = Math.abs(time - (cut + offset));
+      if (distance > tolerance + 1e-9) return;
+      if (i === 0) {
+        cost[0][j] = distance;
+        return;
+      }
+      for (let k = 0; k < j; k++) {
+        if (cost[i - 1][k] + distance < cost[i][j]) {
+          cost[i][j] = cost[i - 1][k] + distance;
+          from[i][j] = k;
+        }
+      }
+    });
+  });
+  const last = expected.length - 1;
+  let end = -1;
+  times.forEach((_, j) => {
+    if (cost[last][j] < (end === -1 ? Infinity : cost[last][end])) end = j;
+  });
+  if (end === -1) return null;
+  const matched = [];
+  for (let i = last, j = end; i >= 0; j = from[i][j], i--) matched.unshift(times[j]);
+  return { matched, error: cost[last][end] };
 }
 
 /** Seconds the last shot may fall short of its target (padded with its last frame) before the output counts as broken. */
@@ -278,24 +324,36 @@ export const ENCODE = [
 
 /**
  * Repair input: join the frames of each range (one input per range, so nothing is buffered while another range plays), and with crop
- * cut that box out and scale it up to the frame width (replace models work better on a person filling the frame). No audio.
- * @param {{ input: string; frames: number; ranges: [number, number][]; crop?: number[]; width: number; height: number; output: string }} spec
+ * cut that box out and scale it up to the frame width (replace models work better on a person filling the frame). With `audio` (the
+ * input has a track) the same stretch of the soundtrack goes along: the replace model drives the mouth from it, and a silent clip comes
+ * back with made-up lip movements.
+ * @param {{ input: string; frames: number; ranges: [number, number][]; crop?: number[]; width: number; height: number; fps: number;
+ *   audio?: boolean; output: string }} spec
  *   frames: frame count of input; ranges are cut to it (clampRanges).
  */
-export function buildExtractArgs({ input, frames, ranges: wanted, crop, width, height, output }) {
+export function buildExtractArgs({ input, frames, ranges: wanted, crop, width, height, fps, audio, output }) {
   const ranges = clampRanges(wanted, frames);
+  if (audio && !(fps > 0)) throw new Error('extract with audio needs fps');
   const args = ['-hide_banner', '-loglevel', 'error', '-y'];
   for (const _ of ranges) args.push('-i', input);
   const filters = ranges.map(
     ([start, end], i) => `[${i}:v]trim=start_frame=${start}:end_frame=${end},setpts=PTS-STARTPTS[c${i}]`,
   );
-  let joined = `${ranges.map((_, i) => `[c${i}]`).join('')}concat=n=${ranges.length}:v=1:a=0`;
+  if (audio)
+    for (const [i, [start, end]] of ranges.entries())
+      filters.push(
+        `[${i}:a]atrim=start=${(start / fps).toFixed(6)}:end=${(end / fps).toFixed(6)},asetpts=PTS-STARTPTS[s${i}]`,
+      );
+  const inputs = ranges.map((_, i) => (audio ? `[c${i}][s${i}]` : `[c${i}]`)).join('');
+  let joined = `${inputs}concat=n=${ranges.length}:v=1:a=${audio ? 1 : 0}`;
+  if (audio) joined += '[j][a];[j]null';
   if (crop) {
     const box = cropPixels(crop, width, height);
     joined += `,crop=${box.w}:${box.h}:${box.x}:${box.y},scale=${width}:-2`;
   }
   filters.push(`${joined}[v]`);
-  return [...args, '-filter_complex', filters.join(';'), '-map', '[v]', '-an', ...ENCODE, output];
+  const sound = audio ? ['-map', '[a]', '-c:a', 'aac', '-b:a', '160k'] : ['-an'];
+  return [...args, '-filter_complex', filters.join(';'), '-map', '[v]', ...sound, ...ENCODE, output];
 }
 
 /**
@@ -312,8 +370,9 @@ function featherAlpha(box, width, height, feather) {
 
 /**
  * Put a repaired clip back over the frames buildExtractArgs took. The clip (any size, frame rate and a slightly different length)
- * is retimed to the ranges' total length, scaled to the frame or the box, and split back into the ranges in order. A whole-frame
- * clip replaces those frames; a box is overlaid on them with feathered inner edges. Frames outside the ranges and the audio are kept.
+ * is retimed to the ranges' total length and split back into the ranges in order. A whole-frame clip is scaled to cover the frame and
+ * cut to it around the center (replace models render at their own aspect, e.g. 768×1408 for 720×1280) and replaces those frames; a box
+ * is stretched over it and overlaid with feathered inner edges. Frames outside the ranges and the audio are kept.
  * @param {{ video: string; frames: number; patch: string; patchDuration: number; ranges: [number, number][]; crop?: number[];
  *   width: number; height: number; fps: number; output: string }} spec
  *   frames: frame count of video; ranges are cut to it as in buildExtractArgs.
@@ -326,6 +385,9 @@ export function buildPatchArgs(spec) {
   const feather = Math.max(2, Math.min(48, Math.floor(Math.min(box.w, box.h) / 4)));
   const length = ranges.reduce((sum, [start, end]) => sum + end - start, 0);
   const ratio = length / fps / patchDuration;
+  const fit = crop
+    ? `scale=${box.w}:${box.h}`
+    : `scale=${box.w}:${box.h}:force_original_aspect_ratio=increase,crop=${box.w}:${box.h}`;
 
   const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', video];
   const filters = [];
@@ -346,7 +408,7 @@ export function buildPatchArgs(spec) {
     args.push('-i', patch);
     const label = `p${input}`;
     filters.push(
-      `[${input++}:v]setpts=${ratio.toFixed(6)}*(PTS-STARTPTS),fps=${fps},scale=${box.w}:${box.h},setsar=1,` +
+      `[${input++}:v]setpts=${ratio.toFixed(6)}*(PTS-STARTPTS),fps=${fps},${fit},setsar=1,` +
         `tpad=stop_mode=clone:stop=${fps},trim=start_frame=${offset}:end_frame=${offset + end - start},setpts=PTS-STARTPTS` +
         (crop
           ? `,format=yuva420p,geq=lum='p(X,Y)':cb='p(X,Y)':cr='p(X,Y)':a='${featherAlpha(box, width, height, feather)}'`

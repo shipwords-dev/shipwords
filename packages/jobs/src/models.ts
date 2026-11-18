@@ -138,10 +138,20 @@ export interface EffectSegment {
 export type CropBox = readonly [number, number, number, number];
 
 export interface EffectRepair {
-  /** Video replace model: gets the shots to repair as reference_video and the photos of the slots in that pass as reference_image (1–3). */
+  /**
+   * Video replace model: gets the shots to repair as reference_video (with their stretch of the soundtrack, which drives the mouths) and
+   * the photo of the one slot that pass replaces as reference_image. A whole-frame result replaces those frames, scaled to cover the frame.
+   */
   upstreamModel: string;
-  /** Instruction for one pass; slots are the people being replaced, in reference image order; kinds as in PromptContext. */
-  prompt: (slots: readonly string[], kinds: Readonly<Record<string, SlotKind>>) => string;
+  /**
+   * Instruction for one pass; slots are the people being replaced, in reference image order (one per pass); kinds as in PromptContext;
+   * shots are the shot indices the pass re-renders, so a prompt can name where the person is in those shots.
+   */
+  prompt: (
+    slots: readonly string[],
+    kinds: Readonly<Record<string, SlotKind>>,
+    shots: readonly number[],
+  ) => string;
   parameters: Readonly<Record<string, unknown>>;
   /** Cost cap per pass (USD string). */
   maxCost: string;
@@ -156,8 +166,8 @@ export interface EffectRepair {
   onMiss?: 'refund' | 'deliver';
   /**
    * Slots visible in each shot, one entry per shot (cuts split the segment into cuts.length + 1 shots), at most 3 per shot. Shots with the
-   * same slots form a group that one pass re-renders together, with the photos of everyone in it; a slot in several groups (a person who
-   * also shows in another shot's corner) gets a pass per group, in order.
+   * same slots form a group that one pass re-renders together for one slot, with that slot's photo; several missed slots in a group get
+   * a pass each, in turn. A slot in several groups (a person who also shows in another shot's corner) gets a pass per group, in order.
    */
   shots: readonly (readonly string[])[];
   /**
@@ -581,7 +591,7 @@ function validateRepair(modelId: string, effect: EffectSpec, segment: EffectSegm
     throw new Error(
       `${where}.shots must list this segment's slots for each of its ${segment.cuts.length + 1} shots`,
     );
-  // One pass sends the photos of everyone in the group of shots it covers; the replace model takes at most 3.
+  // Passes once sent everyone in a group at once (the replace model takes at most 3 photos); kept as a sanity limit per shot.
   if (shots.some((slots) => slots.length > 3 || new Set(slots).size !== slots.length))
     throw new Error(`${where}.shots: at most 3 different people per shot`);
   for (const slot of Object.keys(segment.check.faces)) {

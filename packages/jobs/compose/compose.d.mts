@@ -37,6 +37,8 @@ export function buildExtractArgs(spec: {
   crop?: readonly number[];
   width: number;
   height: number;
+  fps?: number;
+  audio?: boolean;
   output: string;
 }): string[];
 export function buildPatchArgs(spec: {
@@ -56,6 +58,7 @@ export function matchCuts(
   expected: readonly number[],
   detected: readonly number[],
   tolerance?: number,
+  shift?: number,
 ): number[] | null;
 export function splitAtCuts(input: {
   file: string;

@@ -16,6 +16,7 @@ import {
   nextRepairPass,
   photoOf,
   type RepairPass,
+  repairInput,
   shotFrames,
 } from './repair';
 import type { RunnerDeps, StepRunner } from './runner';
@@ -281,22 +282,30 @@ export async function repairOutputs(
         };
       });
       if (!job) return null;
-      const pass = nextRepairPass(repair, job.slots, missed, passes, where);
-      if (!pass) return giveUp('no pass covers them', notApplied('no pass covers them'));
+      // The chosen pass and the frames it covers are stored with the round: its extract, submit and store steps are cached, so a replay,
+      // or a resume after the planner or the timeline (cuts, frame size) changed, must put that clip back into the same frames.
+      // Rounds cached before this step existed plan again with the current rules; deploy such a change when no job is between repair steps.
+      const planned = await step.do(`${label}:pass`, async () => {
+        const pass = nextRepairPass(repair, job.slots, missed, passes, where);
+        if (!pass) return null;
+        return {
+          pass,
+          geometry: {
+            ranges: shotFrames(cuts, segment.target!, fps, pass.shots),
+            // The box is cut at the replace model's aspect so it renders all of it and lines up when blended back.
+            ...(pass.crop
+              ? { crop: repair.aspect ? fitAspect(pass.crop, repair.aspect, width, height) : pass.crop }
+              : {}),
+            width,
+            height,
+            fps,
+          },
+        };
+      });
+      if (!planned) return giveUp('no pass covers them', notApplied('no pass covers them'));
+      const { pass } = planned;
       passes.push(pass);
-      const ranges = shotFrames(cuts, segment.target!, fps, pass.shots);
-      const cut = {
-        jobId,
-        key: current,
-        ranges,
-        // The box is cut at the replace model's aspect so it renders all of it and lines up when blended back.
-        ...(pass.crop
-          ? { crop: repair.aspect ? fitAspect(pass.crop, repair.aspect, width, height) : pass.crop }
-          : {}),
-        width,
-        height,
-        fps,
-      };
+      const cut = { jobId, key: current, ...planned.geometry };
       const clip = await step.do(`${label}:extract`, async () => {
         const bytes = await deps.composer!.extract(cut);
         await deps.bucket.put(work(String(round)), bytes, { httpMetadata: { contentType: 'video/mp4' } });
@@ -309,22 +318,15 @@ export async function repairOutputs(
         const existing = upstreamIds(row)[position];
         if (existing) return { upstreamJobId: existing };
         if (Date.now() > deadline) return { timeout: true as const };
-        const input: SubmitInput = {
-          upstreamModel: repair.upstreamModel,
-          kind: 'video',
+        const input = repairInput(
+          repair,
+          pass,
           // Plans cached by versions before slot kinds have none: everyone is a person, as before.
-          prompt: repair.prompt(pass.slots, (job as { kinds?: Record<string, SlotKind> }).kinds ?? {}),
-          references: [
-            { url: deps.fileUrl!(clip), role: 'reference_video' },
-            ...pass.slots.map((slot) => ({
-              url: job.photos[job.slots.indexOf(slot)]!,
-              role: 'reference_image',
-            })),
-          ],
-          // A new seed each pass: the same frames with the same seed may come back the same.
-          parameters: { ...repair.parameters, seed: round + 1 },
-          maxCost: repair.maxCost,
-        };
+          (job as { kinds?: Record<string, SlotKind> }).kinds ?? {},
+          deps.fileUrl!(clip),
+          pass.slots.map((slot) => job.photos[job.slots.indexOf(slot)]!),
+          round,
+        );
         try {
           const { upstreamJobId } = await adapter.submit(input, `${jobId}:${partId}:repair:${round}`);
           if (!(await appendUpstreamJob(deps.db, jobId, position, upstreamJobId))) {

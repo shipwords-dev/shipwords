@@ -8,10 +8,11 @@
 // POST /likeness  multipart: video (composed), people (JSON [{ ranges: [[start, end], ...] seconds }, ...]), photo-0…photo-N.
 //   Returns { similarity: [...] }: per person, how much their face in those ranges looks like their photo, or null (faces.py). Read-only.
 // POST /extract  multipart: manifest (JSON: { ranges: [[start, end), ...] frames, crop?: [x, y, w, h], width, height, fps }), video.
-//   Returns those frames joined into one silent MP4 (the box only, scaled up, with crop): the input of a repair pass. Read-only.
+//   Returns those frames joined into one MP4 with the same stretch of the video's soundtrack, if it has one (the box only, scaled
+//   up, with crop): the input of a repair pass. Read-only.
 // POST /patch  multipart: manifest (as extract plus id), video, patch (the repaired clip). Returns video with the repaired frames
-//   put back, lined up frame by frame on the background (align.py; stretched over the box if that fails); results also stay in
-//   /tmp/compose/<id>/ (song.mp4, silent.mp4) like compose.
+//   put back: a whole-frame clip covers the frame and replaces them; a box is lined up frame by frame on the background (align.py;
+//   stretched over the box if that fails). Results also stay in /tmp/compose/<id>/ (song.mp4, silent.mp4) like compose.
 // Repeating compose with the same id overwrites the same files, so Workflow retries are idempotent.
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -54,6 +55,43 @@ async function durationOf(file) {
   const value = Number(stdout.trim());
   if (!(value > 0)) throw new Error(`cannot read duration of ${file}`);
   return value;
+}
+
+/**
+ * Length of the first video stream (s). A repaired clip carries the soundtrack it was given, which can run past its picture; the
+ * container duration counts that tail, and retiming the picture by it would squeeze the frames and shift everything after the range.
+ */
+async function videoDurationOf(file) {
+  // JSON, not CSV: side data such as a rotation matrix adds fields to a CSV row ("1.000000,"), which would read as no duration.
+  const { stdout } = await run('ffprobe', [
+    '-v',
+    'error',
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'stream=duration',
+    '-of',
+    'json',
+    file,
+  ]);
+  const value = Number(JSON.parse(stdout).streams?.[0]?.duration);
+  return value > 0 ? value : durationOf(file);
+}
+
+/** Whether the file has an audio stream. */
+async function hasAudio(file) {
+  const { stdout } = await run('ffprobe', [
+    '-v',
+    'error',
+    '-select_streams',
+    'a',
+    '-show_entries',
+    'stream=index',
+    '-of',
+    'csv=p=0',
+    file,
+  ]);
+  return stdout.trim() !== '';
 }
 
 /** Video frames actually in the file (packets of the first video stream; our MP4s have one frame per packet). */
@@ -229,7 +267,16 @@ async function extract(req) {
     const input = join(dir, 'video.mp4');
     const output = join(dir, 'clip.mp4');
     await save(form, 'video', input);
-    await run('ffmpeg', buildExtractArgs({ ...spec, input, frames: await framesOf(input), output }));
+    await run(
+      'ffmpeg',
+      buildExtractArgs({
+        ...spec,
+        input,
+        frames: await framesOf(input),
+        audio: await hasAudio(input),
+        output,
+      }),
+    );
     return await readFile(output);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -250,29 +297,37 @@ async function patch(req) {
   await save(form, 'patch', patchFile);
   const song = join(dir, 'song.mp4');
   const frames = await framesOf(video);
-  // Line the repaired frames up with the ones they replace (align.py); if that fails, stretch them over the box as before.
-  try {
-    const box = spec.crop ? cropPixels(spec.crop, spec.width, spec.height) : null;
-    const plan = { ranges: clampRanges(spec.ranges, frames), box, fps: spec.fps, encode: ENCODE };
-    const { stdout } = await run('python3', ['align.py', video, patchFile, song, JSON.stringify(plan)], {
-      maxBuffer: 1 << 20,
-    });
-    console.log(JSON.stringify({ event: 'patch aligned', id: manifest.id, ...JSON.parse(stdout) }));
-  } catch (error) {
-    console.log(
-      JSON.stringify({ event: 'patch align failed, stretching', id: manifest.id, error: String(error) }),
-    );
-    await run(
+  const replaceFrames = async () =>
+    run(
       'ffmpeg',
       buildPatchArgs({
         ...spec,
         video,
         frames,
         patch: patchFile,
-        patchDuration: await durationOf(patchFile),
+        patchDuration: await videoDurationOf(patchFile),
         output: song,
       }),
     );
+  if (!spec.crop) {
+    // A whole-frame clip replaces the frames outright, scaled to cover the frame. Aligning it on the background (align.py) instead
+    // leaves the strips it doesn't cover showing the frame before repair, and those strips can hold a second copy of a face.
+    await replaceFrames();
+  } else {
+    // Line the repaired box up with the frames it replaces (align.py); if that fails, stretch it over the box as before.
+    try {
+      const box = cropPixels(spec.crop, spec.width, spec.height);
+      const plan = { ranges: clampRanges(spec.ranges, frames), box, fps: spec.fps, encode: ENCODE };
+      const { stdout } = await run('python3', ['align.py', video, patchFile, song, JSON.stringify(plan)], {
+        maxBuffer: 1 << 20,
+      });
+      console.log(JSON.stringify({ event: 'patch aligned', id: manifest.id, ...JSON.parse(stdout) }));
+    } catch (error) {
+      console.log(
+        JSON.stringify({ event: 'patch align failed, stretching', id: manifest.id, error: String(error) }),
+      );
+      await replaceFrames();
+    }
   }
   await run('ffmpeg', buildSilentArgs(song, join(dir, 'silent.mp4')));
   return song;

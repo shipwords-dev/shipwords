@@ -1203,7 +1203,27 @@ describe('effect compose', () => {
       });
     });
 
-    it('a missed edge person: whole wide shots with everyone in them first, then their box alone, then delivered', async () => {
+    it('a round replays the pass and frames it stored, so its cached clip goes back into the same frames', async () => {
+      const { jobId, adapter } = await repairJob();
+      const composer = new FakeComposer();
+      composer.scores = [
+        [0.3, 0.8, 0.2],
+        [0.3, 0.2, 0.2],
+      ];
+      // As if round 0 had been planned before a planner or timeline change: solo over frames 50–90 (shot 1 is 48–96 now), though
+      // the current planner would send edge over the wide shots.
+      const geometry = { ranges: [[50, 90]], width: 720, height: 1280, fps: 24 };
+      const cache = new Map<string, unknown>([
+        ['repair:band:0:pass', { pass: { slots: ['solo'], shots: [1] }, geometry }],
+      ]);
+      await runGeneration(repairDeps(adapter, composer), jobId, durableSteps(cache));
+      expect(composer.extracts[0]).toMatchObject(geometry);
+      expect(composer.patches[0]).toMatchObject(geometry);
+      expect(adapter.submits[1]!.input.prompt).toBe('replace solo');
+      expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+    });
+
+    it('a missed edge person: whole wide shots with their photo alone first, then their box alone, then delivered', async () => {
       const { userId, jobId, adapter } = await repairJob();
       const composer = new FakeComposer();
       // Scores per check in slot order front, edge, solo: the render misses edge, the whole-frame pass still misses edge, the box pass gets it.
@@ -1247,10 +1267,9 @@ describe('effect compose', () => {
       expect(repairs[0]!.input).toEqual({
         upstreamModel: 'vendor/replace',
         kind: 'video',
-        prompt: 'replace front edge',
+        prompt: 'replace edge',
         references: [
           { url: `https://site/files/jobs/${jobId}/repair-band-0.mp4`, role: 'reference_video' },
-          { url: 'https://site/files/uploads/up_f.png', role: 'reference_image' },
           { url: 'https://site/files/uploads/up_e.png', role: 'reference_image' },
         ],
         parameters: { resolution: '720p', seed: 1 },
@@ -1476,10 +1495,8 @@ describe('effect compose', () => {
       ];
       await runGeneration({ ...repairDeps(adapter, composer), models }, jobId, durableSteps());
       const pass = adapter.submits.find((s) => s.key === `${jobId}:band:repair:0`)!;
-      expect(pass.input.references.slice(1).map((r) => r.url)).toEqual([
-        'https://up/front-prep.png',
-        'https://up/edge-prep.png',
-      ]);
+      // One person per pass: only the missed person's prepped photo goes along.
+      expect(pass.input.references.slice(1).map((r) => r.url)).toEqual(['https://up/edge-prep.png']);
       expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
       expect((await getBalance(db, userId)).available).toBe(40);
     });
@@ -1618,7 +1635,7 @@ describe('effect compose', () => {
           [[2.3, 3.7]],
         ]);
         expect(composer.extracts.map((e) => e.ranges)).toEqual([[[48, 96]]]);
-        expect(adapter.submits[1]!.input.prompt).toBe('replace front solo');
+        expect(adapter.submits[1]!.input.prompt).toBe('replace front');
         expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
       });
 
@@ -1862,7 +1879,7 @@ describe('effect compose', () => {
           expect(adapter.submits).toHaveLength(4);
           // Pass 0 went after solo; pass 1, with edge missed again, after edge first.
           expect(adapter.submits[1]!.input.prompt).toBe('replace solo');
-          expect(adapter.submits[2]!.input.prompt).toBe('replace front edge');
+          expect(adapter.submits[2]!.input.prompt).toBe('replace edge');
           expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
           expect(await bytesOf(`jobs/${jobId}/1.mp4`)).toEqual(new Uint8Array([1]));
         });

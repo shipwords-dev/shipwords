@@ -17,6 +17,7 @@ import {
   missedAfterLikeness,
   nextRepairPass,
   photoOf,
+  repairInput,
   shotAt,
   shotGroups,
 } from '../src/repair';
@@ -265,22 +266,61 @@ describe('repair planning by shot groups', () => {
 
   it('starts with the group where the check saw the original, then the slot’s other groups, then takes turns', () => {
     const first = nextRepairPass(repair, filled, ['keys'], [], { keys: [2] })!;
-    expect(first).toEqual({ slots: ['sax', 'keys'], shots: [2] });
+    expect(first).toEqual({ slots: ['keys'], shots: [2] });
     const second = nextRepairPass(repair, filled, ['keys'], [first], { keys: [2] })!;
     // Every flagged group had its pass; the slot's other group is next.
-    expect(second).toEqual({ slots: ['keys', 'left', 'right'], shots: [0, 3] });
+    expect(second).toEqual({ slots: ['keys'], shots: [0, 3] });
     const third = nextRepairPass(repair, filled, ['keys'], [first, second], { keys: [2] })!;
-    expect(third).toEqual({ slots: ['sax', 'keys'], shots: [2] });
+    expect(third).toEqual({ slots: ['keys'], shots: [2] });
     // Without a place (a likeness miss), the slot's groups in order.
-    expect(nextRepairPass(repair, filled, ['keys'], [])).toEqual({
-      slots: ['keys', 'left', 'right'],
+    expect(nextRepairPass(repair, filled, ['keys'], [])).toEqual({ slots: ['keys'], shots: [0, 3] });
+    // Several people missed in the same shots: one pass each, the first failing slot first.
+    const keysPass = nextRepairPass(repair, filled, ['keys', 'left'], [])!;
+    expect(keysPass).toEqual({ slots: ['keys'], shots: [0, 3] });
+    expect(nextRepairPass(repair, filled, ['left'], [keysPass])).toEqual({ slots: ['left'], shots: [0, 3] });
+    // A person who keeps failing doesn't use up the rounds: right, never tried, goes before left's crop pass.
+    const leftPass = nextRepairPass(repair, filled, ['left', 'right'], [])!;
+    expect(leftPass).toEqual({ slots: ['left'], shots: [0, 3] });
+    expect(nextRepairPass(repair, filled, ['left', 'right'], [leftPass])).toEqual({
+      slots: ['right'],
       shots: [0, 3],
     });
   });
 
+  it('a pass request: the shots as reference_video, then the one photo, a new seed each round, the shots passed to the prompt', () => {
+    const prompts: unknown[][] = [];
+    const input = repairInput(
+      {
+        ...repair,
+        parameters: { resolution: '720p' },
+        prompt: (...args) => {
+          prompts.push(args);
+          return 'replace keys';
+        },
+      },
+      { slots: ['keys'], shots: [2] },
+      { keys: 'person' },
+      'https://site/files/jobs/j/repair-full-0.mp4',
+      ['https://site/files/jobs/j/keys-face.png'],
+      1,
+    );
+    expect(input).toEqual({
+      upstreamModel: 'vendor/replace',
+      kind: 'video',
+      prompt: 'replace keys',
+      references: [
+        { url: 'https://site/files/jobs/j/repair-full-0.mp4', role: 'reference_video' },
+        { url: 'https://site/files/jobs/j/keys-face.png', role: 'reference_image' },
+      ],
+      parameters: { resolution: '720p', seed: 2 },
+      maxCost: '0.40',
+    });
+    expect(prompts).toEqual([[['keys'], { keys: 'person' }, [2]]]);
+  });
+
   it('a crop pass on the first group once it had a whole-frame pass', () => {
     const whole = nextRepairPass(repair, filled, ['left'], [])!;
-    expect(whole).toEqual({ slots: ['keys', 'left', 'right'], shots: [0, 3] });
+    expect(whole).toEqual({ slots: ['left'], shots: [0, 3] });
     expect(nextRepairPass(repair, filled, ['left'], [whole])).toEqual({
       slots: ['left'],
       shots: [0, 3],

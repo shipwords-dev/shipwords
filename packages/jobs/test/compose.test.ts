@@ -80,12 +80,40 @@ describe('shot cut alignment', () => {
     expect(parseCutTimes(stderr)).toEqual([5.375, 11.708333]);
   });
 
-  it('matches each expected cut to the nearest detected one within 0.5 s, ignores extra cuts, null when one is missing', () => {
+  it('matches each expected cut to the nearest detected one within the tolerance, ignores extra cuts, null when one is missing', () => {
     expect(matchCuts(cuts, [2.1, ...detected, 17.2])).toEqual(detected);
     expect(matchCuts(cuts, [5.375, 11.708333])).toBeNull();
     expect(matchCuts(cuts, [5.375, 12.3, 15.125])).toBeNull();
     // Two expected cuts never share one detected cut.
     expect(matchCuts([1, 1.2], [1.1])).toBeNull();
+  });
+
+  it('allows the whole render to run late or early by up to 0.5 s, but not shots that drift apart', () => {
+    // Live Kling renders (2026-11-18): every cut late by 0.29–0.54 s. Matched against cut + 0.29 s, all within 0.25 s.
+    expect(matchCuts(cuts, [5.625, 12.125, 15.542])).toEqual([5.625, 12.125, 15.542]);
+    // The same shift early.
+    expect(matchCuts(cuts, [4.9, 11.2, 14.5])).toEqual([4.9, 11.2, 14.5]);
+    // One cut on time, the later ones a second late (the render dropped the end of the clip): no shared offset matches all.
+    expect(matchCuts(cuts, [5.417, 12.625, 16.25])).toBeNull();
+    // Later than the allowed shift plus the tolerance.
+    expect(matchCuts(cuts, [6.4, 12.7, 16.1])).toBeNull();
+    // Extra detected cuts (a flash at 5.9 s) are still ignored; the closest cuts win.
+    expect(matchCuts(cuts, [2.1, 5.35, 5.9, 11.63, 15.02, 17.2])).toEqual([5.35, 11.63, 15.02]);
+    // Uniformly 0.625 s late or early: past the 0.5 s shift, but a 0.5 s shift leaves 0.125 s per cut.
+    expect(matchCuts(cuts, [5.958, 12.25, 15.625])).toEqual([5.958, 12.25, 15.625]);
+    expect(matchCuts(cuts, [4.708, 11, 14.375])).toEqual([4.708, 11, 14.375]);
+    // Only an offset between the observed differences fits (0.1–0.2 s here): interval ends are tried, not just the differences.
+    expect(matchCuts([5, 10, 15], [4.9, 10.4, 15.3])).toEqual([4.9, 10.4, 15.3]);
+    // Cuts 0.875 s apart in their drift: no single offset brings them all within 0.3 s.
+    expect(matchCuts([5, 10, 15], [4.875, 10.75, 15.75])).toBeNull();
+    // The in-order assignment is scored as a whole: taking the nearest cut for 5 s (5.15) would leave nothing for 5.4 s.
+    expect(matchCuts([5, 5.4], [4.75, 5.15], 0.3, 0)).toEqual([4.75, 5.15]);
+    // Equally good either way: late wins (renders pad the start).
+    expect(matchCuts([5], [4.5, 5.5])).toEqual([5.5]);
+    // Scene detection can log one cut twice; two cuts never land on the same time (a zero-length shot).
+    expect(matchCuts([5, 5.1], [5.05, 5.05, 5.35])).toEqual([5.05, 5.35]);
+    expect(matchCuts([], [1])).toEqual([]);
+    expect(matchCuts([], [])).toEqual([]);
   });
 
   it('splits into shots retimed to their exact lengths; the last shot uses the last cut drift and is cut to the remaining target', () => {
@@ -215,6 +243,50 @@ describe('repair args', () => {
     );
   });
 
+  it('extract with audio: the same stretch of the soundtrack goes along, cut by time at the frame bounds', () => {
+    const args = buildExtractArgs({
+      input: 'in.mp4',
+      frames: 425,
+      ranges,
+      width: 720,
+      height: 1280,
+      fps: 24,
+      audio: true,
+      output: 'clip.mp4',
+    });
+    const graph = args[args.indexOf('-filter_complex') + 1]!;
+    expect(graph).toContain('[0:a]atrim=start=0.000000:end=5.333333,asetpts=PTS-STARTPTS[s0]');
+    expect(graph).toContain('[1:a]atrim=start=15.000000:end=17.708333,asetpts=PTS-STARTPTS[s1]');
+    expect(graph).toContain('[c0][s0][c1][s1]concat=n=2:v=1:a=1[j][a];[j]null[v]');
+    expect(args).toEqual(expect.arrayContaining(['-map', '[v]', '-map', '[a]', '-c:a', 'aac']));
+    expect(args).not.toContain('-an');
+    const cropped = buildExtractArgs({
+      input: 'in.mp4',
+      frames: 425,
+      ranges,
+      crop: [0, 0, 0.444, 0.3875],
+      width: 720,
+      height: 1280,
+      fps: 24,
+      audio: true,
+      output: 'clip.mp4',
+    });
+    expect(cropped[cropped.indexOf('-filter_complex') + 1]).toContain(
+      'concat=n=2:v=1:a=1[j][a];[j]null,crop=320:496:0:0,scale=720:-2[v]',
+    );
+    expect(() =>
+      buildExtractArgs({
+        input: 'in.mp4',
+        frames: 425,
+        ranges,
+        width: 720,
+        height: 1280,
+        audio: true,
+        output: 'c.mp4',
+      }),
+    ).toThrow(/fps/);
+  });
+
   it('patch: the clip is retimed to the ranges, split back in order between kept frames, audio copied from the video', () => {
     const args = buildPatchArgs({
       video: 'in.mp4',
@@ -229,7 +301,10 @@ describe('repair args', () => {
     });
     const graph = args[args.indexOf('-filter_complex') + 1]!;
     // 193 frames = 8.041667 s at 24 fps, from an 8.2 s clip.
-    expect(graph).toContain('[1:v]setpts=0.980691*(PTS-STARTPTS),fps=24,scale=720:1280,setsar=1,');
+    // A whole-frame clip covers the frame and is cut to it around the center (replace models render at their own aspect).
+    expect(graph).toContain(
+      '[1:v]setpts=0.980691*(PTS-STARTPTS),fps=24,scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,',
+    );
     expect(graph).toContain('trim=start_frame=0:end_frame=128,setpts=PTS-STARTPTS[p1]');
     expect(graph).toContain('[2:v]trim=start_frame=128:end_frame=360,setpts=PTS-STARTPTS[b2]');
     expect(graph).toContain('trim=start_frame=128:end_frame=193,setpts=PTS-STARTPTS[p3]');
@@ -342,16 +417,19 @@ describe('repair planning', () => {
     expect(shotFrames([1.02, 2.04], 3, 24, [2])).toEqual([[48, 71]]);
   });
 
-  it('whole frame with every filled person in the shots first, the box after that, whole frame again without a box', () => {
+  it('whole frame for the missed person alone first, the box after that; another person in the same shots gets their own pass', () => {
     const filled = ['front', 'edge', 'solo'];
     const first = nextRepairPass(repair, filled, ['edge'], []);
-    expect(first).toEqual({ slots: ['front', 'edge'], shots: [0, 2] });
+    expect(first).toEqual({ slots: ['edge'], shots: [0, 2] });
     expect(nextRepairPass(repair, filled, ['edge'], [first!])).toEqual({
       slots: ['edge'],
       shots: [0, 2],
       crop: [0, 0, 0.4, 0.4],
     });
-    expect(nextRepairPass(repair, filled, ['front'], [first!])).toEqual(first);
+    // edge's pass on these shots doesn't count as front's: front gets a whole-frame pass of its own.
+    expect(nextRepairPass(repair, filled, ['front'], [first!])).toEqual({ slots: ['front'], shots: [0, 2] });
+    // An unfilled slot keeps the original person and is never repaired.
+    expect(nextRepairPass(repair, ['edge', 'solo'], ['front'], [])).toBeNull();
     // Unfilled people stay as the original and get no photo.
     expect(nextRepairPass(repair, ['edge', 'solo'], ['edge'], [])).toEqual({
       slots: ['edge'],
