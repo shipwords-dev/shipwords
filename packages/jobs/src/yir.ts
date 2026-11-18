@@ -1,4 +1,4 @@
-import { createNodeYirClient } from '@yir-ai/sdk/server';
+import { createNodeYirClient, DEFAULT_USER_AGENT } from '@yir-ai/sdk/server';
 import type {
   StandardImageGenerationRequest,
   StandardMusicGenerationRequest,
@@ -14,6 +14,12 @@ import {
 } from './upstream';
 
 type YirClient = ReturnType<typeof createNodeYirClient>;
+
+/**
+ * Names shipwords ahead of the SDK. Yir keeps the first User-Agent product per job,
+ * so it can tell sites built on this starter from other SDK callers.
+ */
+export const YIR_USER_AGENT = `shipwords ${DEFAULT_USER_AGENT}`;
 
 /**
  * The SDK already retries network errors and 502/503/504 on submits and status reads, and Yir retries the task across providers,
@@ -77,6 +83,7 @@ export class YirAdapter implements UpstreamAdapter {
     if (!this.options.apiKey) throw new UpstreamError('yir_not_configured', 'YIR_API_KEY is not set', false);
     this.instance = createNodeYirClient({
       apiKey: this.options.apiKey,
+      userAgent: YIR_USER_AGENT,
       ...(this.options.baseURL ? { baseURL: this.options.baseURL } : {}),
       ...(this.options.referralCode ? { referralCode: this.options.referralCode } : {}),
     });

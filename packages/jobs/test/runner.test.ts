@@ -4,7 +4,7 @@ import { createDb } from '@shipwords/core/db/client';
 import { user } from '@shipwords/core/db/schema';
 import { consumeQuota } from '@shipwords/core/quota/counters';
 import { eq } from 'drizzle-orm';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { sumUsd } from '../src/cost';
 import { ALERT_LIST, FAILURE_STREAK, failureStreak } from '../src/failures';
 import { cancelQueued, loadJob, markFailed, markSubmitted, markSucceeded, spendKey } from '../src/lifecycle';
@@ -446,6 +446,28 @@ describe('Yir errors', () => {
       code: 'yir_error',
       retryable: false,
     });
+  });
+});
+
+describe('Yir client identity', () => {
+  it('sends shipwords as the first User-Agent product, ahead of the SDK', async () => {
+    const seen: Headers[] = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(new Headers(input instanceof Request ? input.headers : init?.headers));
+      return Response.json({ error: { code: 'YIR_TEST', message: 'stop here' } }, { status: 400 });
+    });
+    try {
+      const adapter = new YirAdapter({ apiKey: 'k' });
+      await expect(
+        adapter.submit(
+          { upstreamModel: 'm', kind: 'image', prompt: 'p', references: [], parameters: {} },
+          'k1',
+        ),
+      ).rejects.toBeInstanceOf(UpstreamError);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(seen[0]?.get('user-agent')).toMatch(/^shipwords @yir-ai\/sdk\/\d/);
   });
 });
 
