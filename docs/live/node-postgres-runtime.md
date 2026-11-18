@@ -1,0 +1,156 @@
+# Node and Postgres runtime
+
+Status: proposed, 2026-11-18. Nothing is implemented yet. Work happens on the `node-postgres` branch and merges into `main` once a real site runs on it; the last Cloudflare Workers release is tag `v0.2.0`. When done, fold into `docs/architecture.md` §2, §6 and §8, and rewrite `docs/local-development.md` and `docs/site-launch.md`.
+
+A site becomes a Node server in a Docker container with a Postgres database. Cloudflare Workers, D1, Workflows and Containers stop being a runtime; Cloudflare stays in front as DNS, CDN and WAF, and R2 stays as object storage.
+
+## Why
+
+- **Money code.** D1 has no interactive transactions, only atomic batches. The credit ledger works around it with a per-user version lock and a deliberate CHECK violation to roll a batch back (`credits/ledger.ts`). Postgres transactions and row locks say the same thing directly.
+- **No Durable Objects.** Anything stateful on Workers is a Durable Object: the compose container already is, and its `sleepAfter` behavior cost 984 idle instance-hours before anyone noticed (§6 of the architecture doc). A long-running process on a fixed-price machine has no such failure mode.
+- **Debuggable.** The whole stack, ffmpeg included, runs locally and logs to stdout. Today containers are off in local dev and production has Workers Logs only.
+- **Predictable cost.** A machine has a price cap; usage-billed products do not.
+
+## Non-goals
+
+- **One runtime, not two.** The Workers code paths are deleted, not kept behind an adapter. Someone who wants Workers or SQLite ports it; the seams below (step runner, object store, mailer) are what keep that port small.
+- No database abstraction beyond Drizzle, no generic workflow engine, no queue service, no Temporal.
+
+## What changes
+
+| Concern          | Today                                        | After                                                                  |
+| ---------------- | -------------------------------------------- | ---------------------------------------------------------------------- |
+| Server           | One Worker per site                          | One Node process per site, in a container: pages, API and job worker   |
+| Database         | D1, `drizzle-orm/d1`, SQLite dialect         | Postgres, one database per site, Drizzle `pg-core`                     |
+| Job runtime      | Cloudflare Workflows                         | `job_runs` and `job_steps` tables, a worker loop in the site process   |
+| Compose          | Cloudflare Container per job (Durable Object) | One long-running compose service per machine, reached over HTTP        |
+| Object storage   | R2 binding                                   | `ObjectStore` interface; S3 API against the same R2 bucket             |
+| Email            | `send_email` binding                         | `Mailer` interface; Cloudflare Email Service REST API by default       |
+| Describe         | Workers AI binding                           | Workers AI REST API behind the existing `RunnerDeps.describe`          |
+| Config, secrets  | `wrangler.jsonc`, `.dev.vars`, Worker `env`  | `process.env`, validated once at start; `.env` files outside the repo  |
+| Tests            | workerd with in-memory D1                    | Node with PGlite per test file; a small suite against a real Postgres  |
+| Preview, deploy  | `wrangler versions upload`, `wrangler deploy` | Build an image; the owner runs it                                      |
+
+Sites stay isolated at runtime: each has its own container, database, bucket prefix, secrets and payment account. Only the machine, the Postgres instance and the compose service are shared.
+
+## 1. Database
+
+- **Driver and type.** `drizzle-orm/node-postgres` in the app, `drizzle-orm/pglite` in tests (both ship in the installed drizzle-orm 0.45.4). `Db` is typed as the driver-neutral `PgDatabase`, so engine code never names a driver. `createDb` takes a connection string (`DATABASE_URL`).
+- **Schema.** The two schema files (`core/src/db/schema.ts`, `jobs/src/schema.ts`) are rewritten with `pgTable`:
+  - business timestamps stay epoch milliseconds, as `bigint` in number mode, so comparisons and arithmetic in the engine are untouched; the default becomes `(extract(epoch from clock_timestamp()) * 1000)::bigint`;
+  - Better Auth tables use `timestamp` and `boolean`, which is what its `pg` provider expects; `drizzleAdapter` switches from `provider: 'sqlite'` to `'pg'`;
+  - flags stored as 0/1 integers become `boolean`; JSON stays in `text` columns (`input_json`, `quota_json`, `outputs_json`), parsed by the engine as today.
+- **Raw SQL.** Six files use `sql` fragments. Each is checked for dialect: scalar `max(x, 0)` becomes `greatest(x, 0)`, boolean comparisons with `0` become `false`.
+- **Row counts.** `result.meta.changes` (D1) is used for conditional updates in `quota/counters.ts` and `jobs/lifecycle.ts`. It becomes `.returning()` plus a length check, which is the same on every driver.
+- **Constraint errors.** `isConstraintError` matches D1 message text today. It will match SQLSTATE `23505` (unique) and `23514` (check) plus the constraint name.
+- **Transactions.** The two `db.batch` call sites become `db.transaction`:
+  - `credits/ledger.ts`: lock the user's `credit_accounts` row with `SELECT … FOR UPDATE`, read the lots, write. The version column, the retry loop and the forced CHECK violation go away. Idempotency keys (unique) and CHECK constraints stay as the backstop they are today.
+  - `jobs/lifecycle.ts`: returning a failed guest job's quota and setting its `quota_released` flag commit together, as they do in the batch today. Job state changes stay single conditional updates.
+- **Migrations.** Existing SQLite migrations are dropped and one baseline is generated per package and site. `pnpm db:migrate` applies them with the Drizzle migrator; a container never migrates on its own at start.
+
+## 2. Job runs
+
+`runner.ts` already depends only on `StepRunner` (`do(name, fn)`, `sleep(name, ms)`), its steps run strictly in sequence, and it is written for replay: step names are fixed, the job timeout counts from creation, upstream calls carry the job ID as idempotency key. None of that changes. What Workflows provided is rebuilt on two tables.
+
+**Tables** (in `jobs/src/schema.ts`)
+
+- `job_runs`: `id` (the job ID, primary key), `status` (`pending`, `done`, `dead`), `run_after`, `locked_by`, `locked_until`, `pickups`, `created_at`, `finished_at`.
+- `job_steps`: `run_id`, `name` (primary key together), `result` (jsonb), `attempts`, `error`, `done_at`.
+
+**Dispatch.** `handlers.ts` inserts the `job_runs` row in the same transaction as the job row and the debit (`ON CONFLICT DO NOTHING`), instead of calling `GENERATION_WORKFLOW.create` afterwards. A job can no longer be charged without a run, so the `dispatch_failed` path and the ambiguous-dispatch grace logic are removed.
+
+**Worker loop.** Each site process claims runs once a second, and at once when a job is created in the same process:
+
+```sql
+UPDATE job_runs SET locked_by = $me, locked_until = $now + 60000, pickups = pickups + 1
+WHERE id IN (
+  SELECT id FROM job_runs
+  WHERE status = 'pending' AND run_after <= $now AND (locked_until IS NULL OR locked_until < $now)
+  ORDER BY created_at LIMIT $free FOR UPDATE SKIP LOCKED
+) RETURNING id;
+```
+
+It extends `locked_until` every 20 s for the runs it holds and runs `runGeneration` for each, up to a slot limit (jobs mostly wait on the upstream, so 20 by default). `JOB_WORKER=0` turns the loop off for a process that should only serve pages.
+
+**Step runner**
+
+| Workflows behavior                     | Here                                                                                                                                  |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| A finished step returns its saved result | `do` reads `job_steps`; a row with `done_at` returns `result` without running `fn`                                                    |
+| Step retries: 5, from 10 s, exponential | On a throw, `attempts` is saved; the same process waits 10 s × 2^(n−1) and runs `fn` again; after 5 retries the error goes to the runner |
+| `sleep`                                | Awaited in process (the runner sleeps 3 s and 30 s), then recorded so a replay doesn't sleep again                                    |
+| Resume after a crash                   | The lease expires, another loop claims the run and replays it; finished steps return from the table                                   |
+| One instance per ID                    | The primary key, plus the lease                                                                                                       |
+
+- **At least once.** A step whose `fn` finished but whose row was not written runs again after a crash. Workflows has the same property and the runner's steps are already idempotent.
+- **Lease check.** Before running any `fn` and in the transaction that records a step, the runner confirms it still holds the lease. If it does not, `do` throws without running `fn`. This matters because `runGeneration` catches errors and runs an `abort` step: with the check, that step throws too, so a process that lost its lease can never fail and refund a job another process is finishing.
+- **Shutdown.** On SIGTERM the loop stops claiming, lets steps in flight finish within the container's stop grace period, then releases its leases so the next process picks the runs up at once. Stopping uses the same throw-before-`fn` path as a lost lease. Deploys no longer need zero jobs in flight; step names must stay stable across versions, as today (`runner.test.ts` and `effects.test.ts` lock them).
+- **Poison runs.** A run claimed more than 10 times is marked `dead`, and the job is failed `stale` and settled without running the runner. The read-time stale check in `handlers.ts` stays as a second backstop. This also closes a known gap: a stuck job nobody looks at is now refunded by the loop.
+- **Cleanup.** Step rows of finished runs are deleted after 30 days.
+
+Estimated size: about 300 lines for the loop and step runner.
+
+## 3. Bindings become interfaces
+
+- **Env.** `createCore` and the worker read `process.env` once at start and fail fast on a missing value. `CoreEnv` and `JobsEnv` keep their secret names; `DB`, `OUTPUTS`, `EMAIL`, `AI`, `COMPOSE` and `GENERATION_WORKFLOW` are replaced by `DATABASE_URL`, `S3_*`, `MAIL_*`, `WORKERS_AI_*` and `COMPOSE_URL`.
+- **`ObjectStore`.** The engine uses `get` (with ranges), `head` and `put` on the bucket, in 5 files. An interface with those three methods replaces `R2Bucket`. Two implementations: S3 (against R2, so existing keys, lifecycle rules and free egress stay) and a filesystem directory for local dev and tests.
+- **`Mailer`.** `send({ to, from, subject, html, text })`, the shape used at the 5 `env.EMAIL.send` call sites. Default implementation: the Cloudflare Email Service REST API (`POST /accounts/{id}/email/sending/send`), which keeps a site's verified sending domain. SMTP is a few lines for anyone who prefers it.
+- **Describe.** `workersAiDescribe` calls the Workers AI REST API instead of the binding; the `describe` dependency and its best-effort behavior are unchanged.
+- **Client IP.** The engine reads `cf-connecting-ip` (`http.ts`, `analytics.ts`, Better Auth). Behind a reverse proxy this header is only trustworthy if the origin accepts traffic from Cloudflare alone. The launch guide must say so: firewall the origin to Cloudflare's ranges, or have the proxy drop the header from other sources. Guest quotas depend on it.
+
+## 4. Compose service
+
+`packages/jobs/compose/` keeps its image, endpoints and multipart interface. It changes from one instance per job to one long-running service per machine:
+
+- idle exit and the lifetime cap become opt-in (they exist only because an idle Cloudflare container bills); the SIGTERM handler stays;
+- a semaphore caps concurrent ffmpeg and face-check work;
+- job directories under `/tmp/compose` are removed by age, since no instance teardown does it any more;
+- it listens on the internal Docker network only.
+
+`containerComposer(namespace, bucket)` becomes `httpComposer(baseUrl, store)`. Passing file references instead of multipart bodies is a later optimization, not part of this change.
+
+## 5. Site app and template
+
+- `vite.config.ts` drops `@cloudflare/vite-plugin` and builds for Node.
+- `src/server.ts` keeps its fetch handler (Rybbit proxy, then TanStack Start) and also starts the worker loop; `defineGenerationWorkflow` becomes `startJobWorker(models, site)`.
+- `wrangler.jsonc`, `worker-configuration.d.ts` and `wrangler types` go. The template gains a `Dockerfile`, an example `compose.yaml` (site, Postgres, compose service) and `.env.example`.
+- Scripts: `start`, `db:migrate`; `deploy` and `deploy:preview` are removed.
+- Static files and sample videos are served by the Node server or the reverse proxy, which answer byte ranges on their own.
+
+## 6. Tests
+
+- Vitest runs in Node. Each test file gets a fresh in-memory PGlite with migrations applied (`drizzle-orm/pglite/migrator`) and a temp-directory object store. No ports and no shared database, so parallel worktrees still don't interfere.
+- PGlite is a single connection: transactions queue, they do not contend. Lock behavior needs a real server, so a second suite (`pnpm test:pg`) runs against Postgres for: concurrent debits on one user, the `SKIP LOCKED` claim with two workers, lease expiry and takeover, lost-lease writes being refused. CI runs it with a Postgres service container; locally it needs Docker and is skipped without `TEST_DATABASE_URL`.
+- The 12 test files that import workerd modules, and the two migration helpers, move to the new setup. Existing money tests (duplicates, out-of-order events, partial failures) are kept and must pass unchanged in meaning.
+- New engine tests: replay after a crash at every step boundary of a mock job, retry backoff, shutdown mid-step, poison run, duplicate dispatch.
+
+## 7. Tools, CI, docs
+
+- `new-site`, `check-site` and `replace-output` read wrangler config today; they switch to `.env.example`, `compose.yaml` and the object store. `setup-worktree` copies `.env` instead of `.dev.vars`. `check-site` keeps its route, policy-page and cross-site-import checks.
+- CI adds the Postgres service and `test:pg`.
+- README (both languages), `apps/www`, `docs/architecture.md`, `docs/local-development.md` and `docs/site-launch.md` are rewritten for Docker and Postgres. The example site is re-synced after its source site has moved.
+- An existing D1 deployment moves by exporting D1 and loading it with type conversion (epoch integers to `timestamp` for auth tables, 0/1 to `boolean`); R2 keys do not change. No tool is shipped for it.
+
+## Order of work
+
+1. **Spikes** (below). Stop and revise this note if one fails.
+2. **Database:** schema, `createDb`, ledger and lifecycle transactions, test setup on PGlite, `test:pg`. Gate: `core` and `jobs` checks green, independent review of the money paths.
+3. **Job runs:** tables, loop, step runner, dispatch in `handlers.ts`. Gate: engine tests above.
+4. **Interfaces:** object store, mailer, describe, compose over HTTP.
+5. **Template:** Node build, Dockerfile, `compose.yaml`; a full mock-upstream order (upload, charge, generate, compose, deliver, refund) in containers on a dev machine.
+6. **Tools, CI, docs.**
+7. A real site moves (owner's runbook), then the example site is re-synced.
+
+The generation release gate in `AGENTS.md` applies at step 7: actual site configuration through real request construction and SDK validation, and the first 5 live results looked at by a person.
+
+## To verify first
+
+1. **TanStack Start on Node with a custom server entry.** The hosting guide documents the Node build through `nitro/vite` (`node .output/server/index.mjs`) and calls that plugin "under active development"; it does not say whether a custom `src/server.ts` fetch handler is kept on that path. Fallback: serve the built fetch handler with `srvx`, which is already in the lockfile (1.0.8).
+2. **PGlite with this schema:** migrator, `db.transaction`, and the Better Auth Drizzle adapter with `provider: 'pg'`.
+3. **Cloudflare Email Service REST API** from outside Workers with an existing sending domain. The product is in beta.
+4. **Vite build without the Cloudflare plugin:** Paraglide output, server-only modules (`*.server.ts`) staying out of the client bundle, and `check-site`'s boundary check still seeing the same thing.
+
+## Open decisions
+
+- `node-postgres` or `postgres.js` as the app driver. Default `node-postgres`.
+- Whether the loop should also listen on `LISTEN/NOTIFY` to pick up jobs created by another process. Not needed while one process per site runs both.
