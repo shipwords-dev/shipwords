@@ -4,7 +4,7 @@ import { clientIp, errorResponse, ipBucket, json, readJson } from '@shipwords/co
 import { consumeQuota, dayWindow, releaseQuota } from '@shipwords/core/quota/counters';
 import { ensureGuestId, readGuestId } from '@shipwords/core/quota/guest';
 import type { Core } from '@shipwords/core/server';
-import { and, desc, eq, isNull } from 'drizzle-orm';
+import { and, desc, eq, isNull, like, or } from 'drizzle-orm';
 import { createAdapters, type JobsEnv } from './adapters';
 import { imageSize } from './image-size';
 import {
@@ -29,7 +29,7 @@ import {
   sanitizeParameters,
 } from './models';
 import { r2Response } from './r2-range';
-import { type JobRow, jobs } from './schema';
+import { type JobRow, jobSteps, jobs } from './schema';
 
 const MAX_PROMPT = 4000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -320,6 +320,21 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
     async cancel(request: Request, jobId: string): Promise<Response> {
       const job = await ownedJob(request, jobId);
       if (!job) return errorResponse(404, 'job_not_found');
+      // A submit that has started may have reached the upstream even though no task ID was recorded yet (its process can die in
+      // between): the job counts as started, or a refund here could leave a billed task running with nothing to cancel it.
+      if (job.status === 'queued') {
+        const [begun] = await core.db
+          .select({ name: jobSteps.name })
+          .from(jobSteps)
+          .where(
+            and(
+              eq(jobSteps.runId, jobId),
+              or(like(jobSteps.name, 'submit%'), like(jobSteps.name, 'hedge:%')),
+            ),
+          )
+          .limit(1);
+        if (begun) return errorResponse(409, 'job_started');
+      }
       const updated = await cancelQueued(core.db, jobId);
       if (updated?.status === 'submitted') return errorResponse(409, 'job_started');
       if (updated?.status === 'canceled') {

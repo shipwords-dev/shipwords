@@ -4,7 +4,14 @@ import type { Core } from '@shipwords/core/server';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createJobs } from '../src/handlers';
-import { appendUpstreamJob, enqueueRun, loadJob, markSubmitted, spendKey } from '../src/lifecycle';
+import {
+  appendUpstreamJob,
+  enqueueRun,
+  loadJob,
+  markFailed,
+  markSubmitted,
+  spendKey,
+} from '../src/lifecycle';
 import { defineModels } from '../src/models';
 import type { RunnerDeps } from '../src/runner';
 import { jobRuns, jobSteps, jobs } from '../src/schema';
@@ -292,6 +299,28 @@ describe('steps', () => {
   });
 });
 
+describe('fenced outcome writes', () => {
+  it('a claim that lost the lease cannot fail and refund the job; the current claim can', async () => {
+    const { userId, jobId } = await paidJob();
+    await db
+      .update(jobRuns)
+      .set({ lockedBy: 'w2:1', lockedUntil: Date.now() + 60_000 })
+      .where(eq(jobRuns.id, jobId));
+    await markFailed(db, jobId, 'failed', 'late', 'from the old claim', { runId: jobId, token: 'w1:1' });
+    expect((await loadJob(db, jobId))?.status).toBe('queued');
+    expect((await getBalance(db, userId)).available).toBe(40);
+    await markFailed(db, jobId, 'failed', 'real', 'from the current claim', { runId: jobId, token: 'w2:1' });
+    expect((await loadJob(db, jobId))?.status).toBe('failed');
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
+  it('a step budget is spent only by failed attempts, not by one cut off without an error', async () => {
+    const { runId, steps } = await heldRun('w1:1');
+    await db.insert(jobSteps).values({ runId, name: 'cut', attempts: 3 });
+    expect(await steps.do('cut', async () => 'ok')).toBe('ok');
+  });
+});
+
 describe('upstream IDs recorded twice', () => {
   it('the same segment submit replayed elsewhere is recorded once and reported as recorded to both', async () => {
     const { jobId } = await paidJob();
@@ -482,6 +511,77 @@ describe('job worker', () => {
     download.release();
   });
 
+  it("an old worker's watchdog leaves a run another worker took over alone", async () => {
+    const { userId, jobId } = await paidJob();
+    const adapter = new FakeAdapter();
+    const download = gated(imageResponse);
+    download.hold();
+    worker(
+      { db, bucket, models, adapters: { yir: adapter }, fetcher: () => download.call() },
+      // The first heartbeat comes after both the takeover and the stuck time, so the watchdog runs before renewal notices.
+      { stuckGraceMs: -10 * 60_000 + 300, heartbeatMs: 1_000, leaseMs: 10_000 },
+    );
+    await until(async () => download.calls() > 0);
+    // Another worker takes the run over before this one's watchdog fires.
+    await db
+      .update(jobRuns)
+      .set({ lockedBy: 'other:1', lockedUntil: Date.now() + 60_000 })
+      .where(eq(jobRuns.id, jobId));
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(adapter.cancelled).toEqual([]);
+    expect((await loadJob(db, jobId))?.status).toBe('submitted');
+    expect((await getBalance(db, userId)).available).toBe(40);
+    expect((await runOf(jobId)).status).toBe('pending');
+    download.release();
+  });
+
+  it('frees the slot of a run another worker took over, even if its call never returns', async () => {
+    const { jobId } = await paidJob();
+    const download = gated(imageResponse);
+    download.hold();
+    const w = worker({
+      db,
+      bucket,
+      models,
+      adapters: { yir: new FakeAdapter() },
+      fetcher: () => download.call(),
+    });
+    await until(async () => download.calls() > 0);
+    await db
+      .update(jobRuns)
+      .set({ lockedBy: 'other:1', lockedUntil: Date.now() + 60_000 })
+      .where(eq(jobRuns.id, jobId));
+    await until(async () => w.active === 0);
+    download.release();
+  });
+
+  it('cancels prep hedge copies left by a job that ended without a result', async () => {
+    const { jobId } = await paidJob();
+    await markFailed(db, jobId, 'failed', 'x', 'failed before the run finished');
+    await db.insert(jobSteps).values({
+      runId: jobId,
+      name: 'hedge:left',
+      attempts: 1,
+      result: { v: 'up_hedge' },
+      doneAt: Date.now(),
+    });
+    const adapter = new FakeAdapter();
+    worker({ db, bucket, models, adapters: { yir: adapter } });
+    await until(async () => (await runOf(jobId)).status === 'done');
+    expect(adapter.cancelled).toEqual(['up_hedge']);
+  });
+
+  it('queues a run at start for a job in progress that has none', async () => {
+    const { jobId } = await paidJob();
+    await db.delete(jobRuns).where(eq(jobRuns.id, jobId));
+    const adapter = new FakeAdapter();
+    worker({ db, bucket, models, adapters: { yir: adapter }, fetcher: async () => imageResponse() });
+    await until(
+      async () => (await db.select().from(jobRuns).where(eq(jobRuns.id, jobId))).at(0)?.status === 'done',
+    );
+    expect((await loadJob(db, jobId))?.status).toBe('succeeded');
+  });
+
   it('refuses lease settings that would let a lease run out between heartbeats', () => {
     expect(() =>
       startJobWorker({ db, bucket, models, adapters: {} }, { leaseMs: 4_000, heartbeatMs: 1_000 }),
@@ -516,6 +616,21 @@ describe('creating jobs', () => {
       throw new Error('worker gone');
     }).create(post());
     expect(response.status).toBe(201);
+    expect((await getBalance(db, userId)).available).toBe(40);
+  });
+
+  it('refuses a cancel once a submit has started, since the upstream may already hold the task', async () => {
+    const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
+    await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
+    const jobsApi = api(userId);
+    const { job } = (await (await jobsApi.create(post())).json()) as { job: { id: string } };
+    await db.insert(jobSteps).values({ runId: job.id, name: 'submit', attempts: 1 });
+    const response = await jobsApi.cancel(
+      new Request(`https://test.example/api/jobs/${job.id}/cancel`, { method: 'POST' }),
+      job.id,
+    );
+    expect(response.status).toBe(409);
+    expect((await loadJob(db, job.id))?.status).toBe('queued');
     expect((await getBalance(db, userId)).available).toBe(40);
   });
 

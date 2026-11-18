@@ -1,8 +1,8 @@
 import type { Db } from '@shipwords/core/db/client';
 import { and, eq, inArray, isNotNull, like, lt, ne, notInArray, sql } from 'drizzle-orm';
-import { cancelAll, loadJob, markFailed, upstreamIds } from './lifecycle';
+import { cancelAll, type Fence, loadJob, markFailed, upstreamIds } from './lifecycle';
 import { type RunnerDeps, runGeneration, type StepRunner } from './runner';
-import { jobRuns, jobSteps, TERMINAL } from './schema';
+import { jobRuns, jobSteps, jobs, TERMINAL } from './schema';
 
 // Durable execution of runGeneration on Postgres, in place of Cloudflare Workflows.
 //
@@ -47,6 +47,8 @@ export interface WorkerOptions {
   /** Step rows of runs that ended this long ago are deleted. */
   keepStepsMs?: number;
   log?: (message: string, details: Record<string, unknown>) => void;
+  /** At start, queue a run for every job in progress that has none (jobs created before job_runs existed). Default true. */
+  backfill?: boolean;
   /** For tests; defaults to Date.now. */
   now?: () => number;
 }
@@ -252,8 +254,9 @@ export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRun
       if (row?.doneAt != null) return (row.result as { v?: unknown } | null)?.v as T;
       // Attempts started before (including ones whose process died) count: a replay doesn't get a fresh set of retries.
       const started = row?.attempts ?? 0;
-      if (started > options.retries)
-        throw new Error(row?.error ?? `step ${name} did not finish in ${started} attempts`);
+      // The budget is spent only when the last attempt itself failed; one cut off by a crash or the worker's own database trouble
+      // gets another try (bounded by the run's poison limit).
+      if (started > options.retries && row?.error) throw new Error(row.error);
       if (started > 0 && row?.error) await backoff(started);
       for (let attempt = started + 1; ; attempt++) {
         await begin(name, attempt);
@@ -406,8 +409,29 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
     return [...recorded, ...copies];
   }
 
-  /** Poison or stuck: cancel what the job still has running upstream (it would keep billing), then fail and refund it. */
+  /** True while this claim still holds the run's lease. */
+  async function stillHeld(lease: Lease): Promise<boolean> {
+    const [row] = await db
+      .select({ id: jobRuns.id })
+      .from(jobRuns)
+      .where(
+        and(
+          eq(jobRuns.id, lease.runId),
+          eq(jobRuns.lockedBy, lease.token),
+          eq(jobRuns.status, 'pending'),
+          sql`${jobRuns.lockedUntil} > ${now()}`,
+        ),
+      );
+    return Boolean(row);
+  }
+
+  /**
+   * Poison or stuck: cancel what the job still has running upstream (it would keep billing), then fail and refund it. Only while this
+   * claim holds the lease: another worker may have taken the run over, and the failure write is fenced on the claim as well.
+   */
   async function bury(lease: Lease, why: string) {
+    if (!(await stillHeld(lease))) return;
+    const fence: Fence = { runId: lease.runId, token: lease.token };
     const job = await loadJob(db, lease.runId);
     if (job && !TERMINAL.includes(job.status)) {
       const adapter = deps.adapters[job.upstream];
@@ -415,8 +439,26 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
         await within(CANCEL_LIMIT_MS, cancelAll(adapter, await upstreamTasks(lease.runId, upstreamIds(job))));
     }
     // A job that already ended keeps its state; settlement is idempotent and completes in case the last run died before settle.
-    if (job) await markFailed(db, lease.runId, 'failed', 'stale', why);
+    if (job) await markFailed(db, lease.runId, 'failed', 'stale', why, fence);
     await end(lease, 'dead');
+  }
+
+  /** A job that ended without a result: cancel prep hedge copies its run placed (the runner only cancels what the job row lists). */
+  async function cancelLeftovers(runId: string) {
+    const job = await loadJob(db, runId);
+    if (!job || job.status === 'succeeded' || !TERMINAL.includes(job.status)) return;
+    const adapter = deps.adapters[job.upstream];
+    const copies = await upstreamTasks(runId, []);
+    if (adapter && copies.length > 0) await within(CANCEL_LIMIT_MS, cancelAll(adapter, copies));
+  }
+
+  /** The worker's own database work outside steps: a failure hands the run back, like one inside a step. */
+  async function quiet<T>(lease: Lease, op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch {
+      throw abortLease(lease, 'engine');
+    }
   }
 
   async function stuckAt(runId: string): Promise<number> {
@@ -436,27 +478,31 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
         await bury(lease, 'the job kept stopping before it finished');
         return;
       }
-      entry.stuckAt = await stuckAt(run.id);
+      entry.stuckAt = await quiet(lease, () => stuckAt(run.id));
+      const fence: Fence = { runId: run.id, token: run.token };
       const steps = leasedSteps(db, lease, stepOptions);
       try {
-        await runGeneration(deps, run.id, steps);
+        await runGeneration({ ...deps, fence }, run.id, steps);
       } catch (error) {
         if (error instanceof RunLost) throw error;
         // runGeneration has its own fallback; this catches what escapes it.
         await steps.do('abort:outer', async () => {
-          await markFailed(db, run.id, 'failed', 'workflow_failed', String(error));
+          await markFailed(db, run.id, 'failed', 'workflow_failed', String(error), fence);
           return true;
         });
       }
       // runGeneration swallows errors of best-effort steps (notify, cost): a run stopped in one of them is not finished.
       if (lease.abort.signal.aborted) throw lease.abort.signal.reason;
-      const job = await loadJob(db, run.id);
+      const job = await quiet(lease, () => loadJob(db, run.id));
       if (job && !TERMINAL.includes(job.status)) {
         // Shouldn't happen: leave the lease to expire so the run is replayed; pickups bound how often.
         log('job run ended with the job unfinished', { jobId: run.id, status: job.status });
         return;
       }
-      await end(lease, 'done');
+      await cancelLeftovers(run.id).catch((error: unknown) =>
+        log('canceling leftover upstream tasks failed', { jobId: run.id, error: String(error) }),
+      );
+      await quiet(lease, () => end(lease, 'done'));
     } catch (error) {
       if (error instanceof RunLost) {
         if (error.reason === 'stopping') await release(run.id, run.token).catch(() => {});
@@ -505,8 +551,13 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
       .returning({ id: jobRuns.id });
     const keptIds = new Set(kept.map((row) => row.id));
     for (const lease of leases) {
-      if (keptIds.has(lease.runId)) lease.until = t + leaseMs;
-      else abortLease(lease, 'lost');
+      if (keptIds.has(lease.runId)) {
+        lease.until = t + leaseMs;
+        continue;
+      }
+      // Another worker has the run now. Free the slot even if the call in flight never returns; its writes are fenced.
+      abortLease(lease, 'lost');
+      if (held.get(lease.runId)?.lease === lease) held.delete(lease.runId);
     }
   }
 
@@ -558,6 +609,17 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
       });
   }
 
+  if (options.backfill !== false) {
+    // Jobs created before job_runs existed (or by an older version) have no run; without one nothing would ever run or settle them.
+    void Promise.resolve()
+      .then(() =>
+        db.execute(
+          sql`insert into ${jobRuns} (id) select ${jobs.id} from ${jobs} where ${jobs.status} in ('queued', 'submitted') on conflict do nothing`,
+        ),
+      )
+      .catch((error: unknown) => log('job run backfill failed', { error: String(error) }));
+  }
+
   const beat = setInterval(() => {
     void heartbeat().catch((error: unknown) => log('job worker heartbeat failed', { error: String(error) }));
   }, heartbeatMs);
@@ -575,10 +637,16 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
       stopping = true;
       if (wakeTimer) clearTimeout(wakeTimer);
       for (const entry of held.values()) abortLease(entry.lease, 'stopping');
-      await polling;
-      for (const entry of held.values()) abortLease(entry.lease, 'stopping');
-      // A step that never returns would hold this forever; its lease simply expires and another process replays the run.
-      await within(stopGraceMs, Promise.allSettled([...running]));
+      // A claim, release or step that never returns would hold this forever; such runs' leases simply expire and another process
+      // replays them.
+      await within(
+        stopGraceMs,
+        (async () => {
+          await polling;
+          for (const entry of held.values()) abortLease(entry.lease, 'stopping');
+          await Promise.allSettled([...running]);
+        })(),
+      );
       clearInterval(beat);
     },
   };

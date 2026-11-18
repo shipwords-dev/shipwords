@@ -307,12 +307,21 @@ export async function repairOutputs(
         return work(String(round));
       });
       const position = ctx.partCount + round;
-      const submitted = await step.do(`${label}:submit`, async () => {
+      /** The pass's recorded upstream ID, if the slot was filled (by this call or a replay of it); done if the job ended. */
+      const recorded = async () => {
+        const row = await activeJob(deps.db, jobId);
+        if (!row) return { done: true as const };
+        const id = upstreamIds(row)[position];
+        return id ? { upstreamJobId: id } : null;
+      };
+      const submitted = await step.do(`${label}:submit`, async (info) => {
         const row = await activeJob(deps.db, jobId);
         if (!row) return { done: true as const };
         const existing = upstreamIds(row)[position];
         if (existing) return { upstreamJobId: existing };
-        if (Date.now() > deadline) return { timeout: true as const };
+        // Past the deadline, a first attempt never submits; a later one may follow an attempt the upstream accepted, so it submits
+        // again with the same key to recover that task, and the timeout that follows cancels it.
+        if (Date.now() > deadline && (info?.attempt ?? 1) === 1) return { timeout: true as const };
         const input = repairInput(
           repair,
           pass,
@@ -324,12 +333,17 @@ export async function repairOutputs(
         );
         try {
           const { upstreamJobId } = await adapter.submit(input, `${jobId}:${partId}:repair:${round}`);
-          if (!(await appendUpstreamJob(deps.db, jobId, position, upstreamJobId))) {
+          if (await appendUpstreamJob(deps.db, jobId, position, upstreamJobId, deps.fence))
+            return { upstreamJobId };
+          // The slot was filled meanwhile, or the job ended: keep the recorded task, cancel a different one this call placed.
+          const now = await recorded();
+          if (!now || 'done' in now || now.upstreamJobId !== upstreamJobId)
             await adapter.cancel(upstreamJobId).catch(() => undefined);
-            return { done: true as const };
-          }
-          return { upstreamJobId };
+          return now ?? { done: true as const };
         } catch (error) {
+          // A late error from an attempt another one already got past must not end the pass.
+          const now = await recorded();
+          if (now) return now;
           if (error instanceof UpstreamError && !error.retryable) return { rejected: error.code };
           throw error;
         }

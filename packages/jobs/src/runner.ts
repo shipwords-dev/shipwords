@@ -6,6 +6,7 @@ import {
   activeJob,
   appendUpstreamJob,
   cancelAll,
+  type Fence,
   loadJob,
   markFailed,
   markForReview,
@@ -75,6 +76,8 @@ export interface RunnerDeps {
    */
   failures?: (failed: readonly JobRow[]) => Promise<void>;
   log?: (message: string, details: Record<string, unknown>) => void;
+  /** The worker's claim on this run; job outcome writes apply only while it holds the lease (lifecycle.ts Fence). */
+  fence?: Fence;
 }
 
 const POLL_WAIT_SECONDS = 20;
@@ -107,7 +110,7 @@ export async function runGeneration(deps: RunnerDeps, jobId: string, step: StepR
       const job = await activeJob(deps.db, jobId);
       const adapter = job ? deps.adapters[job.upstream] : undefined;
       if (job && adapter) await cancelAll(adapter, upstreamIds(job));
-      await markFailed(deps.db, jobId, 'failed', 'internal_error', message);
+      await markFailed(deps.db, jobId, 'failed', 'internal_error', message, deps.fence);
       return true;
     });
   }
@@ -243,6 +246,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
         'failed',
         'model_removed',
         `model ${setup.missingModel} is no longer configured`,
+        deps.fence,
       );
       return true;
     });
@@ -320,7 +324,14 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   const adapter = deps.adapters[setup.upstream];
   if (!adapter) {
     await step.do('fail:upstream_missing', async () => {
-      await markFailed(deps.db, jobId, 'failed', 'upstream_missing', `no adapter for ${setup.upstream}`);
+      await markFailed(
+        deps.db,
+        jobId,
+        'failed',
+        'upstream_missing',
+        `no adapter for ${setup.upstream}`,
+        deps.fence,
+      );
       return true;
     });
     return;
@@ -335,7 +346,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     step.do(stepName, async () => {
       const job = await loadJob(deps.db, jobId);
       if (job) await cancelAll(adapter, upstreamIds(job));
-      await markFailed(deps.db, jobId, 'failed', code, message);
+      await markFailed(deps.db, jobId, 'failed', code, message, deps.fence);
       return true;
     });
   const fail = (code: string, message: string) => stop(`fail:${code}`, code, message);
@@ -399,7 +410,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           } catch (error) {
             if (!(error instanceof UpstreamError) || error.retryable) throw error;
             await cancelAll(adapter, upstreamIds(job));
-            await markFailed(deps.db, jobId, 'failed', error.code, error.message);
+            await markFailed(deps.db, jobId, 'failed', error.code, error.message, deps.fence);
             return false;
           }
         });
@@ -481,10 +492,13 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
         hedged.add(partId);
         const part = pending.find((candidate) => candidate.partId === partId)!;
         // Best effort and no Workflow retries: if the copy can't be placed, keep waiting on the original.
-        const copy = await step.do(`hedge:${partId}`, async () => {
+        const copy = await step.do(`hedge:${partId}`, async (info) => {
           const job = await activeJob(deps.db, jobId);
-          // A replay can resume here past the deadline: a copy then could never be used.
-          if (!job || Date.now() > deadline) return null;
+          if (!job) return null;
+          // A replay can resume here past the deadline: a copy then could never be used, so a first attempt places none. A later
+          // attempt may follow one the upstream accepted: it submits with the same key to recover that copy, which the prep
+          // poll's timeout then cancels.
+          if (Date.now() > deadline && (info?.attempt ?? 1) === 1) return null;
           try {
             const { upstreamJobId } = await adapter.submit(
               submitInput(job, part.index),
@@ -675,7 +689,8 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
        * wins and a different task this call placed is canceled; when the job has ended, the task is canceled and the job is done.
        */
       const record = async (upstreamJobId: string) => {
-        if (await appendUpstreamJob(deps.db, jobId, index, upstreamJobId)) return { upstreamJobId };
+        if (await appendUpstreamJob(deps.db, jobId, index, upstreamJobId, deps.fence))
+          return { upstreamJobId };
         const now = await activeJob(deps.db, jobId);
         const recorded = now ? upstreamIds(now)[index] : undefined;
         if (recorded !== upstreamJobId && !upstreamJobId.startsWith(SKIPPED))
@@ -717,7 +732,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
               message: error.message,
             });
             await cancelAll(adapter, upstreamIds(job));
-            await markFailed(deps.db, jobId, 'failed', error.code, error.message);
+            await markFailed(deps.db, jobId, 'failed', error.code, error.message, deps.fence);
             return { done: true as const };
           }
           throw error;
@@ -890,14 +905,14 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     }
   }
   await step.do('finish', async () => {
-    await markSucceeded(deps.db, jobId, finalOutputs);
+    await markSucceeded(deps.db, jobId, finalOutputs, deps.fence);
     return true;
   });
   if (reviews.length > 0) {
     // Best effort, after delivery: the note is kept on the job (error_message, which pages never show) and sent to deps.review.
     await step
       .do('review', async () => {
-        const job = await markForReview(deps.db, jobId, reviews.join('; '));
+        const job = await markForReview(deps.db, jobId, reviews.join('; '), deps.fence);
         if (job) await deps.review?.(job, reviews);
         return true;
       })

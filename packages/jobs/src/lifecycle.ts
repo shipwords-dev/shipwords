@@ -2,7 +2,7 @@ import { refundSpend } from '@shipwords/core/credits/ledger';
 import type { Db, Tx } from '@shipwords/core/db/client';
 import { quotaCounters } from '@shipwords/core/db/schema';
 import type { QuotaRule } from '@shipwords/core/quota/counters';
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, type SQL, sql } from 'drizzle-orm';
 import { type JobRow, jobRuns, jobs, TERMINAL } from './schema';
 import type { UpstreamAdapter } from './upstream';
 
@@ -23,17 +23,36 @@ export async function loadJob(db: Db, jobId: string): Promise<JobRow | null> {
   return row ?? null;
 }
 
+/**
+ * The run claim a write is made under (worker.ts). A write with a fence only applies while that claim still holds the run's lease,
+ * so a worker that lost its lease, but whose call is still running, can't change how the job ends. Handlers write without one.
+ */
+export interface Fence {
+  runId: string;
+  token: string;
+}
+
+function held(fence: Fence | undefined): SQL | undefined {
+  if (!fence) return undefined;
+  return sql`exists (select 1 from ${jobRuns} where ${jobRuns.id} = ${fence.runId} and ${jobRuns.lockedBy} = ${fence.token} and ${jobRuns.status} = 'pending' and ${jobRuns.lockedUntil} > ${Date.now()})`;
+}
+
 /** The job while it is still in progress; null once it has ended or is gone. */
 export async function activeJob(db: Db, jobId: string): Promise<JobRow | null> {
   const job = await loadJob(db, jobId);
   return job && !TERMINAL.includes(job.status) ? job : null;
 }
 
-export async function markSubmitted(db: Db, jobId: string, upstreamJobId: string): Promise<boolean> {
+export async function markSubmitted(
+  db: Db,
+  jobId: string,
+  upstreamJobId: string,
+  fence?: Fence,
+): Promise<boolean> {
   const result = await db
     .update(jobs)
     .set({ status: 'submitted', upstreamJobId, submittedAt: Date.now() })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'queued')))
+    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'queued'), held(fence)))
     .returning({ id: jobs.id });
   return result.length > 0;
 }
@@ -56,8 +75,9 @@ export async function appendUpstreamJob(
   jobId: string,
   index: number,
   upstreamJobId: string,
+  fence?: Fence,
 ): Promise<boolean> {
-  if (index === 0 && (await markSubmitted(db, jobId, upstreamJobId))) return true;
+  if (index === 0 && (await markSubmitted(db, jobId, upstreamJobId, fence))) return true;
   const job = await loadJob(db, jobId);
   if (index === 0) return job?.status === 'submitted' && upstreamIds(job)[0] === upstreamJobId;
   if (job?.status !== 'submitted') return false;
@@ -67,7 +87,14 @@ export async function appendUpstreamJob(
   const result = await db
     .update(jobs)
     .set({ upstreamJobId: [...ids, upstreamJobId].join(',') })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'submitted'), eq(jobs.upstreamJobId, job.upstreamJobId!)))
+    .where(
+      and(
+        eq(jobs.id, jobId),
+        eq(jobs.status, 'submitted'),
+        eq(jobs.upstreamJobId, job.upstreamJobId!),
+        held(fence),
+      ),
+    )
     .returning({ id: jobs.id });
   if (result.length > 0) return true;
   // Lost the race to another write. If that was the same submit replayed elsewhere (same idempotency key, same upstream ID),
@@ -81,11 +108,16 @@ export interface StoredOutput {
   mediaType: string;
 }
 
-export async function markSucceeded(db: Db, jobId: string, outputs: StoredOutput[]): Promise<boolean> {
+export async function markSucceeded(
+  db: Db,
+  jobId: string,
+  outputs: StoredOutput[],
+  fence?: Fence,
+): Promise<boolean> {
   const result = await db
     .update(jobs)
     .set({ status: 'succeeded', outputsJson: JSON.stringify(outputs), finishedAt: Date.now() })
-    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE)))
+    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE), held(fence)))
     .returning({ id: jobs.id });
   return result.length > 0;
 }
@@ -94,11 +126,16 @@ export async function markSucceeded(db: Db, jobId: string, outputs: StoredOutput
  * Note on a delivered job that it needs a human look (error_message; error_code stays empty, so pages still show a plain success).
  * Only bookkeeping like recordUpstreamCost. Returns the job, or null if it isn't a success.
  */
-export async function markForReview(db: Db, jobId: string, note: string): Promise<JobRow | null> {
+export async function markForReview(
+  db: Db,
+  jobId: string,
+  note: string,
+  fence?: Fence,
+): Promise<JobRow | null> {
   await db
     .update(jobs)
     .set({ errorMessage: `needs review: ${note}`.slice(0, 500) })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'succeeded')));
+    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'succeeded'), held(fence)));
   const job = await loadJob(db, jobId);
   return job?.status === 'succeeded' ? job : null;
 }
@@ -115,11 +152,12 @@ export async function markFailed(
   status: 'failed' | 'canceled',
   code: string,
   message: string,
+  fence?: Fence,
 ): Promise<JobRow | null> {
   await db
     .update(jobs)
     .set({ status, errorCode: code, errorMessage: message.slice(0, 500), finishedAt: Date.now() })
-    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE)));
+    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE), held(fence)));
   const job = await loadJob(db, jobId);
   if (job) await settleFailure(db, job);
   return job;
