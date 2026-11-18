@@ -1,5 +1,5 @@
 import { createDb, type Db } from '@shipwords/core/db/client';
-import { type Mailer, mailerFromEnv } from '@shipwords/core/email/mailer';
+import { canSendMail, type Mailer, mailerFromEnv } from '@shipwords/core/email/mailer';
 import type { SiteConfig } from '@shipwords/core/site';
 import { createAdapters, fixedMockResult, type JobsEnv } from './adapters';
 import { httpComposer } from './compose';
@@ -33,7 +33,8 @@ export function runnerDeps(
     console.log(JSON.stringify({ level: 'info', message, ...details }));
   const store = options.store ?? storeFromEnv(env);
   const mailer = options.mailer ?? mailerFromEnv(env, log);
-  const from = env.EMAIL_FROM;
+  // Job emails are best effort: with no way to send, skip them rather than retry a certain failure on every finished job.
+  const from = options.mailer || canSendMail(env) ? env.EMAIL_FROM : undefined;
   return {
     db,
     bucket: store,

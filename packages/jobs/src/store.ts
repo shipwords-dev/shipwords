@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import { dirname, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { AwsClient } from 'aws4fetch';
@@ -14,7 +14,18 @@ export interface StoredObject {
   /** An HTTP ETag value, quotes included. */
   etag: string;
   contentType?: string;
+  /** Set on some objects stored before (e.g. attachment; filename=…); served as is. */
+  contentDisposition?: string;
   uploaded: Date;
+}
+
+/**
+ * Keys are slash-separated names. Empty, "." and ".." segments are refused: URL handling would rewrite them (S3) or they would
+ * step outside the store (local directory), so the object read could differ from the one named.
+ */
+export function assertKey(key: string): void {
+  if (!key || key.split('/').some((segment) => segment === '' || segment === '.' || segment === '..'))
+    throw new Error(`invalid storage key: ${key}`);
 }
 
 export interface ObjectBody extends StoredObject {
@@ -97,6 +108,7 @@ export function memoryStore(): ObjectStore {
       return bodyOf(found.object, () => streamOf(bytes));
     },
     async put(key, body, options) {
+      assertKey(key);
       const bytes = await bytesOf(body);
       objects.set(key, {
         bytes,
@@ -110,20 +122,65 @@ export function memoryStore(): ObjectStore {
 
 // ---- local directory ----
 
-/** Files under a directory, with a small JSON sidecar for the content type; for local development. */
+/**
+ * Files under a directory, with a small JSON sidecar for the content type; for local development. Links are never followed: every
+ * directory on the way must really be inside the root, and the file and its sidecar must be plain files.
+ */
 export function fileStore(root: string): ObjectStore {
   const base = resolve(root);
+  let realBase: Promise<string> | null = null;
+  const baseReal = () => (realBase ??= mkdir(base, { recursive: true }).then(() => realpath(base)));
+  const locks = new Map<string, Promise<unknown>>();
+  /** One writer per key at a time in this process, so a file and its sidecar are always published as a pair. */
+  async function locked<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const before = locks.get(key) ?? Promise.resolve();
+    const next = before.then(work, work);
+    locks.set(
+      key,
+      next.catch(() => {}),
+    );
+    try {
+      return await next;
+    } finally {
+      if (locks.get(key) === next) locks.delete(key);
+    }
+  }
   const pathOf = (key: string) => {
+    assertKey(key);
+    if (key.includes('\\')) throw new Error(`key outside the store: ${key}`);
     const path = resolve(base, ...key.split('/'));
     if (!path.startsWith(base + sep)) throw new Error(`key outside the store: ${key}`);
     return path;
   };
+  /** The deepest existing directory above path must resolve, links followed, to a place inside the root. */
+  async function checkParents(path: string) {
+    const rootReal = await baseReal();
+    let dir = dirname(path);
+    while (dir.length > base.length && !(await lstat(dir).catch(() => null))) dir = dirname(dir);
+    const real = await realpath(dir);
+    if (real !== rootReal && !real.startsWith(rootReal + sep))
+      throw new Error(`path leaves the store: ${path}`);
+  }
+  /** A plain file at path (a link counts as missing). */
+  async function plainFile(path: string) {
+    const info = await lstat(path).catch(() => null);
+    return info?.isFile() ? info : null;
+  }
   async function meta(key: string): Promise<StoredObject | null> {
     const path = pathOf(key);
-    const info = await stat(path).catch(() => null);
-    if (!info?.isFile()) return null;
-    const sidecar = await readFile(`${path}.meta.json`, 'utf8').catch(() => null);
-    const contentType = sidecar ? (JSON.parse(sidecar) as { contentType?: string }).contentType : undefined;
+    await checkParents(path);
+    const info = await plainFile(path);
+    if (!info) return null;
+    const sidecarPath = `${path}.meta.json`;
+    const sidecar = (await plainFile(sidecarPath))
+      ? await readFile(sidecarPath, 'utf8').catch(() => null)
+      : null;
+    let contentType: string | undefined;
+    try {
+      contentType = sidecar ? (JSON.parse(sidecar) as { contentType?: string }).contentType : undefined;
+    } catch {
+      contentType = undefined;
+    }
     return {
       key,
       size: info.size,
@@ -148,12 +205,18 @@ export function fileStore(root: string): ObjectStore {
     },
     async put(key, body, options) {
       const path = pathOf(key);
-      await mkdir(dirname(path), { recursive: true });
-      // Write then rename, so a reader never sees half a file.
-      const temp = `${path}.${crypto.randomUUID()}.part`;
-      await writeFile(temp, await bytesOf(body));
-      await writeFile(`${path}.meta.json`, JSON.stringify({ contentType: options?.contentType }));
-      await rename(temp, path);
+      const bytes = await bytesOf(body);
+      await locked(key, async () => {
+        await checkParents(path);
+        await mkdir(dirname(path), { recursive: true });
+        await checkParents(path);
+        // Write then rename, both files, so a reader never sees half of either.
+        const id = crypto.randomUUID();
+        await writeFile(`${path}.${id}.part`, bytes);
+        await writeFile(`${path}.${id}.meta.part`, JSON.stringify({ contentType: options?.contentType }));
+        await rename(`${path}.${id}.meta.part`, `${path}.meta.json`);
+        await rename(`${path}.${id}.part`, path);
+      });
     },
   };
 }
@@ -178,7 +241,11 @@ export function s3Store(config: S3Config, fetcher: typeof fetch = fetch): Object
     service: 's3',
     region: config.region ?? 'auto',
   });
-  const urlOf = (key: string) =>
+  const urlOf = (key: string) => {
+    assertKey(key);
+    return urlFor(key);
+  };
+  const urlFor = (key: string) =>
     `${config.endpoint.replace(/\/$/, '')}/${encodeURIComponent(config.bucket)}/${key.split('/').map(encodeURIComponent).join('/')}`;
   async function send(key: string, init: RequestInit): Promise<Response> {
     const signed = await client.sign(urlOf(key), init);
@@ -186,6 +253,7 @@ export function s3Store(config: S3Config, fetcher: typeof fetch = fetch): Object
   }
   const objectOf = (key: string, response: Response, size: number): StoredObject => {
     const contentType = response.headers.get('content-type') ?? undefined;
+    const contentDisposition = response.headers.get('content-disposition') ?? undefined;
     const modified = response.headers.get('last-modified');
     return {
       key,
@@ -193,13 +261,24 @@ export function s3Store(config: S3Config, fetcher: typeof fetch = fetch): Object
       etag: response.headers.get('etag') ?? '""',
       uploaded: modified ? new Date(modified) : new Date(0),
       ...(contentType ? { contentType } : {}),
+      ...(contentDisposition ? { contentDisposition } : {}),
     };
   };
+  /** Status, S3 error code and request ID only: an error body can echo the access key ID and the signature. */
+  async function failure(what: string, key: string, response: Response): Promise<Error> {
+    const text = await response.text().catch(() => '');
+    const code = /<Code>([^<]{1,100})<\/Code>/.exec(text)?.[1];
+    const request =
+      response.headers.get('x-amz-request-id') ?? /<RequestId>([^<]{1,100})<\/RequestId>/.exec(text)?.[1];
+    return new Error(
+      `storage ${what} ${key} failed: ${response.status}${code ? ` ${code}` : ''}${request ? ` (request ${request})` : ''}`,
+    );
+  }
   return {
     async head(key) {
       const response = await send(key, { method: 'HEAD' });
       if (response.status === 404) return null;
-      if (!response.ok) throw new Error(`storage head ${key} failed: ${response.status}`);
+      if (!response.ok) throw await failure('head', key, response);
       return objectOf(key, response, Number(response.headers.get('content-length') ?? '0'));
     },
     async get(key, options) {
@@ -209,11 +288,26 @@ export function s3Store(config: S3Config, fetcher: typeof fetch = fetch): Object
         ...(range ? { headers: { range: `bytes=${range.offset}-${range.offset + range.length - 1}` } } : {}),
       });
       if (response.status === 404) return null;
-      if (!response.ok)
-        throw new Error(`storage get ${key} failed: ${response.status} ${await response.text()}`);
-      // The size of the whole object: Content-Range's total on a ranged read, Content-Length otherwise.
-      const total = response.headers.get('content-range')?.split('/')[1];
-      const size = Number(total ?? response.headers.get('content-length') ?? '0');
+      if (!response.ok) throw await failure('get', key, response);
+      let size: number;
+      if (range) {
+        // Only exactly the range asked for may be passed on as a 206: a server or proxy that ignored Range sent the whole object.
+        const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('content-range') ?? '');
+        if (
+          response.status !== 206 ||
+          !match ||
+          Number(match[1]) !== range.offset ||
+          Number(match[2]) !== range.offset + range.length - 1
+        ) {
+          await response.body?.cancel();
+          throw new Error(
+            `storage get ${key}: range ${range.offset}+${range.length} not honored (${response.status})`,
+          );
+        }
+        size = Number(match[3]);
+      } else {
+        size = Number(response.headers.get('content-length') ?? '0');
+      }
       // Streamed, not buffered: videos served through /files would otherwise sit in memory for every request.
       if (!response.body) throw new Error(`storage get ${key} returned no body`);
       const stream = response.body;
@@ -229,8 +323,7 @@ export function s3Store(config: S3Config, fetcher: typeof fetch = fetch): Object
           ...(options?.contentType ? { 'content-type': options.contentType } : {}),
         },
       });
-      if (!response.ok)
-        throw new Error(`storage put ${key} failed: ${response.status} ${await response.text()}`);
+      if (!response.ok) throw await failure('put', key, response);
     },
   };
 }

@@ -19,7 +19,8 @@ export async function freshDatabase(): Promise<{ db: Db; close: () => Promise<vo
   await admin.end();
   const url = new URL(adminUrl);
   url.pathname = `/${name}`;
-  const pool = new Pool({ connectionString: url.toString(), max: 20 });
+  // Small pools and one file at a time (vitest.pg.config.ts): a shared server has room for only so many connections.
+  const pool = new Pool({ connectionString: url.toString(), max: 12, connectionTimeoutMillis: 10_000 });
   const db = drizzle({ client: pool, schema });
   await migrate(db, { migrationsFolder: fileURLToPath(new URL('../test/migrations', import.meta.url)) });
   return {

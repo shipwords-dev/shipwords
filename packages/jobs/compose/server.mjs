@@ -20,7 +20,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -133,6 +133,16 @@ async function compose(req) {
   if (!ID.test(manifest.id ?? '')) throw new Error('bad id');
   if (!Array.isArray(manifest.segments) || manifest.segments.length === 0) throw new Error('no segments');
   const dir = join(ROOT, manifest.id);
+  const release = hold(dir);
+  try {
+    return await composeInto(form, manifest, dir);
+  } finally {
+    release();
+    await utimes(dir, new Date(), new Date()).catch(() => {});
+  }
+}
+
+async function composeInto(form, manifest, dir) {
   await rm(dir, { recursive: true, force: true });
   await mkdir(dir, { recursive: true });
   const segments = [];
@@ -308,6 +318,16 @@ async function patch(req) {
   if (!ID.test(manifest.id ?? '')) throw new Error('bad id');
   const spec = cutSpec(manifest);
   const dir = join(ROOT, manifest.id);
+  const release = hold(dir);
+  try {
+    return await patchInto(form, manifest, spec, dir);
+  } finally {
+    release();
+    await utimes(dir, new Date(), new Date()).catch(() => {});
+  }
+}
+
+async function patchInto(form, manifest, spec, dir) {
   await rm(dir, { recursive: true, force: true });
   await mkdir(dir, { recursive: true });
   const video = join(dir, 'in.mp4');
@@ -407,19 +427,47 @@ const armIdleExit = () => {
 armIdleExit();
 if (MAX_LIFETIME_MS > 0) setTimeout(() => process.exit(0), MAX_LIFETIME_MS);
 
-// ffmpeg and the face checks are CPU-heavy: a few at a time, the rest queue.
+// ffmpeg and the face checks are CPU-heavy: a few at a time, a bounded number wait (their bodies unread until their turn), and
+// beyond that requests are refused with 503 so the caller's step retries later instead of piling up connections.
 const MAX_JOBS = Math.max(1, Number(process.env.MAX_JOBS) || 2);
+const MAX_WAITING = Math.max(0, Number(process.env.MAX_WAITING ?? 8));
 let running = 0;
 const waiting = [];
-async function limited(work) {
-  if (running >= MAX_JOBS) await new Promise((resolve) => waiting.push(resolve));
+class Busy extends Error {}
+async function limited(req, work) {
+  if (running >= MAX_JOBS) {
+    if (waiting.length >= MAX_WAITING) throw new Busy('busy');
+    await new Promise((resolve, reject) => {
+      const entry = { resolve, reject };
+      waiting.push(entry);
+      // A caller that gives up leaves the queue.
+      req.once('close', () => {
+        const index = waiting.indexOf(entry);
+        if (index >= 0) {
+          waiting.splice(index, 1);
+          reject(new Error('caller went away'));
+        }
+      });
+    });
+  }
   running++;
   try {
     return await work();
   } finally {
     running--;
-    waiting.shift()?.();
+    waiting.shift()?.resolve();
   }
+}
+
+// Work directories in use (a compose or patch writing them, a download reading them) are never swept.
+const inUse = new Map();
+function hold(dir) {
+  inUse.set(dir, (inUse.get(dir) ?? 0) + 1);
+  return () => {
+    const left = inUse.get(dir) - 1;
+    if (left > 0) inUse.set(dir, left);
+    else inUse.delete(dir);
+  };
 }
 
 // Work directories left by compose, patch, faces and extract: removed once untouched for KEEP_MS.
@@ -429,6 +477,7 @@ async function sweep() {
     const entries = await readdir(root).catch(() => []);
     for (const entry of entries) {
       const dir = join(root, entry);
+      if (inUse.has(dir)) continue;
       const info = await stat(dir).catch(() => null);
       if (info && Date.now() - info.mtimeMs > KEEP_MS)
         await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -437,7 +486,7 @@ async function sweep() {
 }
 setInterval(() => void sweep(), 10 * 60_000).unref();
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   // Health probes are not work and must not keep the instance alive.
   if (req.url !== '/health') {
     inFlight++;
@@ -449,27 +498,27 @@ createServer(async (req, res) => {
   }
   try {
     if (req.method === 'POST' && req.url === '/split-sheet') {
-      const body = JSON.stringify({ images: await limited(() => splitSheet(req)) });
+      const body = JSON.stringify({ images: await limited(req, () => splitSheet(req)) });
       return res.writeHead(200, { 'content-type': 'application/json' }).end(body);
     }
     if (req.method === 'POST' && req.url === '/compose') {
-      const song = await limited(() => compose(req));
+      const song = await limited(req, () => compose(req));
       return sendFile(res, song, (await stat(song)).size);
     }
     if (req.method === 'POST' && req.url === '/extract') {
-      const clip = await limited(() => extract(req));
+      const clip = await limited(req, () => extract(req));
       return res.writeHead(200, { 'content-type': 'video/mp4', 'content-length': clip.length }).end(clip);
     }
     if (req.method === 'POST' && req.url === '/patch') {
-      const song = await limited(() => patch(req));
+      const song = await limited(req, () => patch(req));
       return sendFile(res, song, (await stat(song)).size);
     }
     if (req.method === 'POST' && req.url === '/faces') {
-      const body = JSON.stringify({ similarity: await limited(() => faces(req)) });
+      const body = JSON.stringify({ similarity: await limited(req, () => faces(req)) });
       return res.writeHead(200, { 'content-type': 'application/json' }).end(body);
     }
     if (req.method === 'POST' && req.url === '/likeness') {
-      const body = JSON.stringify({ similarity: await limited(() => likeness(req)) });
+      const body = JSON.stringify({ similarity: await limited(req, () => likeness(req)) });
       return res.writeHead(200, { 'content-type': 'application/json' }).end(body);
     }
     const match = req.method === 'GET' && req.url?.match(/^\/files\/([a-z0-9_-]{1,80})\/(song|silent)\.mp4$/);
@@ -477,14 +526,21 @@ createServer(async (req, res) => {
       const file = join(ROOT, match[1], `${match[2]}.mp4`);
       const info = await stat(file).catch(() => null);
       if (!info) return res.writeHead(404).end('not found');
+      const release = hold(join(ROOT, match[1]));
+      res.once('close', release);
       return sendFile(res, file, info.size);
     }
     if (req.url === '/health') return res.writeHead(200).end('ok');
     res.writeHead(404).end('not found');
   } catch (error) {
+    if (error instanceof Busy) return res.writeHead(503, { 'retry-after': '30' }).end('busy');
     res.writeHead(500, { 'content-type': 'text/plain' }).end(String(error?.message ?? error));
   }
-}).listen(8080);
+});
+// Internal network only. A queued request's body stays unread until its turn, so the receive timeout must not run out meanwhile;
+// headers still have to arrive in time.
+server.requestTimeout = 0;
+server.listen(8080);
 
 // Node runs as PID 1 here, and PID 1 ignores SIGTERM unless it has a handler: without this, docker stop waits for its timeout and
 // then kills the process.

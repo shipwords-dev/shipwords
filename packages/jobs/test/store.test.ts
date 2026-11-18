@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -43,7 +43,7 @@ describe('object stores', () => {
     await roundTrip(store);
     const files = await readdir(join(dir, 'jobs', 'a'));
     expect(files.some((name) => name.endsWith('.part'))).toBe(false);
-    await expect(store.put('../escape.txt', 'x')).rejects.toThrow(/outside the store/);
+    await expect(store.put('../escape.txt', 'x')).rejects.toThrow(/invalid storage key/);
   });
 
   it('S3: signed path-style requests, sizes from headers, 404 as missing', async () => {
@@ -133,5 +133,71 @@ describe('object stores', () => {
       STORAGE_DIR: dir,
     });
     expect(s3).not.toBeNull();
+  });
+
+  it('refuses keys with empty, "." or ".." segments in every store', async () => {
+    const dir = await tempDir();
+    const fake = (async () => new Response(null)) as unknown as typeof fetch;
+    const stores = [
+      memoryStore(),
+      fileStore(dir),
+      s3Store({ endpoint: 'https://e', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's' }, fake),
+    ];
+    for (const store of stores)
+      for (const key of ['assets/a/./x.mp3', 'a//b', '../x', 'a/../b', ''])
+        await expect(store.put(key, 'x')).rejects.toThrow(/invalid storage key/);
+  });
+
+  it('local directory: never reads or writes through a link out of the root', async () => {
+    const root = await tempDir();
+    const outside = await tempDir();
+    await writeFile(join(outside, 'secret.txt'), 'secret');
+    await mkdir(join(root, 'assets'), { recursive: true });
+    // A directory junction needs no privilege on Windows; a symlink elsewhere.
+    await symlink(outside, join(root, 'assets', 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+    const store = fileStore(root);
+    await expect(store.get('assets/linked/secret.txt')).rejects.toThrow(/leaves the store/);
+    await expect(store.put('assets/linked/new.txt', 'x')).rejects.toThrow(/leaves the store/);
+    expect(await readdir(outside)).toEqual(['secret.txt']);
+  });
+
+  it('S3: a ranged read the server did not honor fails instead of passing the whole object as a 206', async () => {
+    const store = s3Store(
+      { endpoint: 'https://e', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's' },
+      (async () =>
+        new Response(new Uint8Array(8).buffer, {
+          status: 200,
+          headers: { 'content-length': '8' },
+        })) as unknown as typeof fetch,
+    );
+    await expect(store.get('k', { range: { offset: 0, length: 2 } })).rejects.toThrow(/not honored/);
+  });
+
+  it('S3: errors carry the code and request ID, not the response body', async () => {
+    const body =
+      '<Error><Code>SignatureDoesNotMatch</Code><AWSAccessKeyId>AKIDLEAK</AWSAccessKeyId><SignatureProvided>sig</SignatureProvided><RequestId>r1</RequestId></Error>';
+    const store = s3Store(
+      { endpoint: 'https://e', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's' },
+      (async () => new Response(body, { status: 403 })) as unknown as typeof fetch,
+    );
+    const error = (await store.get('k').catch((e: unknown) => e)) as Error;
+    expect(error.message).toContain('403 SignatureDoesNotMatch (request r1)');
+    expect(error.message).not.toContain('AKIDLEAK');
+    expect(error.message).not.toContain('sig');
+  });
+
+  it('S3: passes on a stored Content-Disposition', async () => {
+    const store = s3Store(
+      { endpoint: 'https://e', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's' },
+      (async () =>
+        new Response(null, {
+          headers: {
+            'content-length': '3',
+            'content-disposition': 'attachment; filename="a.mp4"',
+            etag: '"e"',
+          },
+        })) as unknown as typeof fetch,
+    );
+    expect((await store.head('k'))?.contentDisposition).toBe('attachment; filename="a.mp4"');
   });
 });

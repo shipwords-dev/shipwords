@@ -43,11 +43,16 @@ export function cloudflareMailer(config: CloudflareMailerConfig, fetcher: typeof
       const body = (await response.json().catch(() => null)) as {
         success?: boolean;
         errors?: { code: number; message: string }[];
+        result?: { permanent_bounces?: string[]; suppressed_recipients?: string[] };
       } | null;
       if (!response.ok || body?.success !== true) {
         const errors = body?.errors?.map((error) => `${error.code} ${error.message}`).join('; ');
         throw new Error(`email send failed: ${response.status}${errors ? ` ${errors}` : ''}`);
       }
+      // Accepted but known undeliverable: a sign-in code that will never arrive is a failure the caller should report.
+      const lost = [...(body.result?.permanent_bounces ?? []), ...(body.result?.suppressed_recipients ?? [])];
+      if (lost.some((address) => address.toLowerCase() === mail.to.toLowerCase()))
+        throw new Error(`email to ${mail.to} bounced or is suppressed`);
     },
   };
 }
@@ -65,22 +70,22 @@ export interface MailerEnv {
   CLOUDFLARE_ACCOUNT_ID?: string;
   /** Needs Email Sending permission (and Workers AI, if the site describes images). */
   CLOUDFLARE_API_TOKEN?: string;
-  APP_URL?: string;
+  /** "1" in local development only: write emails (sign-in codes included) to the log instead of sending them. Ignored in production. */
+  MAIL_LOG?: string;
 }
 
-function isLocal(url: string | undefined): boolean {
-  if (!url) return false;
-  try {
-    const { hostname } = new URL(url);
-    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname.endsWith('.localhost');
-  } catch {
-    return false;
-  }
+function logsMail(env: MailerEnv): boolean {
+  return env.MAIL_LOG === '1' && process.env.NODE_ENV !== 'production';
+}
+
+/** True when mail can actually go out (or is deliberately logged in development). */
+export function canSendMail(env: MailerEnv): boolean {
+  return Boolean(env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_API_TOKEN) || logsMail(env);
 }
 
 /**
- * The mailer a site's environment configures. Without Cloudflare credentials a local site logs messages; a deployed one throws, so
- * a missing setting shows at the first send instead of sign-in codes silently going nowhere.
+ * The mailer a site's environment configures. Logging instead of sending needs MAIL_LOG=1 outside production: a misconfigured
+ * deployment must never write sign-in codes to its log. Without credentials, sending throws, so a missing setting shows at once.
  */
 export function mailerFromEnv(
   env: MailerEnv,
@@ -89,7 +94,7 @@ export function mailerFromEnv(
 ): Mailer {
   if (env.CLOUDFLARE_ACCOUNT_ID && env.CLOUDFLARE_API_TOKEN)
     return cloudflareMailer({ accountId: env.CLOUDFLARE_ACCOUNT_ID, apiToken: env.CLOUDFLARE_API_TOKEN });
-  if (isLocal(env.APP_URL)) return logMailer(log);
+  if (logsMail(env)) return logMailer(log);
   return {
     async send() {
       throw new Error('no mailer configured: set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN');

@@ -430,6 +430,7 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
       if (!head) return errorResponse(404, 'not_found');
       const headers = new Headers();
       if (head.contentType) headers.set('content-type', head.contentType);
+      if (head.contentDisposition) headers.set('content-disposition', head.contentDisposition);
       // Customer uploads are deleted by a lifecycle rule after a few days; a cached copy must not outlive that, so they are never cached.
       const uncached = intermediate || key.startsWith('uploads/');
       headers.set('cache-control', uncached ? 'no-store' : 'public, max-age=31536000, immutable');

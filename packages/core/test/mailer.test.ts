@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cloudflareMailer, mailerFromEnv } from '../src/email/mailer';
+import { canSendMail, cloudflareMailer, mailerFromEnv } from '../src/email/mailer';
 
 const mail = {
   to: 'user@example.com',
@@ -47,14 +47,41 @@ describe('mailer', () => {
     );
   });
 
-  it('logs instead of sending on a local site without credentials; a deployed one refuses to send', async () => {
+  it('logs instead of sending only when MAIL_LOG=1 outside production; otherwise refuses to send', async () => {
     const logged: Record<string, unknown>[] = [];
-    await mailerFromEnv({ APP_URL: 'http://localhost:5010' }, (_message, details) =>
-      logged.push(details),
-    ).send(mail);
+    await mailerFromEnv({ MAIL_LOG: '1' }, (_message, details) => logged.push(details)).send(mail);
     expect(logged[0]).toMatchObject({ to: 'user@example.com', text: '123456' });
-    await expect(mailerFromEnv({ APP_URL: 'https://site.example' }).send(mail)).rejects.toThrow(
-      /no mailer configured/,
+    await expect(mailerFromEnv({}).send(mail)).rejects.toThrow(/no mailer configured/);
+  });
+
+  it('never logs mail in production, even with MAIL_LOG=1', async () => {
+    const before = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const logged: unknown[] = [];
+      await expect(mailerFromEnv({ MAIL_LOG: '1' }, (_m, d) => logged.push(d)).send(mail)).rejects.toThrow(
+        /no mailer/,
+      );
+      expect(logged).toEqual([]);
+      expect(canSendMail({ MAIL_LOG: '1' })).toBe(false);
+    } finally {
+      process.env.NODE_ENV = before;
+    }
+  });
+
+  it('reports a bounced or suppressed recipient as a failed send', async () => {
+    const fetcher = (async () =>
+      Response.json({
+        success: true,
+        result: {
+          delivered: [],
+          queued: [],
+          permanent_bounces: ['USER@example.com'],
+          suppressed_recipients: [],
+        },
+      })) as unknown as typeof fetch;
+    await expect(cloudflareMailer({ accountId: 'a', apiToken: 't' }, fetcher).send(mail)).rejects.toThrow(
+      /bounced/,
     );
   });
 });
