@@ -404,7 +404,9 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
       if (!head) return errorResponse(404, 'not_found');
       const headers = new Headers();
       head.writeHttpMetadata(headers);
-      headers.set('cache-control', intermediate ? 'no-store' : 'public, max-age=31536000, immutable');
+      // Customer uploads are deleted by a lifecycle rule after a few days; a cached copy must not outlive that, so they are never cached.
+      const uncached = intermediate || key.startsWith('uploads/');
+      headers.set('cache-control', uncached ? 'no-store' : 'public, max-age=31536000, immutable');
       // Byte ranges: iPhone Safari needs 206 to play stored videos.
       return (await r2Response(env().OUTPUTS, key, request, headers)) ?? errorResponse(404, 'not_found');
     },

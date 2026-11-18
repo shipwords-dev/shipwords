@@ -83,16 +83,35 @@ describe('GET /files', () => {
     await markFailed(db, jobId, 'failed', 'test', 'failed');
     expect((await ctx.file(key)).status).toBe(404);
   });
-  it('never serves kept prep copies, whatever the job state', async () => {
+  it('never serves kept prep or upload copies, whatever the job state', async () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
-    const key = `jobs/${jobId}/kept/prep-left-0.png`;
-    await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    const keys = [`jobs/${jobId}/kept/prep-left-0.png`, `jobs/${jobId}/kept/uploads/up_a.png`];
+    for (const key of keys)
+      await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
     for (const status of ['queued', 'submitted', 'succeeded'] as const) {
       await db.update(jobs).set({ status }).where(eq(jobs.id, jobId));
-      expect((await ctx.file(key)).status).toBe(404);
+      for (const key of keys) expect((await ctx.file(key)).status).toBe(404);
     }
   });
+  it('serves uploads uncached, so no copy outlives the lifecycle deletion; outputs stay cacheable', async () => {
+    const ctx = await setup();
+    await env.OUTPUTS.put('uploads/up_cachetest.png', new Uint8Array([1]), {
+      httpMetadata: { contentType: 'image/png' },
+    });
+    const upload = await ctx.file('uploads/up_cachetest.png');
+    expect(upload.status).toBe(200);
+    expect(upload.headers.get('cache-control')).toBe('no-store');
+    await upload.arrayBuffer();
+    const jobId = await createdId(await ctx.create());
+    const output = `jobs/${jobId}/0.mp4`;
+    await env.OUTPUTS.put(output, new Uint8Array([1]), { httpMetadata: { contentType: 'video/mp4' } });
+    await markSucceeded(db, jobId, [{ key: output, mediaType: 'video/mp4' }]);
+    const served = await ctx.file(output);
+    expect(served.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    await served.arrayBuffer();
+  });
+
   it('serves an output replaced by hand under its new key, once the job succeeded', async () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());

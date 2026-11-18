@@ -78,6 +78,8 @@ const POLL_PAUSE_MS = 3_000;
 export const PREP_HEDGE_MS = 60_000;
 /** Longest one batch of kept prep image copies (keep:<from>) may take altogether; they are only for looking back, never worth holding a job up. */
 export const KEEP_TIMEOUT_MS = 30_000;
+/** Longest the private upload copies (keep:uploads, model.keepUploads) may take; they run before the first submit, so keep it short. */
+export const KEEP_UPLOADS_TIMEOUT_MS = 10_000;
 /** File extension of a kept prep image (keep:<from>) by media type; anything else is stored as .png. */
 const PREP_EXTENSIONS: Readonly<Record<string, string>> = {
   'image/png': 'png',
@@ -192,6 +194,8 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       model: model.id,
       timeoutMinutes: model.timeoutMinutes,
       createdAt: job.createdAt,
+      // Cached loads from older versions lack this and skip the upload copies.
+      keepUploads: model.keepUploads === true,
       parts,
       sheets: partsOf(job, model)
         .filter((part) => part.prepSheet)
@@ -239,6 +243,75 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     });
     return;
   }
+  /**
+   * model.keepUploads: keep a private copy of every upload from this site the job uses (the customer's photos) at
+   * jobs/<id>/kept/uploads/<file>, first thing, so an order that fails right away keeps them too. A bucket lifecycle rule deletes uploads/
+   * after a few days, and until then /files serves them to anyone with the link (the upstream fetches them that way); /files never
+   * serves kept/, so the order keeps its originals while the public link still expires. Only this site's own upload URLs count, never a
+   * preset's media. Copies stay inside the bucket. Best effort, bounded by KEEP_UPLOADS_TIMEOUT_MS in all: the step never throws (so
+   * it never retries), and a failure or timeout is only logged. Loads cached before this option existed skip it.
+   */
+  if (setup.keepUploads)
+    await step
+      .do('keep:uploads', async () => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), KEEP_UPLOADS_TIMEOUT_MS);
+        });
+        const work = (async () => {
+          const files = deps.fileUrl?.('');
+          // Without the site's file origin no upload can be recognised: report it rather than keep nothing silently.
+          if (!files) return [{ key: '*', error: 'no file origin (fileUrl) to recognise uploads' }];
+          const row = await activeJob(deps.db, jobId);
+          const model = row && deps.models.find((m) => m.id === row.modelId);
+          if (!row || !model) return [];
+          const keys = new Set(
+            partsOf(row, model).flatMap((part) =>
+              part.references.flatMap((ref) => {
+                const name = ref.url.startsWith(`${files}uploads/`)
+                  ? ref.url.slice(`${files}uploads/`.length)
+                  : '';
+                return /^up_[a-z0-9]+\.(?:png|jpg|webp)$/.test(name) ? [`uploads/${name}`] : [];
+              }),
+            ),
+          );
+          const failed: { key: string; error: string }[] = [];
+          for (const key of keys) {
+            const target = `jobs/${jobId}/kept/${key}`;
+            try {
+              if (await deps.bucket.head(target)) continue;
+              const source = await deps.bucket.get(key);
+              if (!source) throw new Error('upload missing');
+              await deps.bucket.put(target, await source.arrayBuffer(), {
+                httpMetadata: source.httpMetadata ?? {},
+              });
+            } catch (error) {
+              failed.push({ key, error: String(error) });
+            }
+          }
+          return failed;
+        })();
+        // After a timeout the copies may still finish in the background; they write the same keys, so that is harmless.
+        work.catch(() => undefined);
+        try {
+          const result = await Promise.race([work, timeout]);
+          if (result === 'timeout') {
+            deps.log?.('upload copy timed out', { jobId });
+            return false;
+          }
+          if (result.length) deps.log?.('upload copy failed', { jobId, failed: result });
+          return result.length === 0;
+        } catch (error) {
+          deps.log?.('upload copy failed', { jobId, error: String(error) });
+          return false;
+        } finally {
+          clearTimeout(timer);
+        }
+      })
+      .catch((error: unknown) => {
+        deps.log?.('upload copy step failed', { jobId, error: String(error) });
+        return false;
+      });
   const adapter = deps.adapters[setup.upstream];
   if (!adapter) {
     await step.do('fail:upstream_missing', async () => {

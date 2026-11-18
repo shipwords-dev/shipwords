@@ -23,6 +23,11 @@ export interface ModelDefinition {
   maxCost?: string;
   /** How long to poll before timing out and refunding. */
   timeoutMinutes: number;
+  /**
+   * Keep a private copy of the customer's uploads with each job (jobs/<id>/kept/uploads/, never served by /files) before the uploads
+   * expire. Off by default: a site that turns it on keeps photos past the uploads/ lifecycle and must say so in its privacy policy.
+   */
+  keepUploads?: boolean;
   /** Role of the user's reference image for the upstream; defaults to reference_image for image models, first_frame for video models. */
   referenceRole?: 'reference_image' | 'first_frame';
   /** Effects: prompts and reference videos are preset server-side; users only upload photos per slot. */
