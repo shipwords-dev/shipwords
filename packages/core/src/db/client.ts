@@ -11,9 +11,22 @@ export type Db = PgDatabase<PgQueryResultHKT, Schema>;
 /** A transaction handle; it accepts every query a Db does. */
 export type Tx = PgTransaction<PgQueryResultHKT, Schema, ExtractTablesWithRelations<Schema>>;
 
-/** Opens a pool on DATABASE_URL. One per process; the pool is closed with the process. */
-export function createDb(connectionString: string, config: Omit<PoolConfig, 'connectionString'> = {}): Db {
-  return drizzle({ client: new Pool({ connectionString, max: 10, ...config }), schema }) as unknown as Db;
+/**
+ * Opens a pool on DATABASE_URL. One per process; the pool is closed with the process.
+ * An idle connection that drops (database restart, network) is reported through the pool's error event, outside any request:
+ * without a listener Node would crash the whole process. The pool discards that connection and opens a new one on demand.
+ */
+export function createDb(
+  connectionString: string,
+  config: Omit<PoolConfig, 'connectionString'> = {},
+  onIdleError: (error: Error) => void = (error) =>
+    console.error(
+      JSON.stringify({ level: 'error', message: 'idle database connection failed', error: String(error) }),
+    ),
+): Db {
+  const pool = new Pool({ connectionString, max: 10, ...config });
+  pool.on('error', onIdleError);
+  return drizzle({ client: pool, schema }) as unknown as Db;
 }
 
 export { schema };

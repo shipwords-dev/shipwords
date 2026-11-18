@@ -16,6 +16,14 @@ const uid = () => `u_${++seq}_${crypto.randomUUID().slice(0, 8)}`;
 const DAY = 86_400_000;
 
 describe('credit ledger', () => {
+  it('rejects amounts that do not fit the integer columns before writing anything', async () => {
+    const userId = crypto.randomUUID();
+    await expect(
+      grantCredits(db, { userId, amount: 2_147_483_648, idemKey: `big:${userId}`, source: 'test' }),
+    ).rejects.toThrow(/up to 2147483647/);
+    expect((await getBalance(db, userId)).available).toBe(0);
+  });
+
   it('grants are idempotent: one key grants once', async () => {
     const userId = uid();
     const first = await grantCredits(db, { userId, amount: 100, idemKey: `g:${userId}`, source: 'test' });

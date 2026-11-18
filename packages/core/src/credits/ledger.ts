@@ -37,9 +37,12 @@ interface ActiveLot {
   sourceRef: string | null;
 }
 
+/** Credit columns are Postgres integer (32-bit). */
+export const MAX_CREDITS = 2_147_483_647;
+
 function assertPositiveInt(amount: number) {
-  if (!Number.isSafeInteger(amount) || amount <= 0)
-    throw new Error(`credit amount must be a positive integer: ${amount}`);
+  if (!Number.isSafeInteger(amount) || amount <= 0 || amount > MAX_CREDITS)
+    throw new Error(`credit amount must be a positive integer up to ${MAX_CREDITS}: ${amount}`);
 }
 
 function activeLotsWhere(userId: string, now: number) {

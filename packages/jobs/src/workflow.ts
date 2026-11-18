@@ -2,6 +2,9 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloud
 import { createDb } from '@shipwords/core/db/client';
 import type { SiteConfig } from '@shipwords/core/site';
 import { createAdapters, fixedMockResult, type JobsEnv } from './adapters';
+
+export { createAdapters, type JobsEnv };
+
 import { containerComposer } from './compose';
 import { workersAiDescribe } from './describe';
 import { markFailed } from './lifecycle';

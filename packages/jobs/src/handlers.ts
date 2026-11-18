@@ -170,7 +170,9 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
         inputJson = JSON.stringify({ parts });
       } else {
         prompt = (body.prompt ?? '').trim();
-        if (!prompt || prompt.length > MAX_PROMPT) return errorResponse(400, 'invalid_prompt');
+        // Postgres text can't store NUL; reject it here so it doesn't fail the insert after the charge.
+        if (!prompt || prompt.length > MAX_PROMPT || prompt.includes('\u0000'))
+          return errorResponse(400, 'invalid_prompt');
         const references = resolveReferences(model, body.references);
         if (!references) return errorResponse(400, 'invalid_references');
         parameters = sanitizeParameters(model, body.parameters);

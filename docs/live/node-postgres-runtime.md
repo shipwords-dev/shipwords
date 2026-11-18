@@ -1,6 +1,6 @@
 # Node and Postgres runtime
 
-Status: proposed, 2026-11-18. Nothing is implemented yet. Work happens on the `node-postgres` branch and merges into `main` once a real site runs on it; the last Cloudflare Workers release is tag `v0.2.0`. When done, fold into `docs/architecture.md` §2, §6 and §8, and rewrite `docs/local-development.md` and `docs/site-launch.md`.
+Status: in progress. Step 2 (database) is done; steps 3–7 are not started. Work happens on the `node-postgres` branch and merges into `main` once a real site runs on it; the last Cloudflare Workers release is tag `v0.2.0`. When done, fold into `docs/architecture.md` §2, §6 and §8, and rewrite `docs/local-development.md` and `docs/site-launch.md`.
 
 A site becomes a Node server in a Docker container with a Postgres database. Cloudflare Workers, D1, Workflows and Containers stop being a runtime; Cloudflare stays in front as DNS, CDN and WAF, and R2 stays as object storage.
 
@@ -133,7 +133,7 @@ Estimated size: about 300 lines for the loop and step runner.
 ## Order of work
 
 1. **Spikes** (below): three passed; the email send is pending.
-2. **Database:** schema, `createDb`, ledger and lifecycle transactions, test setup on PGlite, `test:pg`. Gate: `core` and `jobs` checks green, independent review of the money paths.
+2. **Database (done, 2026-11-18):** schema, `createDb`, ledger and lifecycle transactions, test setup on PGlite, `test:pg`. Gate: `core` and `jobs` checks green, independent review of the money paths. Credit amounts are capped at the Postgres `integer` range (2,147,483,647); the R2 binding is replaced in tests by an in-memory stand-in until step 4.
 3. **Job runs:** tables, loop, step runner, dispatch in `handlers.ts`. Gate: engine tests above.
 4. **Interfaces:** object store, mailer, describe, compose over HTTP.
 5. **Template:** Node build, Dockerfile, `compose.yaml`; a full mock-upstream order (upload, charge, generate, compose, deliver, refund) in containers on a dev machine.

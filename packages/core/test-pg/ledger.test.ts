@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   getBalance,
@@ -95,13 +95,30 @@ describe.skipIf(!adminUrl)('ledger under real concurrency', () => {
   it('grants, spends and clawbacks interleaved keep ledger, lots and debt in agreement', async () => {
     const userId = crypto.randomUUID();
     await grantCredits(db, { userId, amount: 20, idemKey: `g0:${userId}`, source: 'test' });
+    let spent = 0;
     const ops = Array.from({ length: N }, (_, i) => {
       const key = `${i}:${userId}`;
       if (i % 3 === 0) return grantCredits(db, { userId, amount: 2, idemKey: `g:${key}`, source: 'test' });
-      if (i % 3 === 1) return spendCredits(db, { userId, amount: 3, idemKey: `s:${key}` }).catch(() => null);
+      if (i % 3 === 1)
+        return spendCredits(db, { userId, amount: 3, idemKey: `s:${key}` }).then(
+          (result) => {
+            expect(result.applied).toBe(true);
+            spent++;
+          },
+          (error: unknown) => {
+            // Only a short balance may refuse a spend; any other error fails the test.
+            if (!(error instanceof InsufficientCreditsError)) throw error;
+          },
+        );
       return revokeCredits(db, { userId, amount: 2, idemKey: `r:${key}` });
     });
     await Promise.all(ops);
+    expect(spent).toBeGreaterThan(0);
+    const spends = await db
+      .select()
+      .from(creditLedger)
+      .where(and(eq(creditLedger.userId, userId), eq(creditLedger.kind, 'spend')));
+    expect(spends).toHaveLength(spent);
     const balance = await consistent(userId);
     const [account] = await db.select().from(creditAccounts).where(eq(creditAccounts.userId, userId));
     expect(account!.debt).toBe(balance.debt);

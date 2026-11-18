@@ -60,7 +60,7 @@ async function setup(balance = 10) {
       dispatchFails = true;
     },
     balance: async () => (await getBalance(db, userId)).available,
-    create: () => api.create(request('/api/jobs', { modelId: 'paid', prompt: 'a cat' })),
+    create: (prompt = 'a cat') => api.create(request('/api/jobs', { modelId: 'paid', prompt })),
     get: (jobId: string) => api.get(new Request(`https://test.example/api/jobs/${jobId}`), jobId),
     cancel: (jobId: string) => api.cancel(request(`/api/jobs/${jobId}/cancel`), jobId),
     file: (key: string) => api.file(new Request(`https://test.example/files/${key}`), key),
@@ -130,6 +130,14 @@ async function createdId(response: Response) {
 }
 
 describe('job handlers: money paths', () => {
+  it('rejects a prompt with a NUL character before charging', async () => {
+    const ctx = await setup();
+    const response = await ctx.create('a\u0000cat');
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('invalid_prompt');
+    expect(await ctx.balance()).toBe(10);
+  });
+
   it('not enough credits: 402, no job row, nothing dispatched', async () => {
     const ctx = await setup(3);
     const response = await ctx.create();
