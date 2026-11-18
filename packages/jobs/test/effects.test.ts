@@ -432,12 +432,18 @@ describe('multi-part effect jobs', () => {
   });
 
   it('timeout: past the deadline later segments are not submitted, submitted ones are canceled and refunded', async () => {
-    const { userId, jobId } = await effectJob(
-      { left: '/files/uploads/up_a.png' },
-      { createdAt: Date.now() - 21 * 60_000 },
-    );
+    const { userId, jobId } = await effectJob({ left: '/files/uploads/up_a.png' });
     const adapter = new FakeAdapter();
-    await runGeneration(deps(adapter), jobId, durableSteps());
+    // The deadline passes right after the first segment is submitted.
+    const start = Date.now();
+    adapter.onSubmit = async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(start + 21 * 60_000);
+    };
+    try {
+      await runGeneration(deps(adapter), jobId, durableSteps());
+    } finally {
+      vi.restoreAllMocks();
+    }
     expect(await loadJob(db, jobId)).toMatchObject({ status: 'failed', errorCode: 'timeout' });
     expect(adapter.submits.map((s) => s.key)).toEqual([`${jobId}:left`]);
     expect(adapter.cancelled).toEqual([`up_${jobId}:left`]);

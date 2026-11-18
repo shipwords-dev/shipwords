@@ -69,7 +69,11 @@ export async function appendUpstreamJob(
     .set({ upstreamJobId: [...ids, upstreamJobId].join(',') })
     .where(and(eq(jobs.id, jobId), eq(jobs.status, 'submitted'), eq(jobs.upstreamJobId, job.upstreamJobId!)))
     .returning({ id: jobs.id });
-  return result.length > 0;
+  if (result.length > 0) return true;
+  // Lost the race to another write. If that was the same submit replayed elsewhere (same idempotency key, same upstream ID),
+  // the segment is recorded: report success, or the caller would cancel a task the job needs.
+  const after = await loadJob(db, jobId);
+  return after?.status === 'submitted' && upstreamIds(after)[index] === upstreamJobId;
 }
 
 export interface StoredOutput {

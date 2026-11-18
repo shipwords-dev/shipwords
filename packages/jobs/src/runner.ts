@@ -670,8 +670,9 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
         if (!job) return { done: true as const };
         const existing = upstreamIds(job)[index];
         if (existing) return { upstreamJobId: existing };
-        // Prep may have used up the time: submitting video segments now would just waste upstream spend.
-        if (index > 0 && Date.now() > deadline) return { timeout: true as const };
+        // Prep may have used up the time, or the run started late (a backlog, a worker outage): submitting now would just waste
+        // upstream spend on a job that times out anyway.
+        if (Date.now() > deadline) return { timeout: true as const };
         try {
           const { upstreamJobId } = await adapter.submit(
             submitInput(job, index),

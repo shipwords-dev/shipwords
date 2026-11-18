@@ -251,12 +251,30 @@ describe('generation jobs', () => {
   });
 
   it('timeout: cancels the upstream task and refunds', async () => {
-    const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
+    const { userId, jobId } = await paidJob();
     const adapter = new FakeAdapter();
-    await runGeneration(deps(adapter), jobId, immediateSteps());
+    // The deadline passes while the task runs upstream (a job already past it is never submitted).
+    const start = Date.now();
+    adapter.onSubmit = async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(start + 11 * 60_000);
+    };
+    try {
+      await runGeneration(deps(adapter), jobId, immediateSteps());
+    } finally {
+      vi.restoreAllMocks();
+    }
     const job = await loadJob(db, jobId);
     expect(job).toMatchObject({ status: 'failed', errorCode: 'timeout' });
     expect(adapter.cancelled).toEqual([`up_${jobId}`]);
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
+  it('a job already past its deadline is failed and refunded without being submitted', async () => {
+    const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
+    const adapter = new FakeAdapter();
+    await runGeneration(deps(adapter), jobId, immediateSteps());
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'failed', errorCode: 'timeout' });
+    expect(adapter.submits).toHaveLength(0);
     expect((await getBalance(db, userId)).available).toBe(50);
   });
 

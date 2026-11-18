@@ -82,7 +82,14 @@ export interface JobsOptions {
 }
 
 export function createJobs(core: Core, models: readonly ModelDefinition[], options: JobsOptions = {}) {
-  const wake = () => options.wake?.();
+  /** Best effort: the job is already committed, so a throwing wake must not turn the response into an error (a retry would charge again). */
+  const wake = () => {
+    try {
+      options.wake?.();
+    } catch (error) {
+      core.log('job worker wake failed', { error: String(error) });
+    }
+  };
   const env = () => core.env as unknown as JobsEnv & { GUEST_COOKIE_SECRET: string; APP_URL?: string };
   const baseURL = () => (env().APP_URL ?? core.site.url).replace(/\/$/, '');
 
@@ -202,9 +209,12 @@ export function createJobs(core: Core, models: readonly ModelDefinition[], optio
         )
           return errorResponse(409, 'idempotency_conflict');
         job = await healStale(job);
-        // The run was queued with the job; nudge the worker in case this process can take it now. A queued job past its deadline
-        // gets no new run: the runner fails it on its first step, or stale healing does.
-        if (job.status === 'queued') wake();
+        // The run was queued with the job; queue it again in case the job predates job_runs (a no-op otherwise), and nudge the
+        // worker. A run that starts past the job's deadline fails it with a refund before submitting anything.
+        if (job.status === 'queued') {
+          await enqueueRun(core.db, job.id);
+          wake();
+        }
         return json({ job: publicJob((await loadJob(core.db, job.id))!, baseURL()) }, { status: 200 });
       }
       if (idempotent) {
