@@ -7,7 +7,6 @@ import { YirAdapter } from './yir';
 export interface JobsEnv {
   DATABASE_URL: string;
   OUTPUTS: R2Bucket;
-  GENERATION_WORKFLOW: Workflow<{ jobId: string }>;
   YIR_API_KEY: string;
   YIR_BASE_URL?: string;
   /** Yir referral code included for people deploying this starter; optional for your own sites. */

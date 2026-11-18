@@ -1,6 +1,7 @@
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
 import { user } from '@shipwords/core/db/schema';
 import type { Core } from '@shipwords/core/server';
+import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createJobs } from '../src/handlers';
 import { loadJob } from '../src/lifecycle';
@@ -8,6 +9,7 @@ import { MockAdapter } from '../src/mock';
 import { defineModels, MAX_LYRICS, type ModelDefinition, musicParameters } from '../src/models';
 import { emailOnFinish } from '../src/notify';
 import { runGeneration, type StepRunner } from '../src/runner';
+import { jobs as jobRows, jobRuns } from '../src/schema';
 import type { PollResult, SubmitInput, UpstreamAdapter } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
 import { bucket } from './bucket';
@@ -49,20 +51,14 @@ const steps: StepRunner = { do: (_name, fn) => fn(), sleep: async () => {} };
 const mp3Fetcher: typeof fetch = async () =>
   new Response(new Uint8Array([0xff, 0xfb]), { headers: { 'content-type': 'audio/mpeg' } });
 
-/** The slice of Core that createJobs touches: a signed-in user (or a guest with a granted quota) and a Workflow that only records ids. */
+/** The slice of Core that createJobs touches: a signed-in user (or a guest with a granted quota); `queued` lists the user's queued runs. */
 function fakeCore(userId: string | null) {
-  const dispatched: string[] = [];
   const core = {
     db,
     site: { id: 'music', url: BASE },
     env: {
       APP_URL: BASE,
       GUEST_COOKIE_SECRET: 'secret',
-      GENERATION_WORKFLOW: {
-        create: async ({ id }: { id: string }) => {
-          dispatched.push(id);
-        },
-      },
     },
     getUser: async () => (userId ? { id: userId } : null),
     guest: {
@@ -70,7 +66,17 @@ function fakeCore(userId: string | null) {
     },
     log: () => {},
   } as unknown as Core;
-  return { jobs: createJobs(core, models), dispatched };
+  const queued = async () =>
+    userId
+      ? (
+          await db
+            .select({ id: jobRuns.id })
+            .from(jobRuns)
+            .innerJoin(jobRows, eq(jobRows.id, jobRuns.id))
+            .where(eq(jobRows.userId, userId))
+        ).map((row) => row.id)
+      : [];
+  return { jobs: createJobs(core, models), queued };
 }
 
 async function userWith(credits: number) {
@@ -103,9 +109,9 @@ describe('music models', () => {
 });
 
 describe('creating a music job', () => {
-  it('stores the lyrics and the style prompt, charges once, dispatches once', async () => {
+  it('stores the lyrics and the style prompt, charges once, queues one run', async () => {
     const userId = await userWith(3);
-    const { jobs, dispatched } = fakeCore(userId);
+    const { jobs, queued } = fakeCore(userId);
     const response = await jobs.create(
       post({
         modelId: 'song',
@@ -118,7 +124,7 @@ describe('creating a music job', () => {
     const job = await created(response);
     expect(job).toMatchObject({ kind: 'music', prompt: 'J-POP, 明るい', costCredits: 1, status: 'queued' });
     expect(JSON.parse(job.inputJson)).toEqual({ references: [], parameters: {}, lyrics: '[Verse]\n夏の空' });
-    expect(dispatched).toEqual([job.id]);
+    expect(await queued()).toEqual([job.id]);
     expect((await getBalance(db, userId)).available).toBe(2);
   });
 
@@ -140,13 +146,13 @@ describe('creating a music job', () => {
 
   it('rejects bad lyrics before charging', async () => {
     const userId = await userWith(3);
-    const { jobs, dispatched } = fakeCore(userId);
+    const { jobs, queued } = fakeCore(userId);
     for (const lyrics of ['あ'.repeat(MAX_LYRICS + 1), 42]) {
       const response = await jobs.create(post({ modelId: 'song', prompt: 'p', lyrics }));
       expect(response.status).toBe(400);
       expect(await response.json()).toMatchObject({ error: { code: 'invalid_lyrics' } });
     }
-    expect(dispatched).toEqual([]);
+    expect(await queued()).toEqual([]);
     expect((await getBalance(db, userId)).available).toBe(3);
   });
 
@@ -157,13 +163,13 @@ describe('creating a music job', () => {
     expect(JSON.parse(job.inputJson).lyrics).toBe('叫べ');
   });
 
-  it('insufficient credits: 402, no job, nothing dispatched', async () => {
+  it('insufficient credits: 402, no job, no run', async () => {
     const userId = await userWith(1);
-    const { jobs, dispatched } = fakeCore(userId);
+    const { jobs, queued } = fakeCore(userId);
     await created(await jobs.create(post({ modelId: 'song', prompt: 'a' })));
     const response = await jobs.create(post({ modelId: 'song', prompt: 'b' }));
     expect(response.status).toBe(402);
-    expect(dispatched).toHaveLength(1);
+    expect(await queued()).toHaveLength(1);
     expect((await getBalance(db, userId)).available).toBe(0);
   });
 });

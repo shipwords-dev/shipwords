@@ -1,9 +1,9 @@
 import { refundSpend } from '@shipwords/core/credits/ledger';
-import type { Db } from '@shipwords/core/db/client';
+import type { Db, Tx } from '@shipwords/core/db/client';
 import { quotaCounters } from '@shipwords/core/db/schema';
 import type { QuotaRule } from '@shipwords/core/quota/counters';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
-import { type JobRow, jobs, TERMINAL } from './schema';
+import { type JobRow, jobRuns, jobs, TERMINAL } from './schema';
 import type { UpstreamAdapter } from './upstream';
 
 // Every write to job state goes through here. Each state change is a conditional UPDATE;
@@ -12,6 +12,11 @@ import type { UpstreamAdapter } from './upstream';
 const ACTIVE: JobRow['status'][] = ['queued', 'submitted'];
 
 export const spendKey = (jobId: string) => `job:${jobId}`;
+
+/** Queue the job's run (worker.ts). Called in the transaction that creates the job; a second call is a no-op. */
+export async function enqueueRun(db: Db | Tx, jobId: string): Promise<void> {
+  await db.insert(jobRuns).values({ id: jobId }).onConflictDoNothing();
+}
 
 export async function loadJob(db: Db, jobId: string): Promise<JobRow | null> {
   const [row] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);

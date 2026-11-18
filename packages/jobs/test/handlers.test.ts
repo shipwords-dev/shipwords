@@ -1,11 +1,11 @@
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
 import type { Core } from '@shipwords/core/server';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createJobs } from '../src/handlers';
 import { loadJob, markFailed, markSucceeded } from '../src/lifecycle';
 import type { ModelDefinition } from '../src/models';
-import { jobs } from '../src/schema';
+import { jobRuns, jobs } from '../src/schema';
 import { bucket } from './bucket';
 import { db } from './db';
 
@@ -27,8 +27,6 @@ const model: ModelDefinition = {
 async function setup(balance = 10) {
   const userId = crypto.randomUUID();
   await grantCredits(db, { userId, amount: balance, idemKey: userId, source: 'test' });
-  const dispatched: string[] = [];
-  let dispatchFails = false;
   const api = createJobs(
     {
       db,
@@ -38,12 +36,6 @@ async function setup(balance = 10) {
       env: {
         GUEST_COOKIE_SECRET: 'test-secret',
         OUTPUTS: bucket,
-        GENERATION_WORKFLOW: {
-          create: async ({ id }: { id: string }) => {
-            if (dispatchFails) throw new Error('dispatch error');
-            dispatched.push(id);
-          },
-        },
       },
     } as unknown as Core,
     [model],
@@ -55,10 +47,13 @@ async function setup(balance = 10) {
     });
   return {
     userId,
-    dispatched,
-    failDispatch: () => {
-      dispatchFails = true;
-    },
+    /** Runs queued for this user's jobs. */
+    runs: () =>
+      db
+        .select({ id: jobRuns.id })
+        .from(jobRuns)
+        .innerJoin(jobs, eq(jobs.id, jobRuns.id))
+        .where(eq(jobs.userId, userId)),
     balance: async () => (await getBalance(db, userId)).available,
     create: (prompt = 'a cat') => api.create(request('/api/jobs', { modelId: 'paid', prompt })),
     get: (jobId: string) => api.get(new Request(`https://test.example/api/jobs/${jobId}`), jobId),
@@ -95,9 +90,7 @@ describe('GET /files', () => {
   });
   it('serves uploads uncached, so no copy outlives the lifecycle deletion; outputs stay cacheable', async () => {
     const ctx = await setup();
-    await bucket.put('uploads/up_cachetest.png', new Uint8Array([1]), {
-      httpMetadata: { contentType: 'image/png' },
-    });
+    await bucket.put('uploads/up_cachetest.png', new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
     const upload = await ctx.file('uploads/up_cachetest.png');
     expect(upload.status).toBe(200);
     expect(upload.headers.get('cache-control')).toBe('no-store');
@@ -110,7 +103,6 @@ describe('GET /files', () => {
     expect(served.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
     await served.arrayBuffer();
   });
-
   it('serves an output replaced by hand under its new key, once the job succeeded', async () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
@@ -138,24 +130,32 @@ describe('job handlers: money paths', () => {
     expect(await ctx.balance()).toBe(10);
   });
 
-  it('not enough credits: 402, no job row, nothing dispatched', async () => {
+  it('not enough credits: 402, no job row, no run', async () => {
     const ctx = await setup(3);
     const response = await ctx.create();
     expect(response.status).toBe(402);
     expect(await db.select().from(jobs).where(eq(jobs.userId, ctx.userId))).toHaveLength(0);
-    expect(ctx.dispatched).toHaveLength(0);
+    expect(await ctx.runs()).toHaveLength(0);
     expect(await ctx.balance()).toBe(3);
   });
 
-  it('dispatch failure fails the job and refunds once, however often it is read', async () => {
+  it('queues the run in the charge transaction', async () => {
     const ctx = await setup();
-    ctx.failDispatch();
-    expect((await ctx.create()).status).toBe(503);
-    const [row] = await db.select().from(jobs).where(eq(jobs.userId, ctx.userId));
-    expect(row?.status).toBe('failed');
-    expect(row?.errorCode).toBe('dispatch_failed');
-    await ctx.get(row!.id);
-    await ctx.get(row!.id);
+    const jobId = await createdId(await ctx.create());
+    expect(await ctx.runs()).toEqual([{ id: jobId }]);
+    expect(await ctx.balance()).toBe(6);
+  });
+
+  it('a run insert that fails rolls back the charge and the job', async () => {
+    const ctx = await setup();
+    // A run row already holding the next job ID can't exist; simulate a failing run insert with a CHECK on this test database.
+    await db.execute(sql`alter table job_runs add constraint test_no_runs check (false) not valid`);
+    try {
+      await expect(ctx.create()).rejects.toThrow();
+    } finally {
+      await db.execute(sql`alter table job_runs drop constraint test_no_runs`);
+    }
+    expect(await db.select().from(jobs).where(eq(jobs.userId, ctx.userId))).toHaveLength(0);
     expect(await ctx.balance()).toBe(10);
   });
 

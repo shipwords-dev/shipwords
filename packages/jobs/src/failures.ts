@@ -9,8 +9,9 @@ import { type JobRow, jobs } from './schema';
 export const FAILURE_STREAK = 3;
 
 /**
- * Failures written outside the runner, so nobody checks the streak when they end: dispatch_failed (the Workflow never started), stale
- * (its instance died) and workflow_failed (the Workflow's outer catch, when the runner itself couldn't run). They count toward the
+ * Failures written outside the runner, so nobody checks the streak when they end: dispatch_failed (older jobs whose Workflow never
+ * started), stale (the run kept dying, or nobody ran it in time) and workflow_failed (the catch around the runner, when the runner
+ * itself couldn't finish). They count toward the
  * streak but leave the alert to the next failure the runner checks.
  */
 export const UNCHECKED_FAILURES: readonly string[] = ['dispatch_failed', 'stale', 'workflow_failed'];

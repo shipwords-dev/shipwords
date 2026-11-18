@@ -11,6 +11,7 @@ import {
   cancelAll,
   cancelQueued,
   claimGuestJobs,
+  enqueueRun,
   loadJob,
   markFailed,
   type StoredOutput,
@@ -75,7 +76,13 @@ function withCookie(response: Response, setCookie: string | null): Response {
   return response;
 }
 
-export function createJobs(core: Core, models: readonly ModelDefinition[]) {
+export interface JobsOptions {
+  /** Tell this process's job worker a run is waiting (worker.wake); without it the worker finds the run on its next poll. */
+  wake?: () => void;
+}
+
+export function createJobs(core: Core, models: readonly ModelDefinition[], options: JobsOptions = {}) {
+  const wake = () => options.wake?.();
   const env = () => core.env as unknown as JobsEnv & { GUEST_COOKIE_SECRET: string; APP_URL?: string };
   const baseURL = () => (env().APP_URL ?? core.site.url).replace(/\/$/, '');
 
@@ -90,8 +97,8 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
   }
 
   /**
-   * Fallback: if the Workflow exits unexpectedly the job stays in progress. Jobs still unfinished after the model timeout plus 15 minutes
-   * are marked failed and refunded when the user views them, so no cron is needed.
+   * Fallback next to the worker's poison-run check: a job still unfinished after the model timeout plus 15 minutes (no worker running,
+   * say) is marked failed and refunded when the user views it.
    */
   async function healStale(job: JobRow): Promise<JobRow> {
     if (job.status === 'failed' || job.status === 'canceled') {
@@ -139,22 +146,11 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
     return urls;
   }
 
-  async function dispatch(job: JobRow): Promise<Response | null> {
-    try {
-      await env().GENERATION_WORKFLOW.create({ id: job.id, params: { jobId: job.id } });
-      return null;
-    } catch (error) {
-      core.log('workflow dispatch failed', { jobId: job.id, error: String(error) });
-      await markFailed(core.db, job.id, 'failed', 'dispatch_failed', 'could not start the job');
-      return errorResponse(503, 'dispatch_failed', 'Could not start the job, please try again.');
-    }
-  }
-
   return {
     models,
 
     /** POST /api/jobs */
-    async create(request: Request, options?: { idempotencyKey: string }): Promise<Response> {
+    async create(request: Request, idempotent?: { idempotencyKey: string }): Promise<Response> {
       const body = await readJson<CreateBody>(request);
       const model = models.find((m) => m.id === body?.modelId);
       if (!body || !model) return errorResponse(400, 'unknown_model');
@@ -190,10 +186,10 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
         }
       }
       const user = await core.getUser(request);
-      if (options && (!user || !/^[a-zA-Z0-9:_-]{1,200}$/.test(options.idempotencyKey)))
+      if (idempotent && (!user || !/^[a-zA-Z0-9:_-]{1,200}$/.test(idempotent.idempotencyKey)))
         return errorResponse(400, 'invalid_idempotency_key');
-      const jobId = options
-        ? `job_${Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([user!.id, options.idempotencyKey])))), (b) => b.toString(16).padStart(2, '0')).join('')}`
+      const jobId = idempotent
+        ? `job_${Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([user!.id, idempotent.idempotencyKey])))), (b) => b.toString(16).padStart(2, '0')).join('')}`
         : newId('job');
 
       // Only the server supplies this key. A lost response must not create another debit or reset a terminal job.
@@ -206,24 +202,12 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
         )
           return errorResponse(409, 'idempotency_conflict');
         job = await healStale(job);
-        // The runner's deadline is anchored to creation, not dispatch. Never start expired work.
-        // Keep ambiguous submissions through the existing grace period before stale healing refunds them.
-        if (job.status === 'queued' && Date.now() < job.createdAt + model!.timeoutMinutes * 60_000) {
-          try {
-            await env().GENERATION_WORKFLOW.create({ id: job.id, params: { jobId: job.id } });
-          } catch {
-            try {
-              // create can time out after accepting the task, or race another retry of this request.
-              await (await env().GENERATION_WORKFLOW.get(job.id)).status();
-            } catch {
-              // Keep the debit and queued row: retry the same key, or let stale-job healing settle it.
-              return errorResponse(503, 'dispatch_pending');
-            }
-          }
-        }
+        // The run was queued with the job; nudge the worker in case this process can take it now. A queued job past its deadline
+        // gets no new run: the runner fails it on its first step, or stale healing does.
+        if (job.status === 'queued') wake();
         return json({ job: publicJob((await loadJob(core.db, job.id))!, baseURL()) }, { status: 200 });
       }
-      if (options) {
+      if (idempotent) {
         const existing = await loadJob(core.db, jobId);
         if (existing) return resume(existing);
       }
@@ -241,16 +225,22 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
           upstream: model.upstream,
         };
         try {
-          // Charge and job creation share one transaction: either both happen or neither does.
+          // Charge, job and run share one transaction: all happen or none does, so a charged job always runs.
           if (cost > 0) {
             await spendCredits(
               core.db,
               { userId: user.id, amount: cost, idemKey: spendKey(jobId), ref: jobId },
-              (tx) => tx.insert(jobs).values(row),
+              async (tx) => {
+                await tx.insert(jobs).values(row);
+                await enqueueRun(tx, jobId);
+              },
             );
           } else {
-            if (options) await core.db.insert(jobs).values(row).onConflictDoNothing();
-            else await core.db.insert(jobs).values(row);
+            await core.db.transaction(async (tx) => {
+              if (idempotent) await tx.insert(jobs).values(row).onConflictDoNothing();
+              else await tx.insert(jobs).values(row);
+              await enqueueRun(tx, jobId);
+            });
           }
         } catch (error) {
           if (error instanceof InsufficientCreditsError) {
@@ -262,8 +252,9 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
           throw error;
         }
         const job = (await loadJob(core.db, jobId))!;
-        if (options) return resume(job);
-        return (await dispatch(job)) ?? json({ job: publicJob(job, baseURL()) }, { status: 201 });
+        if (idempotent) return resume(job);
+        wake();
+        return json({ job: publicJob(job, baseURL()) }, { status: 201 });
       }
 
       if (!model.guest) return errorResponse(401, 'login_required', 'Sign in to use this model.');
@@ -275,17 +266,19 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
         );
       }
       await core.db
-        .insert(jobs)
-        .values({
-          id: jobId,
-          guestId: decision.guestId,
-          modelId: model.id,
-          kind: model.kind,
-          prompt,
-          inputJson,
-          costCredits: 0,
-          quotaJson: JSON.stringify(decision.rules),
-          upstream: model.upstream,
+        .transaction(async (tx) => {
+          await tx.insert(jobs).values({
+            id: jobId,
+            guestId: decision.guestId,
+            modelId: model.id,
+            kind: model.kind,
+            prompt,
+            inputJson,
+            costCredits: 0,
+            quotaJson: JSON.stringify(decision.rules),
+            upstream: model.upstream,
+          });
+          await enqueueRun(tx, jobId);
         })
         .catch(async (error) => {
           // Quota was taken but the job wasn't created: give it back, or repeated failures would drain the daily guest budget.
@@ -293,11 +286,8 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
           throw error;
         });
       const job = (await loadJob(core.db, jobId))!;
-      const failed = await dispatch(job);
-      return withCookie(
-        failed ?? json({ job: publicJob(job, baseURL()) }, { status: 201 }),
-        decision.setCookie,
-      );
+      wake();
+      return withCookie(json({ job: publicJob(job, baseURL()) }, { status: 201 }), decision.setCookie);
     },
 
     /** GET /api/jobs/<id> */
@@ -323,8 +313,8 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
       const updated = await cancelQueued(core.db, jobId);
       if (updated?.status === 'submitted') return errorResponse(409, 'job_started');
       if (updated?.status === 'canceled') {
-        // The Workflow is not terminated: it may be inside the first submit, the upstream already holding the task. Left running, it sees
-        // the job canceled, cancels the task it just submitted and stops; a Workflow that hasn't started yet stops at its first step.
+        // The run is not stopped: it may be inside the first submit, the upstream already holding the task. Left running, it sees
+        // the job canceled, cancels the task it just submitted and stops; a run that hasn't started yet stops at its first step.
         // createAdapters throws when the mock is misconfigured; nothing real was submitted then, so there is nothing to cancel.
         const adapter = (() => {
           try {
