@@ -123,7 +123,7 @@ afterEach(async () => {
   await Promise.all(workers.splice(0).map((w) => w.stop()));
 });
 
-const stepOptions = { retries: 2, retryDelayMs: 1, stepTimeoutMs: 60_000, now: Date.now };
+const stepOptions = { retries: 2, retryDelayMs: 1, now: Date.now };
 
 /** A run row held by one claim (`token`), and steps bound to that lease. */
 async function heldRun(token: string, options: Partial<typeof stepOptions> = {}, database: Db = db) {
@@ -203,10 +203,25 @@ describe('steps', () => {
     expect(calls).toBe(3);
   });
 
-  it('a step that never returns counts as a failed attempt', async () => {
-    const { runId, steps } = await heldRun('w1:1', { retries: 1, stepTimeoutMs: 20 });
-    await expect(steps.do('hang', () => new Promise(() => {}))).rejects.toThrow(/longer than 20 ms/);
-    expect(await stepOf(runId, 'hang')).toMatchObject({ attempts: 2, doneAt: null });
+  it('an attempt whose process died counts, and the next one is told its effects are unknown', async () => {
+    const { runId, steps } = await heldRun('w1:1');
+    const seen: number[] = [];
+    // The first attempt starts, then its process dies before the result is saved.
+    await expect(
+      steps.do('submit', async (info) => {
+        seen.push(info!.attempt);
+        throw new RunLost(runId, 'lost');
+      }),
+    ).rejects.toBeInstanceOf(RunLost);
+    await takeOver(runId, 'w2:1');
+    const lease: Lease = { runId, token: 'w2:1', abort: new AbortController(), until: Date.now() + 60_000 };
+    expect(
+      await leasedSteps(db, lease, stepOptions).do('submit', async (info) => {
+        seen.push(info!.attempt);
+        return 'ok';
+      }),
+    ).toBe('ok');
+    expect(seen).toEqual([1, 2]);
   });
 
   it('a claim that lost its lease saves nothing, and no later step of the run starts', async () => {
@@ -250,14 +265,17 @@ describe('steps', () => {
         return 1;
       }),
     ).rejects.toBeInstanceOf(RunLost);
-    expect(await stepOf(runId, 'x')).toBeUndefined();
+    // The attempt was recorded as started; its result was not saved.
+    expect(await stepOf(runId, 'x')).toMatchObject({ attempts: 1, result: null, doneAt: null });
   });
 
   it("the worker's own database failure stops the run instead of failing the step", async () => {
+    // The attempt starts fine (first transaction); saving its result fails (every later one).
+    let transactions = 0;
     let failSaves = true;
     const flaky = new Proxy(db, {
       get(target, key) {
-        if (key === 'transaction' && failSaves)
+        if (key === 'transaction' && failSaves && ++transactions > 1)
           return async () => {
             throw new Error('connection reset');
           };
@@ -407,6 +425,61 @@ describe('job worker', () => {
     worker(deps, { id: 'second' });
     await until(async () => (await runOf(jobId)).status === 'done');
     expect(await stepOf(jobId, 'notify')).toMatchObject({ doneAt: expect.any(Number) });
+  });
+
+  it('buries a run stuck past its job deadline: cancels upstream, refunds, frees the slot', async () => {
+    const { userId, jobId } = await paidJob();
+    const adapter = new FakeAdapter();
+    const download = gated(imageResponse);
+    download.hold();
+    // The job's deadline is 10 minutes off; a negative grace makes the run count as stuck 100 ms after creation.
+    const w = worker(
+      { db, bucket, models, adapters: { yir: adapter }, fetcher: () => download.call() },
+      { stuckGraceMs: -10 * 60_000 + 100 },
+    );
+    await until(async () => (await runOf(jobId)).status === 'dead');
+    expect(adapter.cancelled).toEqual([`up_${jobId}`]);
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'failed', errorCode: 'stale' });
+    expect((await getBalance(db, userId)).available).toBe(50);
+    expect(w.active).toBe(0);
+    // The stuck call returns at last: the job stays failed and refunded.
+    download.release();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect((await loadJob(db, jobId))?.status).toBe('failed');
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
+  it("hands a run back after the worker's own database trouble without counting it toward poison", async () => {
+    const { jobId } = await paidJob();
+    const broken = new Proxy(db, {
+      get(target, key) {
+        if (key === 'transaction')
+          return async () => {
+            throw new Error('connection reset');
+          };
+        return Reflect.get(target, key);
+      },
+    });
+    worker({ db: broken, bucket, models, adapters: { yir: new FakeAdapter() } }, { retryRunAfterMs: 60_000 });
+    await until(async () => (await runOf(jobId)).runAfter > Date.now() + 30_000);
+    expect(await runOf(jobId)).toMatchObject({ status: 'pending', lockedBy: null, pickups: 0 });
+    expect((await loadJob(db, jobId))?.status).toBe('queued');
+  });
+
+  it('stop() returns after its grace even if a step never does', async () => {
+    const { jobId } = await paidJob();
+    const download = gated(imageResponse);
+    download.hold();
+    const w = worker(
+      { db, bucket, models, adapters: { yir: new FakeAdapter() }, fetcher: () => download.call() },
+      { stopGraceMs: 50 },
+    );
+    await until(async () => download.calls() > 0);
+    const started = Date.now();
+    await w.stop();
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect((await runOf(jobId)).status).toBe('pending');
+    download.release();
   });
 
   it('refuses lease settings that would let a lease run out between heartbeats', () => {

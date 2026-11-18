@@ -1,5 +1,5 @@
 import type { Db } from '@shipwords/core/db/client';
-import { and, eq, inArray, lt, ne, notInArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, like, lt, ne, notInArray, sql } from 'drizzle-orm';
 import { cancelAll, loadJob, markFailed, upstreamIds } from './lifecycle';
 import { type RunnerDeps, runGeneration, type StepRunner } from './runner';
 import { jobRuns, jobSteps, TERMINAL } from './schema';
@@ -8,19 +8,21 @@ import { jobRuns, jobSteps, TERMINAL } from './schema';
 //
 // - A job's run row is inserted with the job (handlers.ts). Each process runs a loop that claims pending runs with
 //   SELECT … FOR UPDATE SKIP LOCKED and holds each one by a lease it keeps extending. Every claim writes its own token into
-//   locked_by, so saves, heartbeats and releases match one claim, never an older one of the same process.
-// - step.do(name, fn) returns a finished step's saved result without running fn, so a replay skips the work already done;
-//   otherwise it runs fn with a time limit, retrying with exponential backoff (the attempt count survives a replay), and saves
-//   the result. Steps are at least once: a crash after fn but before the save runs fn again, as on Workflows, and the runner's
-//   steps are written for that.
-// - Before fn starts the worker confirms in the database that it still holds the lease, and it saves the result only under the
-//   lease. Once the lease is lost, or the process is stopping, every later step throws RunLost without running. That includes the
-//   runner's own abort and settle steps, so a worker that lost a run can't fail and refund a job another worker is finishing.
-// - The worker's own database trouble (reading or saving a step) never reaches the runner as a step failure, which would fail
-//   and refund a paid job: the worker stops the run instead, and it is replayed once the lease expires.
+//   locked_by, so step writes, heartbeats and releases match one claim, never an older one of the same process.
+// - step.do(name, fn) returns a finished step's saved result without running fn, so a replay skips the work already done.
+//   Otherwise, under the lease, it records that an attempt is starting, runs fn and saves the result, retrying failures with
+//   exponential backoff. The attempt count includes attempts whose process died, survives replays, and is passed to fn, so a step
+//   can tell a first attempt (nothing done yet) from one whose earlier effects are unknown. Steps are at least once.
+// - A step is never run twice at the same time: there is no per-step timeout to retry around a slow call (a Node call can't be
+//   stopped, and the old one would keep writing). A run stuck past its job's deadline plus a grace period is buried instead:
+//   its upstream tasks are canceled and the job is failed ('stale') and refunded. Jobs only move forward, so whatever the stuck
+//   call writes later can't undo that.
+// - Once the lease is lost or the process is stopping, every later step throws RunLost without running, including the runner's
+//   own abort and settle steps, so a worker that lost a run can't fail and refund a job another worker is finishing.
+// - The worker's own database trouble never reaches the runner as a step failure (which would fail and refund a paid job): the
+//   run is handed back for a later replay, and such hand-backs don't count toward the poison limit.
 // - A run marked done always has a finished job. A run whose job is still in progress when runGeneration returns is left to be
-//   replayed; a run claimed too often without finishing is poison: its upstream tasks are canceled and the job is failed
-//   ('stale') and refunded without running it again.
+//   replayed; a run claimed too often without finishing is poison and is buried.
 
 export interface WorkerOptions {
   /** Identifies this process in locked_by; defaults to a random ID. */
@@ -36,8 +38,12 @@ export interface WorkerOptions {
   /** Retries of a throwing step after the first attempt, and the delay before the first retry (doubling each time). */
   retries?: number;
   retryDelayMs?: number;
-  /** A step running longer counts as a failed attempt. Runner steps take seconds to a minute or two. */
-  stepTimeoutMs?: number;
+  /** A run still going this long after its job's deadline is buried (the same grace the job handlers use for stale jobs). */
+  stuckGraceMs?: number;
+  /** How long stop() waits for steps in flight before returning anyway (their leases then expire). */
+  stopGraceMs?: number;
+  /** A run handed back after the worker's own database trouble is retried after this delay. */
+  retryRunAfterMs?: number;
   /** Step rows of runs that ended this long ago are deleted. */
   keepStepsMs?: number;
   log?: (message: string, details: Record<string, unknown>) => void;
@@ -53,20 +59,30 @@ const DEFAULTS = {
   maxPickups: 10,
   retries: 5,
   retryDelayMs: 10_000,
-  stepTimeoutMs: 10 * 60_000,
+  stuckGraceMs: 15 * 60_000,
+  stopGraceMs: 60_000,
+  retryRunAfterMs: 30_000,
   keepStepsMs: 30 * 24 * 3_600_000,
 } as const;
 
 const CLEANUP_EVERY_MS = 3_600_000;
 /** A step doesn't start this close to the lease's end: the heartbeat should have extended it long before. */
 const LEASE_MARGIN_MS = 5_000;
-/** The worker's own reads and writes are retried this often before it gives the run up for a later replay. */
+/** The worker's own reads and writes are retried this often before it hands the run back. */
 const ENGINE_ATTEMPTS = 3;
+/** Canceling upstream tasks of a buried run waits at most this long; the refund doesn't wait on a hung upstream. */
+const CANCEL_LIMIT_MS = 30_000;
 
-/** Thrown by a step once this worker may no longer run the job: it lost the lease, the process is stopping, or its own bookkeeping failed. */
+/** Why a step refused to run. */
+export type LostReason = 'lost' | 'stopping' | 'engine' | 'stuck';
+
+/** Thrown by a step once this worker may no longer run the job. */
 export class RunLost extends Error {
-  constructor(readonly runId: string) {
-    super(`run ${runId} is no longer held by this worker`);
+  constructor(
+    readonly runId: string,
+    readonly reason: LostReason = 'lost',
+  ) {
+    super(`run ${runId} is no longer run by this worker (${reason})`);
     this.name = 'RunLost';
   }
 }
@@ -74,6 +90,10 @@ export class RunLost extends Error {
 /** Step results are saved as JSON; a fresh run returns the same round-tripped value a replay would. */
 function encode(value: unknown): { v?: unknown } {
   return JSON.parse(JSON.stringify({ v: value })) as { v?: unknown };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
@@ -91,27 +111,20 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-class StepTimeout extends Error {
-  constructor(name: string, ms: number) {
-    super(`step ${name} took longer than ${ms} ms`);
-    this.name = 'StepTimeout';
-  }
-}
-
-/** Resolves or rejects with fn, or rejects with StepTimeout after ms. fn keeps running in the background; steps are at least once. */
-function withTimeout<T>(name: string, ms: number, fn: () => Promise<T>): Promise<T> {
+/** Resolves with the promise, or with undefined after ms, so a hung call can't hold up what follows it. */
+function within<T>(ms: number, promise: Promise<T>): Promise<T | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const limit = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new StepTimeout(name, ms)), ms);
+  const limit = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
   });
-  return Promise.race([fn(), limit]).finally(() => clearTimeout(timer));
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
 }
 
 export interface Lease {
   runId: string;
   /** This claim's locked_by value. */
   token: string;
-  /** Aborted when the lease is lost or the worker stops; pending waits end at once, and no step runs after. */
+  /** Aborted (with a RunLost) when the run may no longer continue here; pending waits end at once, and no step runs after. */
   abort: AbortController;
   /** locked_until as last written by this worker. */
   until: number;
@@ -121,7 +134,7 @@ export interface JobWorker {
   readonly id: string;
   /** Look for pending runs now, e.g. right after a job is created in this process. */
   wake(): void;
-  /** Stop claiming; let steps in flight finish, then release the leases so another process picks the runs up at once. */
+  /** Stop claiming; let steps in flight finish (up to stopGraceMs), then release the leases so another process picks the runs up. */
   stop(): Promise<void>;
   /** Runs held right now (for tests and health checks). */
   readonly active: number;
@@ -130,29 +143,30 @@ export interface JobWorker {
 interface StepOptions {
   retries: number;
   retryDelayMs: number;
-  stepTimeoutMs: number;
   now: () => number;
+}
+
+function abortLease(lease: Lease, reason: LostReason): RunLost {
+  if (lease.abort.signal.aborted) return lease.abort.signal.reason as RunLost;
+  const error = new RunLost(lease.runId, reason);
+  lease.abort.abort(error);
+  return error;
 }
 
 /** Steps of one run, bound to one claim's lease on it. */
 export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRunner {
   const { runId, token } = lease;
-  /** From here on every step of this run throws, including the runner's abort and settle steps. */
-  const lost = () => {
-    const error = new RunLost(runId);
-    if (!lease.abort.signal.aborted) lease.abort.abort(error);
-    return error;
-  };
+  const lost = (reason: LostReason = 'lost') => abortLease(lease, reason);
 
-  /** The worker's own database work. A failure that persists stops the run (replayed later); it never becomes a step failure. */
+  /** The worker's own database work. A failure that persists hands the run back; it never becomes a step failure. */
   async function engine<T>(op: () => Promise<T>): Promise<T> {
     for (let attempt = 1; ; attempt++) {
       try {
         return await op();
       } catch (error) {
         if (error instanceof RunLost) throw error;
-        if (attempt >= ENGINE_ATTEMPTS) throw lost();
-        await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+        if (attempt >= ENGINE_ATTEMPTS) throw lost('engine');
+        await delay(200 * attempt);
       }
     }
   }
@@ -165,6 +179,11 @@ export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRun
       sql`${jobRuns.lockedUntil} > ${atLeast}`,
     );
 
+  function assertRunning() {
+    if (lease.abort.signal.aborted) throw lease.abort.signal.reason as RunLost;
+    if (options.now() > lease.until - LEASE_MARGIN_MS) throw lost();
+  }
+
   async function stepRow(name: string) {
     const [row] = await db
       .select()
@@ -173,23 +192,31 @@ export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRun
     return row ?? null;
   }
 
-  /** Confirms, locally and in the database, that a step may start now. */
-  async function check() {
-    if (lease.abort.signal.aborted || options.now() > lease.until - LEASE_MARGIN_MS) throw lost();
-    const [row] = await engine(() =>
-      db
-        .select({ id: jobRuns.id })
-        .from(jobRuns)
-        .where(heldWhere(options.now() + LEASE_MARGIN_MS)),
+  /** Under the lease, records that `attempt` is starting. */
+  async function begin(name: string, attempt: number) {
+    assertRunning();
+    await engine(() =>
+      db.transaction(async (tx) => {
+        const [held] = await tx
+          .select({ id: jobRuns.id })
+          .from(jobRuns)
+          .where(heldWhere(options.now() + LEASE_MARGIN_MS))
+          .for('update');
+        if (!held) throw lost();
+        // Aborted while waiting for the lock: roll back, so an attempt that never ran isn't counted.
+        if (lease.abort.signal.aborted) throw lease.abort.signal.reason as RunLost;
+        await tx
+          .insert(jobSteps)
+          .values({ runId, name, attempts: attempt })
+          .onConflictDoUpdate({ target: [jobSteps.runId, jobSteps.name], set: { attempts: attempt } });
+      }),
     );
-    if (!row) throw lost();
+    // stop() or the heartbeat may have aborted the lease while the query was in flight.
+    assertRunning();
   }
 
-  /** Saves a step outcome only while this claim still holds the lease; otherwise throws RunLost. */
-  async function save(
-    name: string,
-    fields: { result?: { v?: unknown }; attempts: number; error: string | null; done: boolean },
-  ) {
+  /** Saves a step's outcome only while this claim still holds the lease; otherwise throws RunLost. */
+  async function settle(name: string, fields: { result?: { v?: unknown }; error?: string; done: boolean }) {
     await engine(() =>
       db.transaction(async (tx) => {
         const [held] = await tx
@@ -198,16 +225,14 @@ export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRun
           .where(heldWhere(options.now()))
           .for('update');
         if (!held) throw lost();
-        const values = {
-          result: fields.result ?? null,
-          attempts: fields.attempts,
-          error: fields.error,
-          doneAt: fields.done ? options.now() : null,
-        };
         await tx
-          .insert(jobSteps)
-          .values({ runId, name, ...values })
-          .onConflictDoUpdate({ target: [jobSteps.runId, jobSteps.name], set: values });
+          .update(jobSteps)
+          .set({
+            result: fields.result ?? null,
+            error: fields.error ?? null,
+            doneAt: fields.done ? options.now() : null,
+          })
+          .where(and(eq(jobSteps.runId, runId), eq(jobSteps.name, name)));
       }),
     );
   }
@@ -221,42 +246,45 @@ export function leasedSteps(db: Db, lease: Lease, options: StepOptions): StepRun
   }
 
   return {
-    async do<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    async do<T>(name: string, fn: (info?: { attempt: number }) => Promise<T>): Promise<T> {
+      assertRunning();
       const row = await engine(() => stepRow(name));
       if (row?.doneAt != null) return (row.result as { v?: unknown } | null)?.v as T;
-      // Attempts made before a crash or a handover count: a replay doesn't get a fresh set of retries.
-      const done = row?.attempts ?? 0;
-      if (done > options.retries) throw new Error(row?.error ?? `step ${name} failed`);
-      if (done > 0) await backoff(done);
-      for (let attempt = done + 1; ; attempt++) {
-        await check();
+      // Attempts started before (including ones whose process died) count: a replay doesn't get a fresh set of retries.
+      const started = row?.attempts ?? 0;
+      if (started > options.retries)
+        throw new Error(row?.error ?? `step ${name} did not finish in ${started} attempts`);
+      if (started > 0 && row?.error) await backoff(started);
+      for (let attempt = started + 1; ; attempt++) {
+        await begin(name, attempt);
         let value: T;
         try {
-          value = await withTimeout(name, options.stepTimeoutMs, fn);
+          value = await fn({ attempt });
         } catch (error) {
           if (error instanceof RunLost) throw error;
           const message = error instanceof Error ? error.message : String(error);
-          await save(name, { attempts: attempt, error: message.slice(0, 2_000), done: false });
+          await settle(name, { error: message.slice(0, 2_000), done: false });
           if (attempt > options.retries) throw error;
           await backoff(attempt);
           continue;
         }
         const result = encode(value);
-        await save(name, { result, attempts: attempt, error: null, done: true });
+        await settle(name, { result, done: true });
         return result.v as T;
       }
     },
 
     async sleep(name: string, ms: number): Promise<void> {
+      assertRunning();
       const row = await engine(() => stepRow(name));
       if (row?.doneAt != null) return;
-      await check();
+      await begin(name, (row?.attempts ?? 0) + 1);
       try {
         await abortableDelay(ms, lease.abort.signal);
       } catch {
         throw lost();
       }
-      await save(name, { attempts: 1, error: null, done: true });
+      await settle(name, { done: true });
     },
   };
 }
@@ -273,13 +301,15 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
   const leaseMs = options.leaseMs ?? DEFAULTS.leaseMs;
   const heartbeatMs = options.heartbeatMs ?? DEFAULTS.heartbeatMs;
   const maxPickups = options.maxPickups ?? DEFAULTS.maxPickups;
+  const stuckGraceMs = options.stuckGraceMs ?? DEFAULTS.stuckGraceMs;
+  const stopGraceMs = options.stopGraceMs ?? DEFAULTS.stopGraceMs;
+  const retryRunAfterMs = options.retryRunAfterMs ?? DEFAULTS.retryRunAfterMs;
   const keepStepsMs = options.keepStepsMs ?? DEFAULTS.keepStepsMs;
   const now = options.now ?? Date.now;
   const log = options.log ?? deps.log ?? (() => {});
   const stepOptions: StepOptions = {
     retries: options.retries ?? DEFAULTS.retries,
     retryDelayMs: options.retryDelayMs ?? DEFAULTS.retryDelayMs,
-    stepTimeoutMs: options.stepTimeoutMs ?? DEFAULTS.stepTimeoutMs,
     now,
   };
   // A heartbeat must land well before a step would refuse to start for a lease about to end.
@@ -288,7 +318,12 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
       `leaseMs (${leaseMs}) must be at least ${LEASE_MARGIN_MS} ms plus two heartbeats (${heartbeatMs} ms)`,
     );
 
-  const held = new Map<string, Lease>();
+  interface Held {
+    lease: Lease;
+    /** When the run counts as stuck: its job's deadline plus the grace. */
+    stuckAt: number;
+  }
+  const held = new Map<string, Held>();
   const running = new Set<Promise<void>>();
   let stopping = false;
   let wakeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -333,7 +368,7 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
   }
 
   /** Ends a run this claim holds; a no-op if the lease moved on. */
-  async function finish(lease: Lease, status: 'done' | 'dead') {
+  async function end(lease: Lease, status: 'done' | 'dead') {
     await db
       .update(jobRuns)
       .set({ status, lockedBy: null, lockedUntil: null, finishedAt: now() })
@@ -342,35 +377,66 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
       );
   }
 
-  /** Gives a run back so another worker can claim it at once (shutdown); the claim isn't counted against the poison limit. */
-  async function release(runId: string, token: string) {
+  /**
+   * Gives a run back without counting the claim against the poison limit: on shutdown (claimable at once) or after the worker's own
+   * database trouble (claimable after retryRunAfterMs).
+   */
+  async function release(runId: string, token: string, after = 0) {
     await db
       .update(jobRuns)
-      .set({ lockedBy: null, lockedUntil: null, pickups: sql`greatest(${jobRuns.pickups} - 1, 0)` })
+      .set({
+        lockedBy: null,
+        lockedUntil: null,
+        pickups: sql`greatest(${jobRuns.pickups} - 1, 0)`,
+        runAfter: now() + after,
+      })
       .where(and(eq(jobRuns.id, runId), eq(jobRuns.lockedBy, token), eq(jobRuns.status, 'pending')));
   }
 
-  /** Poison: cancel what the job still has running upstream (it would keep billing), then fail and refund it. */
-  async function bury(lease: Lease) {
+  /** Upstream task IDs a run placed: those recorded on the job, plus prep hedge copies, which only live in step results. */
+  async function upstreamTasks(runId: string, recorded: readonly string[]): Promise<string[]> {
+    const hedges = await db
+      .select({ result: jobSteps.result })
+      .from(jobSteps)
+      .where(and(eq(jobSteps.runId, runId), like(jobSteps.name, 'hedge:%'), isNotNull(jobSteps.doneAt)));
+    const copies = hedges.flatMap((row) => {
+      const value = (row.result as { v?: unknown } | null)?.v;
+      return typeof value === 'string' ? [value] : [];
+    });
+    return [...recorded, ...copies];
+  }
+
+  /** Poison or stuck: cancel what the job still has running upstream (it would keep billing), then fail and refund it. */
+  async function bury(lease: Lease, why: string) {
     const job = await loadJob(db, lease.runId);
     if (job && !TERMINAL.includes(job.status)) {
       const adapter = deps.adapters[job.upstream];
-      if (adapter) await cancelAll(adapter, upstreamIds(job));
+      if (adapter)
+        await within(CANCEL_LIMIT_MS, cancelAll(adapter, await upstreamTasks(lease.runId, upstreamIds(job))));
     }
     // A job that already ended keeps its state; settlement is idempotent and completes in case the last run died before settle.
-    if (job) await markFailed(db, lease.runId, 'failed', 'stale', 'the job kept stopping before it finished');
-    await finish(lease, 'dead');
+    if (job) await markFailed(db, lease.runId, 'failed', 'stale', why);
+    await end(lease, 'dead');
+  }
+
+  async function stuckAt(runId: string): Promise<number> {
+    const job = await loadJob(db, runId);
+    const model = job && deps.models.find((m) => m.id === job.modelId);
+    if (!job || !model) return Number.POSITIVE_INFINITY;
+    return job.createdAt + model.timeoutMinutes * 60_000 + stuckGraceMs;
   }
 
   async function execute(run: { id: string; pickups: number; until: number; token: string }) {
     const lease: Lease = { runId: run.id, token: run.token, abort: new AbortController(), until: run.until };
-    held.set(run.id, lease);
+    const entry: Held = { lease, stuckAt: Number.POSITIVE_INFINITY };
+    held.set(run.id, entry);
     try {
       if (run.pickups > maxPickups) {
         log('job run is poison', { jobId: run.id, pickups: run.pickups });
-        await bury(lease);
+        await bury(lease, 'the job kept stopping before it finished');
         return;
       }
+      entry.stuckAt = await stuckAt(run.id);
       const steps = leasedSteps(db, lease, stepOptions);
       try {
         await runGeneration(deps, run.id, steps);
@@ -383,31 +449,43 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
         });
       }
       // runGeneration swallows errors of best-effort steps (notify, cost): a run stopped in one of them is not finished.
-      if (lease.abort.signal.aborted) throw new RunLost(run.id);
+      if (lease.abort.signal.aborted) throw lease.abort.signal.reason;
       const job = await loadJob(db, run.id);
       if (job && !TERMINAL.includes(job.status)) {
         // Shouldn't happen: leave the lease to expire so the run is replayed; pickups bound how often.
         log('job run ended with the job unfinished', { jobId: run.id, status: job.status });
         return;
       }
-      await finish(lease, 'done');
+      await end(lease, 'done');
     } catch (error) {
       if (error instanceof RunLost) {
-        if (stopping) await release(run.id, run.token).catch(() => {});
-        log('job run left to be replayed', { jobId: run.id });
+        if (error.reason === 'stopping') await release(run.id, run.token).catch(() => {});
+        if (error.reason === 'engine') await release(run.id, run.token, retryRunAfterMs).catch(() => {});
+        log('job run left to be replayed', { jobId: run.id, reason: error.reason });
         return;
       }
       // The lease expires and the run is replayed; pickups bound how often.
       log('job run crashed', { jobId: run.id, error: String(error) });
     } finally {
-      held.delete(run.id);
+      if (held.get(run.id) === entry) held.delete(run.id);
     }
   }
 
   async function heartbeat() {
     if (held.size === 0) return;
-    const leases = [...held.values()];
     const t = now();
+    // Runs stuck past their job's deadline are buried, and their slot is freed even though the stuck call never returns.
+    for (const [runId, entry] of held) {
+      if (t < entry.stuckAt || entry.lease.abort.signal.aborted) continue;
+      abortLease(entry.lease, 'stuck');
+      held.delete(runId);
+      log('job run stuck past its deadline', { jobId: runId });
+      void bury(entry.lease, 'the job got stuck').catch((error: unknown) =>
+        log('burying a stuck run failed', { jobId: runId, error: String(error) }),
+      );
+    }
+    const leases = [...held.values()].map((entry) => entry.lease);
+    if (leases.length === 0) return;
     const kept = await db
       .update(jobRuns)
       .set({ lockedUntil: t + leaseMs })
@@ -428,7 +506,7 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
     const keptIds = new Set(kept.map((row) => row.id));
     for (const lease of leases) {
       if (keptIds.has(lease.runId)) lease.until = t + leaseMs;
-      else lease.abort.abort(new RunLost(lease.runId));
+      else abortLease(lease, 'lost');
     }
   }
 
@@ -463,10 +541,10 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
     }
   }
 
-  function schedule(delay: number) {
+  function schedule(ms: number) {
     if (stopping) return;
     if (wakeTimer) clearTimeout(wakeTimer);
-    wakeTimer = setTimeout(tick, delay);
+    wakeTimer = setTimeout(tick, ms);
   }
 
   function tick() {
@@ -496,10 +574,11 @@ export function startJobWorker(deps: RunnerDeps, options: WorkerOptions = {}): J
     async stop() {
       stopping = true;
       if (wakeTimer) clearTimeout(wakeTimer);
-      for (const lease of held.values()) lease.abort.abort(new RunLost(lease.runId));
+      for (const entry of held.values()) abortLease(entry.lease, 'stopping');
       await polling;
-      for (const lease of held.values()) lease.abort.abort(new RunLost(lease.runId));
-      await Promise.allSettled([...running]);
+      for (const entry of held.values()) abortLease(entry.lease, 'stopping');
+      // A step that never returns would hold this forever; its lease simply expires and another process replays the run.
+      await within(stopGraceMs, Promise.allSettled([...running]));
       clearInterval(beat);
     },
   };

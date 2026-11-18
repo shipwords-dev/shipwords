@@ -24,7 +24,15 @@ export function createDb(
       JSON.stringify({ level: 'error', message: 'idle database connection failed', error: String(error) }),
     ),
 ): Db {
-  const pool = new Pool({ connectionString, max: 10, ...config });
+  const pool = new Pool({
+    connectionString,
+    max: 10,
+    // No query, lock wait or open transaction can hold a connection (and the row locks it took) indefinitely.
+    statement_timeout: 30_000,
+    lock_timeout: 10_000,
+    idle_in_transaction_session_timeout: 60_000,
+    ...config,
+  });
   pool.on('error', onIdleError);
   return drizzle({ client: pool, schema }) as unknown as Db;
 }

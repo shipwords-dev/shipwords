@@ -52,19 +52,32 @@ describe.skipIf(!adminUrl)('job workers on one queue', () => {
         await enqueueRun(tx, id);
       });
     const deps = { db, bucket: {} as R2Bucket, models, adapters: {} };
-    const options = { pollMs: 5, heartbeatMs: 50, slots: 8 };
+    const logs: string[] = [];
+    const log = (message: string, details: Record<string, unknown>) =>
+      logs.push(`${message} ${JSON.stringify(details)}`);
+    const options = { pollMs: 5, heartbeatMs: 50, slots: 8, retryRunAfterMs: 100, log };
     const a = startJobWorker(deps, { ...options, id: 'a' });
     const b = startJobWorker(deps, { ...options, id: 'b' });
     const end = Date.now() + 20_000;
     for (;;) {
       const runs = await db.select().from(jobRuns).where(inArray(jobRuns.id, ids));
       if (runs.every((run) => run.status === 'done')) break;
-      if (Date.now() > end) throw new Error('runs did not finish');
+      if (Date.now() > end) {
+        const left = runs
+          .filter((run) => run.status !== 'done')
+          .map((run) => `${run.id} ${run.status} ${run.pickups}`);
+        throw new Error(
+          [`runs did not finish: ${left.join('; ')}`, ...logs.slice(-20)].join(String.fromCharCode(10)),
+        );
+      }
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     await Promise.all([a.stop(), b.stop()]);
     const runs = await db.select().from(jobRuns).where(inArray(jobRuns.id, ids));
-    expect(runs.every((run) => run.pickups === 1)).toBe(true);
+    // A run handed back after a transient database error is claimed again; nothing else may claim a run twice.
+    const reclaimed = runs.filter((run) => run.pickups !== 1).map((run) => run.id);
+    const handedBack = logs.filter((line) => line.includes('"reason":"engine"'));
+    expect(reclaimed.length).toBeLessThanOrEqual(handedBack.length);
     const loads = await db.select().from(jobSteps).where(eq(jobSteps.name, 'load'));
     expect(loads.filter((step) => ids.includes(step.runId)).every((step) => step.attempts === 1)).toBe(true);
   });

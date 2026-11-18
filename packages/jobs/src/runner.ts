@@ -31,11 +31,16 @@ import type { JobRow } from './schema';
 import type { PollResult, SubmitInput, UpstreamAdapter } from './upstream';
 import { UpstreamError } from './upstream';
 
-// The full execution of one generation job. The Workflow persists each step's result and resumes after interruption;
-// this only depends on the StepRunner interface, so tests pass an implementation that runs directly.
+// The full execution of one generation job. The step runner (worker.ts) persists each step's result and resumes after
+// interruption; this only depends on the StepRunner interface, so tests pass an implementation that runs directly.
+
+export interface StepInfo {
+  /** 1 on a step's first attempt; higher when an earlier attempt failed or its process died mid-step (its effects are unknown). */
+  attempt: number;
+}
 
 export interface StepRunner {
-  do<T>(name: string, fn: () => Promise<T>): Promise<T>;
+  do<T>(name: string, fn: (info?: StepInfo) => Promise<T>): Promise<T>;
   sleep(name: string, ms: number): Promise<void>;
 }
 
@@ -665,32 +670,44 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           });
         descriptions.set(partId, described);
       }
-      const submitted = await step.do(name('submit', partId), async () => {
+      /**
+       * Records this segment's upstream ID. When the slot was filled meanwhile (the same submit replayed elsewhere), the recorded ID
+       * wins and a different task this call placed is canceled; when the job has ended, the task is canceled and the job is done.
+       */
+      const record = async (upstreamJobId: string) => {
+        if (await appendUpstreamJob(deps.db, jobId, index, upstreamJobId)) return { upstreamJobId };
+        const now = await activeJob(deps.db, jobId);
+        const recorded = now ? upstreamIds(now)[index] : undefined;
+        if (recorded !== upstreamJobId && !upstreamJobId.startsWith(SKIPPED))
+          await adapter.cancel(upstreamJobId).catch(() => undefined);
+        return recorded ? { upstreamJobId: recorded } : { done: true as const };
+      };
+      const submitted = await step.do(name('submit', partId), async (info) => {
         const job = await activeJob(deps.db, jobId);
         if (!job) return { done: true as const };
         const existing = upstreamIds(job)[index];
         if (existing) return { upstreamJobId: existing };
         // Prep may have used up the time, or the run started late (a backlog, a worker outage): submitting now would just waste
-        // upstream spend on a job that times out anyway.
-        if (Date.now() > deadline) return { timeout: true as const };
+        // upstream spend on a job that times out anyway. Only on a first attempt, though: after a failed or interrupted one the
+        // upstream may already hold the task, and submitting again with the same key is how its ID is recovered, so the timeout
+        // that follows cancels it instead of leaving it running unseen.
+        if (Date.now() > deadline && (info?.attempt ?? 1) === 1) return { timeout: true as const };
         try {
           const { upstreamJobId } = await adapter.submit(
             submitInput(job, index),
             single ? jobId : `${jobId}:${partId}`,
           );
-          if (!(await appendUpstreamJob(deps.db, jobId, index, upstreamJobId))) {
-            // The job was canceled during submit: nobody needs the task just placed, cancel it.
-            await adapter.cancel(upstreamJobId).catch(() => undefined);
-            return { done: true as const };
-          }
-          return { upstreamJobId };
+          return await record(upstreamJobId);
         } catch (error) {
+          // A late error from an attempt another one already got past must not fail or refund the job.
+          const latest = await activeJob(deps.db, jobId);
+          if (!latest) return { done: true as const };
+          const recorded = upstreamIds(latest)[index];
+          if (recorded) return { upstreamJobId: recorded };
           if (error instanceof UpstreamError && !error.retryable && index < prepCount) {
             // Prep rejected (e.g. a celebrity photo): don't fail, record a placeholder and fall back to the original photo.
             deps.log?.('prep rejected, using original photo', { jobId, part: partId, code: error.code });
-            const skipped = `${SKIPPED}${partId}`;
-            if (!(await appendUpstreamJob(deps.db, jobId, index, skipped))) return { done: true as const };
-            return { upstreamJobId: skipped };
+            return await record(`${SKIPPED}${partId}`);
           }
           if (error instanceof UpstreamError && !error.retryable) {
             deps.log?.('upstream rejected job', {

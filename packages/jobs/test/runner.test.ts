@@ -269,6 +269,40 @@ describe('generation jobs', () => {
     expect((await getBalance(db, userId)).available).toBe(50);
   });
 
+  it('a late rejection from one submit attempt does not fail a job another attempt already submitted', async () => {
+    const { userId, jobId } = await paidJob();
+    const adapter = new FakeAdapter();
+    adapter.polls = [{ state: 'succeeded', files: [{ url: 'https://up/x.png', mediaType: 'image/png' }] }];
+    adapter.submitError = new UpstreamError('YIR_INVALID_REQUEST', 'late', false);
+    const real = adapter.submit.bind(adapter);
+    adapter.submit = async (input, key) => {
+      // Another attempt got through and recorded its task before this one's error came back.
+      await markSubmitted(db, jobId, 'up_real');
+      return real(input, key);
+    };
+    await runGeneration(deps(adapter), jobId, immediateSteps());
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded', upstreamJobId: 'up_real' });
+    expect((await getBalance(db, userId)).available).toBe(40);
+  });
+
+  it('a submit replayed past the deadline recovers the task an earlier attempt may have placed, then cancels it', async () => {
+    const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
+    const adapter = new FakeAdapter();
+    const names: string[] = [];
+    const replay: StepRunner = {
+      do: (name, fn) => {
+        names.push(name);
+        return fn({ attempt: name === 'submit' ? 2 : 1 });
+      },
+      sleep: async () => {},
+    };
+    await runGeneration(deps(adapter), jobId, replay);
+    expect(adapter.submits.map((s) => s.key)).toEqual([jobId]);
+    expect(adapter.cancelled).toEqual([`up_${jobId}`]);
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'failed', errorCode: 'timeout' });
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
   it('a job already past its deadline is failed and refunded without being submitted', async () => {
     const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
     const adapter = new FakeAdapter();
