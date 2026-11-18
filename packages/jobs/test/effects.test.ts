@@ -2249,6 +2249,74 @@ describe('prep and reference audio', () => {
     expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
   });
 
+  it('prep copies run one at a time and a failure logs its reason', async () => {
+    const twoPrep: ModelDefinition = {
+      ...prepModel,
+      maxCost: '0.96',
+      effect: {
+        ...prepModel.effect!,
+        slots: prepModel.effect!.slots.map((slot) => ({ ...slot, prep: `${slot.id} outfit` })),
+      },
+    };
+    const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
+    const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
+    const parts = effectParts(
+      twoPrep,
+      { left: '/files/uploads/up_a.png', right: '/files/uploads/up_b.png' },
+      upload,
+      asset,
+    )!;
+    await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
+    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
+      db.insert(jobs).values({
+        id: jobId,
+        userId,
+        modelId: 'demo-prep',
+        kind: 'video',
+        prompt: '',
+        inputJson: JSON.stringify({ parts }),
+        costCredits: 10,
+        upstream: 'yir',
+      }),
+    ]);
+    const adapter = new FakeAdapter();
+    adapter.polls.set(`up_${jobId}:prep-left`, [image('https://up/left-prep.png')]);
+    adapter.polls.set(`up_${jobId}:prep-right`, [image('https://up/right-prep.png')]);
+    adapter.polls.set(`up_${jobId}:left`, [succeeded('left')]);
+    adapter.polls.set(`up_${jobId}:right`, [succeeded('right')]);
+    adapter.polls.set(`up_${jobId}:group`, [succeeded('group')]);
+    let open = 0;
+    let most = 0;
+    const fetcher: typeof fetch = async (input) => {
+      if (!String(input).includes('-prep')) return outputFetcher(input);
+      most = Math.max(most, ++open);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      open--;
+      return String(input).includes('right-prep')
+        ? new Response('gone', { status: 403 })
+        : new Response(new Uint8Array([1, 2, 3]), { headers: { 'content-type': 'image/png' } });
+    };
+    const logs: [string, Record<string, unknown>][] = [];
+    await runGeneration(
+      {
+        ...deps(adapter),
+        models: defineModels([twoPrep]),
+        fetcher,
+        log: (message, data) => logs.push([message, data]),
+      },
+      jobId,
+      durableSteps(),
+    );
+    expect(most).toBe(1);
+    expect((await env.OUTPUTS.get(`jobs/${jobId}/kept/prep-left.png`))?.size).toBe(3);
+    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-right.png`)).toBeNull();
+    expect(logs.find(([message]) => message === 'prep copy failed')?.[1]).toEqual({
+      jobId,
+      failed: [{ part: 'prep-right', error: 'Error: download failed: 403' }],
+    });
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+  });
+
   it('a batch that ends early still keeps the prep images that came back before it ended', async () => {
     // left and right both have prep; left comes back, right fails while the user cancels, so its fallback ends the loop early.
     const twoPrep: ModelDefinition = {

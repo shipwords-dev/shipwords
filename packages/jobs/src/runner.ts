@@ -76,8 +76,8 @@ const POLL_WAIT_SECONDS = 20;
 const POLL_PAUSE_MS = 3_000;
 /** Prep images usually finish in about 35 s; one still running past this gets a second copy, and whichever finishes first is used. */
 export const PREP_HEDGE_MS = 60_000;
-/** Longest a kept prep image copy (keep:<from>) may take; it is only for looking back, never worth holding a job up. */
-export const KEEP_TIMEOUT_MS = 20_000;
+/** Longest one batch of kept prep image copies (keep:<from>) may take altogether; they are only for looking back, never worth holding a job up. */
+export const KEEP_TIMEOUT_MS = 30_000;
 /** File extension of a kept prep image (keep:<from>) by media type; anything else is stored as .png. */
 const PREP_EXTENSIONS: Readonly<Record<string, string>> = {
   'image/png': 'png',
@@ -509,36 +509,44 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
 
   /**
    * Keep a copy of each prep image the upstream returned (sheets are already stored as crops) at jobs/<id>/kept/<part>.<ext>, to look back
-   * at what the video model got after the upstream URL expires; /files never serves that folder. One step per batch, copies in parallel,
-   * each within KEEP_TIMEOUT_MS. Best effort: the step never throws or hangs, so it never retries, and a step failure is only logged, so a
-   * copy never holds up the video segments beyond the timeout or fails the job.
+   * at what the video model got after the upstream URL expires; /files never serves that folder. One step per batch, all copies within
+   * KEEP_TIMEOUT_MS. Copies run one at a time, each buffered before the write, like the describe and sheet downloads that work in
+   * production: ten parallel download-to-R2 streams all failed there (2026-11-18) for a reason the log did not keep, so each failure now
+   * logs its error. Best effort: the step never throws or hangs, so it never retries, and a step failure is only logged, so a copy never
+   * holds up the video segments beyond the timeout or fails the job.
    */
   const keepPreps = (from: number, kept: readonly { partId: string; url: string; mediaType: string }[]) =>
     step
       .do(`keep:${from}`, async () => {
-        const copy = async ({ partId, url, mediaType }: (typeof kept)[number]) => {
+        const deadline = Date.now() + KEEP_TIMEOUT_MS;
+        const copy = async ({ partId, url, mediaType }: (typeof kept)[number], ms: number) => {
           const key = `jobs/${jobId}/kept/${partId}.${PREP_EXTENSIONS[mediaType] ?? 'png'}`;
           if (await deps.bucket.head(key)) return;
-          const response = await (deps.fetcher ?? fetch)(url, {
-            signal: AbortSignal.timeout(KEEP_TIMEOUT_MS),
-          });
-          if (!response.ok || !response.body)
-            throw new Error(`download ${partId} failed: ${response.status}`);
-          await deps.bucket.put(key, response.body, { httpMetadata: { contentType: mediaType } });
+          const response = await (deps.fetcher ?? fetch)(url, { signal: AbortSignal.timeout(ms) });
+          if (!response.ok) throw new Error(`download failed: ${response.status}`);
+          const image = await response.arrayBuffer();
+          await deps.bucket.put(key, image, { httpMetadata: { contentType: mediaType } });
         };
-        const results = await Promise.allSettled(
-          kept.map((image) => {
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            const timeout = new Promise<never>((_, reject) => {
-              timer = setTimeout(() => reject(new Error('copy timed out')), KEEP_TIMEOUT_MS);
-            });
-            return Promise.race([copy(image), timeout]).finally(() => clearTimeout(timer));
-          }),
-        );
-        const failed = results.flatMap((result, i) =>
-          result.status === 'rejected' ? [kept[i]!.partId] : [],
-        );
-        if (failed.length) deps.log?.('prep copy failed', { jobId, parts: failed });
+        const failed: { part: string; error: string }[] = [];
+        for (const image of kept) {
+          const ms = deadline - Date.now();
+          if (ms <= 0) {
+            failed.push({ part: image.partId, error: 'out of time' });
+            continue;
+          }
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('copy timed out')), ms);
+          });
+          try {
+            await Promise.race([copy(image, ms), timeout]);
+          } catch (error) {
+            failed.push({ part: image.partId, error: String(error) });
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+        if (failed.length) deps.log?.('prep copy failed', { jobId, failed });
         return failed.length === 0;
       })
       .catch((error: unknown) => {
