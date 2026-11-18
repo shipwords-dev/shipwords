@@ -20,7 +20,6 @@
     "drizzle-orm": "0.45.4"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20261027.1",
     "@electric-sql/pglite": "0.5.16",
     "@types/node": "26.6.6",
     "@types/pg": "8.23.1",
@@ -29,8 +28,7 @@
     "pg": "8.23.1",
     "react": "19.3.1",
     "typescript": "6.0.3",
-    "vitest": "4.1.12",
-    "wrangler": "4.153.0"
+    "vitest": "4.1.12"
   },
   "peerDependencies": {
     "react": "^19.0.0"
