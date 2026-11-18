@@ -9,6 +9,10 @@
 
 A [Yir API key](https://yir.ai/?utm_source=shipwords&utm_medium=docs) (`YIR_API_KEY`) is only needed for real generations; see the mock upstream below.
 
+## Lock and concurrency tests
+
+Unit tests run on in-memory PGlite and need nothing. `pnpm --filter @shipwords/core --filter @shipwords/jobs test:pg` checks row locks and races against a real Postgres and is skipped unless `TEST_DATABASE_URL` is set. Point it at any Postgres 17 where the role may create databases (`CREATEDB`, no superuser needed); each test file creates its own database and drops it. Keep the URL in a file outside the repo and load it before running, e.g. `set -a; . ~/.config/shipwords/test.env; set +a`.
+
 ## Running a site
 
 ```bash

@@ -5,8 +5,8 @@ import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { Client, Pool } from 'pg';
 
 // Lock behavior needs a real server: PGlite has one connection, so its transactions queue instead of contending.
-// TEST_DATABASE_URL points at a disposable server (e.g. docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:55433:5432 postgres:17-alpine
-// gives postgres://postgres@127.0.0.1:55433/postgres). Each file gets its own database, dropped afterwards.
+// TEST_DATABASE_URL points at a server where this role may create databases (locally: the shared Postgres, see docs/local-development.md;
+// in CI: a service container). Each file gets its own database, dropped afterwards.
 
 export const adminUrl = process.env.TEST_DATABASE_URL;
 
@@ -19,7 +19,7 @@ export async function freshDatabase(): Promise<{ db: Db; close: () => Promise<vo
   await admin.end();
   const url = new URL(adminUrl);
   url.pathname = `/${name}`;
-  const pool = new Pool({ connectionString: url.toString(), max: 40 });
+  const pool = new Pool({ connectionString: url.toString(), max: 20 });
   const db = drizzle({ client: pool, schema });
   await migrate(db, { migrationsFolder: fileURLToPath(new URL('../test/migrations', import.meta.url)) });
   return {
