@@ -110,15 +110,15 @@ Estimated size: about 300 lines for the loop and step runner.
 
 ## 5. Site app and template
 
-- `vite.config.ts` drops `@cloudflare/vite-plugin` and builds for Node.
-- `src/server.ts` keeps its fetch handler (Rybbit proxy, then TanStack Start) and also starts the worker loop; `defineGenerationWorkflow` becomes `startJobWorker(models, site)`.
+- `vite.config.ts` drops `@cloudflare/vite-plugin` and adds no platform plugin. The build writes `dist/client` and `dist/server/server.js`, whose default export is the site's own `src/server.ts` handler; `srvx --prod -s ../client dist/server/server.js` serves it (srvx becomes a direct dependency). Nitro is not needed.
+- `src/server.ts` keeps its fetch handler (Rybbit proxy, then TanStack Start) and also starts the worker loop; `defineGenerationWorkflow` becomes `startJobWorker(models, site)`. srvx calls `fetch(request)` without an `env`, so the handler reads config from the validated process env.
 - `wrangler.jsonc`, `worker-configuration.d.ts` and `wrangler types` go. The template gains a `Dockerfile`, an example `compose.yaml` (site, Postgres, compose service) and `.env.example`.
 - Scripts: `start`, `db:migrate`; `deploy` and `deploy:preview` are removed.
-- Static files and sample videos are served by the Node server or the reverse proxy, which answer byte ranges on their own.
+- Static files and sample videos are served by srvx's static handler or the reverse proxy; srvx answered a `Range` request with 206 in the spike.
 
 ## 6. Tests
 
-- Vitest runs in Node. Each test file gets a fresh in-memory PGlite with migrations applied (`drizzle-orm/pglite/migrator`) and a temp-directory object store. No ports and no shared database, so parallel worktrees still don't interfere.
+- Vitest runs in Node. Each test file gets a fresh in-memory PGlite with migrations applied (`drizzle-orm/pglite/migrator`) and a temp-directory object store. No ports and no shared database, so parallel worktrees still don't interfere. Starting PGlite and migrating took about 1.2 s in the spike, so tests share one instance per file and clear tables between tests rather than start one per test.
 - PGlite is a single connection: transactions queue, they do not contend. Lock behavior needs a real server, so a second suite (`pnpm test:pg`) runs against Postgres for: concurrent debits on one user, the `SKIP LOCKED` claim with two workers, lease expiry and takeover, lost-lease writes being refused. CI runs it with a Postgres service container; locally it needs Docker and is skipped without `TEST_DATABASE_URL`.
 - The 12 test files that import workerd modules, and the two migration helpers, move to the new setup. Existing money tests (duplicates, out-of-order events, partial failures) are kept and must pass unchanged in meaning.
 - New engine tests: replay after a crash at every step boundary of a mock job, retry backoff, shutdown mid-step, poison run, duplicate dispatch.
@@ -132,7 +132,7 @@ Estimated size: about 300 lines for the loop and step runner.
 
 ## Order of work
 
-1. **Spikes** (below). Stop and revise this note if one fails.
+1. **Spikes** (below): three passed; the email send is pending.
 2. **Database:** schema, `createDb`, ledger and lifecycle transactions, test setup on PGlite, `test:pg`. Gate: `core` and `jobs` checks green, independent review of the money paths.
 3. **Job runs:** tables, loop, step runner, dispatch in `handlers.ts`. Gate: engine tests above.
 4. **Interfaces:** object store, mailer, describe, compose over HTTP.
@@ -142,12 +142,14 @@ Estimated size: about 300 lines for the loop and step runner.
 
 The generation release gate in `AGENTS.md` applies at step 7: actual site configuration through real request construction and SDK validation, and the first 5 live results looked at by a person.
 
-## To verify first
+## Spikes (2026-11-18)
 
-1. **TanStack Start on Node with a custom server entry.** The hosting guide documents the Node build through `nitro/vite` (`node .output/server/index.mjs`) and calls that plugin "under active development"; it does not say whether a custom `src/server.ts` fetch handler is kept on that path. Fallback: serve the built fetch handler with `srvx`, which is already in the lockfile (1.0.8).
-2. **PGlite with this schema:** migrator, `db.transaction`, and the Better Auth Drizzle adapter with `provider: 'pg'`.
-3. **Cloudflare Email Service REST API** from outside Workers with an existing sending domain. The product is in beta.
-4. **Vite build without the Cloudflare plugin:** Paraglide output, server-only modules (`*.server.ts`) staying out of the client bundle, and `check-site`'s boundary check still seeing the same thing.
+Run in a worktree of this branch with throwaway code, not committed.
+
+1. **Node build with the custom server entry: passed.** The template built with the Cloudflare plugin removed and `cloudflare:workers` aliased to a stub. `dist/server/server.js` exports the template's own handler (the Rybbit proxy is in it). Called from Node, `/` and `/terms` rendered 200 and `/robots.txt` served; under srvx, static files and a `Range` request (206) worked. The only failure was the handler reading `env` that srvx does not pass, covered in §5.
+2. **PGlite: passed.** On a pg-core version of the Better Auth tables and `credit_accounts`, with `@electric-sql/pglite` 0.5.16 and drizzle-orm 0.45.4: drizzle-kit generated a Postgres migration and the PGlite migrator applied it; a transaction with `SELECT … FOR UPDATE` committed; a CHECK violation rolled back the whole transaction and surfaced SQLSTATE `23514`, a duplicate key `23505`; `.returning()` gave the row count of conditional updates; `greatest(x - 1, 0)` worked; bigint millisecond defaults came back as numbers. Better Auth 1.7.14 with `provider: 'pg'` ran an email OTP sign-in through `auth.handler`, returned a session with `Date` timestamps and wrote its database rate limit rows.
+3. **Cloudflare Email Service REST API: not yet sent.** The endpoint exists (an unauthenticated call returns `Authentication error`). Sending needs an API token with email sending permission, which is a new credential, and the test sends a real email; both wait for the owner.
+4. **Browser boundary: passed.** `check-site` (required routes, policy pages, server-only text in `dist/client`, cross-site imports) passed on the Node build output.
 
 ## Open decisions
 
