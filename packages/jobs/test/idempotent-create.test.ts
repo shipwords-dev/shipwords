@@ -1,6 +1,4 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import type { Core } from '@shipwords/core/server';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
@@ -8,8 +6,8 @@ import { createJobs } from '../src/handlers';
 import { loadJob, markFailed } from '../src/lifecycle';
 import type { ModelDefinition } from '../src/models';
 import { jobs } from '../src/schema';
+import { db } from './db';
 
-const db = createDb(env.DB);
 const model: ModelDefinition = {
   id: 'preview',
   name: 'Preview',
@@ -140,7 +138,11 @@ describe('idempotent server job creation', () => {
     const ctx = await setup();
     ctx.unavailable(true);
     await ctx.create();
-    const row = await db.select().from(jobs).where(eq(jobs.userId, ctx.userId)).get();
+    const row = await db
+      .select()
+      .from(jobs)
+      .where(eq(jobs.userId, ctx.userId))
+      .then((rows) => rows[0]);
     await db
       .update(jobs)
       .set({ createdAt: Date.now() - 11 * 60_000 })

@@ -5,6 +5,7 @@ import { consumeQuota, dayWindow, releaseQuota } from '@shipwords/core/quota/cou
 import { ensureGuestId, readGuestId } from '@shipwords/core/quota/guest';
 import type { Core } from '@shipwords/core/server';
 import { and, desc, eq, isNull } from 'drizzle-orm';
+import { createAdapters, type JobsEnv } from './adapters';
 import { imageSize } from './image-size';
 import {
   cancelAll,
@@ -28,7 +29,6 @@ import {
 } from './models';
 import { r2Response } from './r2-range';
 import { type JobRow, jobs } from './schema';
-import { createAdapters, type JobsEnv } from './workflow';
 
 const MAX_PROMPT = 4000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -239,12 +239,12 @@ export function createJobs(core: Core, models: readonly ModelDefinition[]) {
           upstream: model.upstream,
         };
         try {
-          // Charge and job creation share one batch: either both happen or neither does.
+          // Charge and job creation share one transaction: either both happen or neither does.
           if (cost > 0) {
             await spendCredits(
               core.db,
               { userId: user.id, amount: cost, idemKey: spendKey(jobId), ref: jobId },
-              [core.db.insert(jobs).values(row)],
+              (tx) => tx.insert(jobs).values(row),
             );
           } else {
             if (options) await core.db.insert(jobs).values(row).onConflictDoNothing();

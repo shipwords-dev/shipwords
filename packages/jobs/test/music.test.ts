@@ -1,6 +1,4 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import { user } from '@shipwords/core/db/schema';
 import type { Core } from '@shipwords/core/server';
 import { describe, expect, it } from 'vitest';
@@ -12,9 +10,10 @@ import { emailOnFinish } from '../src/notify';
 import { runGeneration, type StepRunner } from '../src/runner';
 import type { PollResult, SubmitInput, UpstreamAdapter } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
+import { bucket } from './bucket';
+import { db } from './db';
 import { id3v2 } from './id3';
 
-const db = createDb(env.DB);
 const BASE = 'https://music.test';
 
 const song: ModelDefinition = {
@@ -178,7 +177,7 @@ describe('running a music job', () => {
   }
   const deps = (adapter: FakeAdapter) => ({
     db,
-    bucket: env.OUTPUTS,
+    bucket: bucket,
     models,
     adapters: { yir: adapter },
     fetcher: mp3Fetcher,
@@ -216,7 +215,7 @@ describe('running a music job', () => {
       { key: `jobs/${job.id}/0.mp3`, mediaType: 'audio/mpeg' },
       { key: `jobs/${job.id}/1.mp3`, mediaType: 'audio/mpeg' },
     ]);
-    expect(await env.OUTPUTS.get(`jobs/${job.id}/1.mp3`)).not.toBeNull();
+    expect(await bucket.get(`jobs/${job.id}/1.mp3`)).not.toBeNull();
     expect((await getBalance(db, userId)).available).toBe(2);
 
     // A replayed Workflow neither resubmits nor charges again.
@@ -234,7 +233,7 @@ describe('running a music job', () => {
     const fetcher: typeof fetch = async () =>
       new Response(tagged, { headers: { 'content-type': 'audio/mpeg' } });
     await runGeneration({ ...deps(adapter), fetcher }, job.id, steps);
-    const stored = await env.OUTPUTS.get(`jobs/${job.id}/0.mp3`);
+    const stored = await bucket.get(`jobs/${job.id}/0.mp3`);
     expect([...new Uint8Array(await stored!.arrayBuffer())]).toEqual([0xff, 0xfb, 0x90, 0x64]);
   });
 

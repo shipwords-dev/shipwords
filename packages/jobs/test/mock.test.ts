@@ -1,15 +1,13 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits, spendCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import { describe, expect, it } from 'vitest';
+import { createAdapters, type JobsEnv } from '../src/adapters';
 import { loadJob, spendKey } from '../src/lifecycle';
 import { MockAdapter, mockComposer, mockMode } from '../src/mock';
 import { defineModels, effectParts, type ModelDefinition } from '../src/models';
 import { runGeneration, type StepRunner } from '../src/runner';
 import { jobs } from '../src/schema';
-import { createAdapters, type JobsEnv } from '../src/workflow';
-
-const db = createDb(env.DB);
+import { bucket } from './bucket';
+import { db } from './db';
 
 const model: ModelDefinition = {
   id: 'mock-demo',
@@ -88,8 +86,8 @@ async function mockJob(slots: Record<string, string>) {
     (key) => `http://localhost:5464/files/${key}`,
   )!;
   await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-  await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-    db.insert(jobs).values({
+  await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+    tx.insert(jobs).values({
       id: jobId,
       userId,
       modelId: 'mock-demo',
@@ -99,7 +97,7 @@ async function mockJob(slots: Record<string, string>) {
       costCredits: 10,
       upstream: 'yir',
     }),
-  ]);
+  );
   return { userId, jobId };
 }
 
@@ -196,10 +194,10 @@ describe('mock runs a full effect job', () => {
     await runGeneration(
       {
         db,
-        bucket: env.OUTPUTS,
+        bucket: bucket,
         models,
         adapters: { yir: adapter },
-        composer: mockComposer(env.OUTPUTS),
+        composer: mockComposer(bucket),
         fetcher: recordingFetcher(fetched),
       },
       jobId,
@@ -215,22 +213,22 @@ describe('mock runs a full effect job', () => {
     ]);
     const outputs = JSON.parse(job!.outputsJson!) as { key: string }[];
     expect(outputs).toHaveLength(2);
-    const song = await env.OUTPUTS.get(outputs[0]!.key);
+    const song = await bucket.get(outputs[0]!.key);
     expect(await song!.text()).toBe('http://localhost:5464/files/assets/demo/right.mp4');
     expect((await getBalance(db, userId)).available).toBe(40);
   });
 
   it('fixed result: every job returns the same finished video and never echoes inputs', async () => {
-    await env.OUTPUTS.put('assets/demo/result.mp4', 'fixed-song');
-    await env.OUTPUTS.put('assets/demo/result-silent.mp4', 'fixed-silent');
+    await bucket.put('assets/demo/result.mp4', 'fixed-song');
+    await bucket.put('assets/demo/result-silent.mp4', 'fixed-silent');
     const { jobId } = await mockJob({ right: '/files/uploads/up_a.png' });
     await runGeneration(
       {
         db,
-        bucket: env.OUTPUTS,
+        bucket: bucket,
         models,
         adapters: { yir: new MockAdapter('succeed', { image: 0, video: 0 }) },
-        composer: mockComposer(env.OUTPUTS, {
+        composer: mockComposer(bucket, {
           song: 'assets/demo/result.mp4',
           silent: 'assets/demo/result-silent.mp4',
         }),
@@ -242,8 +240,8 @@ describe('mock runs a full effect job', () => {
     const job = await loadJob(db, jobId);
     expect(job?.status).toBe('succeeded');
     const [song, silent] = JSON.parse(job!.outputsJson!) as { key: string }[];
-    expect(await (await env.OUTPUTS.get(song!.key))!.text()).toBe('fixed-song');
-    expect(await (await env.OUTPUTS.get(silent!.key))!.text()).toBe('fixed-silent');
+    expect(await (await bucket.get(song!.key))!.text()).toBe('fixed-song');
+    expect(await (await bucket.get(silent!.key))!.text()).toBe('fixed-silent');
   });
 
   it('fail mode: whole job fails with a full refund', async () => {
@@ -254,10 +252,10 @@ describe('mock runs a full effect job', () => {
     await runGeneration(
       {
         db,
-        bucket: env.OUTPUTS,
+        bucket: bucket,
         models,
         adapters: { yir: new MockAdapter('fail', { image: 0, video: 0 }) },
-        composer: mockComposer(env.OUTPUTS),
+        composer: mockComposer(bucket),
         fetcher: recordingFetcher([]),
       },
       jobId,

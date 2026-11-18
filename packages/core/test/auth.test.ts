@@ -1,11 +1,8 @@
-import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { createAuth } from '../src/auth/server';
-import { createDb } from '../src/db/client';
 import type { CoreEnv } from '../src/env';
 import { defineSite } from '../src/site';
-
-const db = createDb(env.DB);
+import { db } from './db';
 
 const site = defineSite({
   id: 'test',

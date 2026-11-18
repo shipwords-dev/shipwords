@@ -1,13 +1,13 @@
-import { sql } from 'drizzle-orm';
-import { index, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { nowMs } from '@shipwords/core/db/schema';
+import { bigint, boolean, index, integer, pgTable, text } from 'drizzle-orm/pg-core';
 
-const now = sql`(cast(unixepoch('subsec') * 1000 as integer))`;
+const ms = (name: string) => bigint(name, { mode: 'number' });
 
 /**
  * Generation jobs. State only moves forward: queued → submitted → succeeded | failed | canceled;
  * every state change is a conditional UPDATE, so a finished job can never be moved to another state.
  */
-export const jobs = sqliteTable(
+export const jobs = pgTable(
   'jobs',
   {
     id: text('id').primaryKey(),
@@ -21,7 +21,7 @@ export const jobs = sqliteTable(
     costCredits: integer('cost_credits').notNull().default(0),
     /** Guest quota counting rule, used to return quota on failure. */
     quotaJson: text('quota_json'),
-    quotaReleased: integer('quota_released', { mode: 'boolean' }).notNull().default(false),
+    quotaReleased: boolean('quota_released').notNull().default(false),
     status: text('status', { enum: ['queued', 'submitted', 'succeeded', 'failed', 'canceled'] })
       .notNull()
       .default('queued'),
@@ -33,9 +33,9 @@ export const jobs = sqliteTable(
     errorMessage: text('error_message'),
     /** R2 key and content type of the output. */
     outputsJson: text('outputs_json'),
-    createdAt: integer('created_at', { mode: 'number' }).notNull().default(now),
-    submittedAt: integer('submitted_at', { mode: 'number' }),
-    finishedAt: integer('finished_at', { mode: 'number' }),
+    createdAt: ms('created_at').notNull().default(nowMs),
+    submittedAt: ms('submitted_at'),
+    finishedAt: ms('finished_at'),
   },
   (t) => [
     index('jobs_user_idx').on(t.userId, t.createdAt),

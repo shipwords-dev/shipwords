@@ -67,7 +67,7 @@ export function createCore(site: SiteConfig, options: { log?: Logger } = {}) {
   function context() {
     if (cached) return cached;
     const env = workerEnv as unknown as CoreEnv;
-    const db = createDb(env.DB);
+    const db = createDb(required(env, 'DATABASE_URL'));
     const baseURL = (env.APP_URL ?? site.url).replace(/\/$/, '');
     const auth = createAuth({ db, env, site, baseURL, log });
     const getUser = async (request: Request): Promise<SessionUser | null> => {

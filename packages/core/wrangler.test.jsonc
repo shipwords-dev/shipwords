@@ -1,8 +1,0 @@
-// Test-only config for vitest-pool-workers; never deployed.
-{
-  "name": "shipwords-core-test",
-  "main": "test/worker.ts",
-  "compatibility_date": "2026-10-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "d1_databases": [{ "binding": "DB", "database_name": "test", "database_id": "local" }]
-}

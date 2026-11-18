@@ -108,7 +108,7 @@ export function createAuth(deps: AuthDeps) {
     // Email change links are signed with the secret and sign the user in; we only use email OTP and Google, so the route stays off.
     disabledPaths: ['/verify-email'],
     database: drizzleAdapter(db, {
-      provider: 'sqlite',
+      provider: 'pg',
       schema: {
         user: schema.user,
         session: schema.session,

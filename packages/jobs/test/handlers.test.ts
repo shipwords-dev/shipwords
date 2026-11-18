@@ -1,6 +1,4 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import type { Core } from '@shipwords/core/server';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
@@ -8,10 +6,11 @@ import { createJobs } from '../src/handlers';
 import { loadJob, markFailed, markSucceeded } from '../src/lifecycle';
 import type { ModelDefinition } from '../src/models';
 import { jobs } from '../src/schema';
+import { bucket } from './bucket';
+import { db } from './db';
 
 // Money paths of the plain (non-idempotent) create, cancel and stale healing. Idempotent create: idempotent-create.test.ts.
 
-const db = createDb(env.DB);
 const model: ModelDefinition = {
   id: 'paid',
   name: 'Paid',
@@ -38,7 +37,7 @@ async function setup(balance = 10) {
       log: () => {},
       env: {
         GUEST_COOKIE_SECRET: 'test-secret',
-        OUTPUTS: env.OUTPUTS,
+        OUTPUTS: bucket,
         GENERATION_WORKFLOW: {
           create: async ({ id }: { id: string }) => {
             if (dispatchFails) throw new Error('dispatch error');
@@ -73,7 +72,7 @@ describe('GET /files', () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
     const key = `jobs/${jobId}/prep-backLeft-3.png`;
-    await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    await bucket.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
     expect((await ctx.file(key)).status).toBe(404);
     await db.update(jobs).set({ status: 'submitted' }).where(eq(jobs.id, jobId));
     const response = await ctx.file(key);
@@ -88,7 +87,7 @@ describe('GET /files', () => {
     const jobId = await createdId(await ctx.create());
     const keys = [`jobs/${jobId}/kept/prep-left-0.png`, `jobs/${jobId}/kept/uploads/up_a.png`];
     for (const key of keys)
-      await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+      await bucket.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
     for (const status of ['queued', 'submitted', 'succeeded'] as const) {
       await db.update(jobs).set({ status }).where(eq(jobs.id, jobId));
       for (const key of keys) expect((await ctx.file(key)).status).toBe(404);
@@ -96,7 +95,7 @@ describe('GET /files', () => {
   });
   it('serves uploads uncached, so no copy outlives the lifecycle deletion; outputs stay cacheable', async () => {
     const ctx = await setup();
-    await env.OUTPUTS.put('uploads/up_cachetest.png', new Uint8Array([1]), {
+    await bucket.put('uploads/up_cachetest.png', new Uint8Array([1]), {
       httpMetadata: { contentType: 'image/png' },
     });
     const upload = await ctx.file('uploads/up_cachetest.png');
@@ -105,7 +104,7 @@ describe('GET /files', () => {
     await upload.arrayBuffer();
     const jobId = await createdId(await ctx.create());
     const output = `jobs/${jobId}/0.mp4`;
-    await env.OUTPUTS.put(output, new Uint8Array([1]), { httpMetadata: { contentType: 'video/mp4' } });
+    await bucket.put(output, new Uint8Array([1]), { httpMetadata: { contentType: 'video/mp4' } });
     await markSucceeded(db, jobId, [{ key: output, mediaType: 'video/mp4' }]);
     const served = await ctx.file(output);
     expect(served.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
@@ -116,7 +115,7 @@ describe('GET /files', () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
     const replaced = `jobs/${jobId}/0-r1794301409744.mp4`;
-    await env.OUTPUTS.put(replaced, new Uint8Array([1, 2, 3]), {
+    await bucket.put(replaced, new Uint8Array([1, 2, 3]), {
       httpMetadata: { contentType: 'video/mp4' },
     });
     expect((await ctx.file(replaced)).status).toBe(404);

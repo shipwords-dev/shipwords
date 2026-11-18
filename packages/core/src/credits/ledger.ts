@@ -1,17 +1,16 @@
 import { and, asc, eq, gt, isNull, or, sql } from 'drizzle-orm';
-import { type BatchItem, type Db, isConstraintError, newId } from '../db/client';
+import { type Db, isConstraintError, isRetryableTransactionError, newId, type Tx } from '../db/client';
 import { creditAccounts, creditAllocations, creditLedger, creditLots } from '../db/schema';
 
 // The only write entry points for the credit ledger. Rules:
 // - One idempotency key per operation; if the key exists, treat it as done and return applied=false;
-// - All writes of an operation (including caller-supplied extra) go into one D1 batch;
-// - Per-user optimistic lock: read the account version, then the lots; the batch checks the version is unchanged and increments it.
-//   If any other ledger operation for the same user slips in between read and write, the whole batch fails and is re-read and retried.
-//   CHECK constraints (remaining and debt non-negative) are the backstop.
+// - Every write of an operation, including the caller's `extra` writes, runs in one transaction;
+// - The transaction first locks the user's credit_accounts row (SELECT … FOR UPDATE), so one user's ledger operations run one at a time
+//   and each reads lots and debt after the previous one committed. The idempotency check runs under the same lock.
+//   CHECK constraints (remaining and debt non-negative) and the unique idempotency key are the backstop.
 
-const MAX_ATTEMPTS = 8;
-/** On version mismatch, sets debt to a value that must violate CHECK so the whole batch rolls back. */
-const VERSION_CONFLICT = 1_000_000_000_000;
+/** Deadlocks and serialization failures roll the whole transaction back; it is safe to run again. */
+const MAX_ATTEMPTS = 3;
 
 export class InsufficientCreditsError extends Error {
   constructor(
@@ -29,6 +28,9 @@ export interface LedgerResult {
   ledgerId: string | null;
 }
 
+/** Writes that must commit together with a ledger operation (e.g. the job row a charge pays for). Runs last, in the same transaction. */
+export type ExtraWrites = (tx: Tx) => Promise<unknown>;
+
 interface ActiveLot {
   id: string;
   remaining: number;
@@ -40,54 +42,45 @@ function assertPositiveInt(amount: number) {
     throw new Error(`credit amount must be a positive integer: ${amount}`);
 }
 
-async function activeLots(db: Db, userId: string, now: number): Promise<ActiveLot[]> {
-  return (
-    db
-      .select({ id: creditLots.id, remaining: creditLots.remaining, sourceRef: creditLots.sourceRef })
-      .from(creditLots)
-      .where(
-        and(
-          eq(creditLots.userId, userId),
-          gt(creditLots.remaining, 0),
-          or(isNull(creditLots.expiresAt), gt(creditLots.expiresAt, now)),
-        ),
-      )
-      // Earliest expiry first, never-expiring last (SQLite sorts NULL first by default, so handle it explicitly).
-      .orderBy(sql`${creditLots.expiresAt} is null`, asc(creditLots.expiresAt), asc(creditLots.createdAt))
+function activeLotsWhere(userId: string, now: number) {
+  return and(
+    eq(creditLots.userId, userId),
+    gt(creditLots.remaining, 0),
+    or(isNull(creditLots.expiresAt), gt(creditLots.expiresAt, now)),
   );
 }
 
-async function currentDebt(db: Db, userId: string): Promise<number> {
-  const row = await db.query.creditAccounts.findFirst({ where: eq(creditAccounts.userId, userId) });
-  return row?.debt ?? 0;
+async function activeLots(tx: Tx, userId: string, now: number): Promise<ActiveLot[]> {
+  return (
+    tx
+      .select({ id: creditLots.id, remaining: creditLots.remaining, sourceRef: creditLots.sourceRef })
+      .from(creditLots)
+      .where(activeLotsWhere(userId, now))
+      // Earliest expiry first, never-expiring last.
+      .orderBy(asc(creditLots.expiresAt), asc(creditLots.createdAt))
+  );
 }
 
-async function findLedger(db: Db, idemKey: string) {
-  return db.query.creditLedger.findFirst({ where: eq(creditLedger.idemKey, idemKey) });
+async function findLedger(db: Db | Tx, idemKey: string) {
+  const [row] = await db.select().from(creditLedger).where(eq(creditLedger.idemKey, idemKey)).limit(1);
+  return row ?? null;
 }
 
-interface AccountState {
-  debt: number;
-  version: number;
+/** Creates the user's account if missing and locks it until the transaction ends; returns the current debt. */
+async function lockAccount(tx: Tx, userId: string): Promise<number> {
+  await tx.insert(creditAccounts).values({ userId }).onConflictDoNothing();
+  const [row] = await tx
+    .select({ debt: creditAccounts.debt })
+    .from(creditAccounts)
+    .where(eq(creditAccounts.userId, userId))
+    .for('update');
+  return row!.debt;
 }
 
-/** Reads the account (creating it if missing); must be called before reading lots. */
-async function readAccount(db: Db, userId: string): Promise<AccountState> {
-  await db.insert(creditAccounts).values({ userId }).onConflictDoNothing();
-  const row = await db.query.creditAccounts.findFirst({ where: eq(creditAccounts.userId, userId) });
-  return { debt: row?.debt ?? 0, version: row?.version ?? 0 };
-}
-
-/** Checks the version is unchanged, increments it and updates debt. If the version changed, debt goes negative and CHECK rolls back the batch. */
-function commitAccount(db: Db, userId: string, account: AccountState, debtChange: number): BatchItem {
-  const conflict = sql`(case when ${creditAccounts.version} = ${account.version} then 0 else ${VERSION_CONFLICT} end)`;
-  return db
+async function changeDebt(tx: Tx, userId: string, debtChange: number) {
+  await tx
     .update(creditAccounts)
-    .set({
-      debt: sql`${creditAccounts.debt} + ${debtChange} - ${conflict}`,
-      version: sql`${creditAccounts.version} + 1`,
-      updatedAt: Date.now(),
-    })
+    .set({ debt: sql`${creditAccounts.debt} + ${debtChange}`, updatedAt: Date.now() })
     .where(eq(creditAccounts.userId, userId));
 }
 
@@ -104,23 +97,34 @@ function allocate(lots: ActiveLot[], amount: number): { lotId: string; amount: n
   return plan;
 }
 
+/**
+ * Runs one ledger operation for userId: lock the account, return applied=false if idemKey is already used, else `write` (which returns
+ * the new ledger ID) and then `extra`, all in one transaction. A unique violation on the idempotency key (the same key used for
+ * another user, or a race the lock can't see) also means already applied.
+ */
 async function runIdempotent(
   db: Db,
+  userId: string,
   idemKey: string,
-  build: () => Promise<{ ledgerId: string; items: BatchItem[] }>,
+  write: (tx: Tx, debt: number) => Promise<string>,
+  extra?: ExtraWrites,
 ): Promise<LedgerResult> {
   for (let attempt = 1; ; attempt++) {
-    const { ledgerId, items } = await build();
     try {
-      await db.batch(items as [BatchItem, ...BatchItem[]]);
-      return { applied: true, ledgerId };
+      return await db.transaction(async (tx) => {
+        const debt = await lockAccount(tx, userId);
+        const existing = await findLedger(tx, idemKey);
+        if (existing) return { applied: false, ledgerId: existing.id };
+        const ledgerId = await write(tx, debt);
+        if (extra) await extra(tx);
+        return { applied: true, ledgerId };
+      });
     } catch (error) {
-      if (isConstraintError(error, 'UNIQUE', 'credit_ledger.idem_key')) {
+      if (isConstraintError(error, 'UNIQUE', 'credit_ledger_idem_uq')) {
         const existing = await findLedger(db, idemKey);
         return { applied: false, ledgerId: existing?.id ?? null };
       }
-      if (isConstraintError(error, 'CHECK') && attempt < MAX_ATTEMPTS) {
-        // On conflict, wait briefly before re-reading so concurrent requests don't keep colliding.
+      if (isRetryableTransactionError(error) && attempt < MAX_ATTEMPTS) {
         await new Promise((resolve) => setTimeout(resolve, Math.random() * 20 * attempt));
         continue;
       }
@@ -141,18 +145,16 @@ export interface GrantInput {
 }
 
 /** Grants credits. If the user has debt, it's repaid first and only the rest becomes available. */
-export async function grantCredits(
-  db: Db,
-  input: GrantInput,
-  extra: BatchItem[] = [],
-): Promise<LedgerResult> {
+export async function grantCredits(db: Db, input: GrantInput, extra?: ExtraWrites): Promise<LedgerResult> {
   assertPositiveInt(input.amount);
-  return runIdempotent(db, input.idemKey, async () => {
-    const account = await readAccount(db, input.userId);
-    const debtPay = Math.min(account.debt, input.amount);
-    const ledgerId = newId('cl');
-    const items: BatchItem[] = [
-      db.insert(creditLedger).values({
+  return runIdempotent(
+    db,
+    input.userId,
+    input.idemKey,
+    async (tx, debt) => {
+      const debtPay = Math.min(debt, input.amount);
+      const ledgerId = newId('cl');
+      await tx.insert(creditLedger).values({
         id: ledgerId,
         userId: input.userId,
         kind: 'grant',
@@ -160,8 +162,8 @@ export async function grantCredits(
         debtDelta: -debtPay,
         idemKey: input.idemKey,
         ref: input.ref ?? input.sourceRef ?? null,
-      }),
-      db.insert(creditLots).values({
+      });
+      await tx.insert(creditLots).values({
         id: newId('lot'),
         userId: input.userId,
         source: input.source,
@@ -169,12 +171,12 @@ export async function grantCredits(
         amount: input.amount,
         remaining: input.amount - debtPay,
         expiresAt: input.expiresAt ?? null,
-      }),
-      commitAccount(db, input.userId, account, -debtPay),
-    ];
-    items.push(...extra);
-    return { ledgerId, items };
-  });
+      });
+      await changeDebt(tx, input.userId, -debtPay);
+      return ledgerId;
+    },
+    extra,
+  );
 }
 
 export interface SpendInput {
@@ -184,57 +186,41 @@ export interface SpendInput {
   ref?: string | null;
 }
 
-/** Charges credits, earliest-expiring lots first. Throws InsufficientCreditsError on low balance and writes nothing. */
-export async function spendCredits(
-  db: Db,
-  input: SpendInput,
-  extra: BatchItem[] = [],
-): Promise<LedgerResult> {
+/**
+ * Charges credits, earliest-expiring lots first. Throws InsufficientCreditsError on low balance and writes nothing.
+ * A repeated key returns applied=false without checking the balance, so a retry never reports insufficient credits.
+ */
+export async function spendCredits(db: Db, input: SpendInput, extra?: ExtraWrites): Promise<LedgerResult> {
   assertPositiveInt(input.amount);
-  return runIdempotent(db, input.idemKey, async () => {
-    const account = await readAccount(db, input.userId);
-    const debt = account.debt;
-    const lots = await activeLots(db, input.userId, Date.now());
-    const total = lots.reduce((sum, lot) => sum + lot.remaining, 0);
-    if (total - debt < input.amount) {
-      // A duplicate request with an already-used idempotency key shouldn't report insufficient balance.
-      const existing = await findLedger(db, input.idemKey);
-      if (existing) throw new AlreadyAppliedSignal(existing.id);
-      throw new InsufficientCreditsError(input.amount, Math.max(0, total - debt));
-    }
-    const ledgerId = newId('cl');
-    const items: BatchItem[] = [
-      commitAccount(db, input.userId, account, 0),
-      db.insert(creditLedger).values({
+  return runIdempotent(
+    db,
+    input.userId,
+    input.idemKey,
+    async (tx, debt) => {
+      const lots = await activeLots(tx, input.userId, Date.now());
+      const total = lots.reduce((sum, lot) => sum + lot.remaining, 0);
+      if (total - debt < input.amount)
+        throw new InsufficientCreditsError(input.amount, Math.max(0, total - debt));
+      const ledgerId = newId('cl');
+      await tx.insert(creditLedger).values({
         id: ledgerId,
         userId: input.userId,
         kind: 'spend',
         delta: -input.amount,
         idemKey: input.idemKey,
         ref: input.ref ?? null,
-      }),
-    ];
-    for (const part of allocate(lots, input.amount)) {
-      items.push(
-        db
+      });
+      for (const part of allocate(lots, input.amount)) {
+        await tx
           .update(creditLots)
           .set({ remaining: sql`${creditLots.remaining} - ${part.amount}` })
-          .where(eq(creditLots.id, part.lotId)),
-        db.insert(creditAllocations).values({ ledgerId, lotId: part.lotId, amount: part.amount }),
-      );
-    }
-    items.push(...extra);
-    return { ledgerId, items };
-  }).catch((error) => {
-    if (error instanceof AlreadyAppliedSignal) return { applied: false, ledgerId: error.ledgerId };
-    throw error;
-  });
-}
-
-class AlreadyAppliedSignal extends Error {
-  constructor(readonly ledgerId: string) {
-    super('already applied');
-  }
+          .where(eq(creditLots.id, part.lotId));
+        await tx.insert(creditAllocations).values({ ledgerId, lotId: part.lotId, amount: part.amount });
+      }
+      return ledgerId;
+    },
+    extra,
+  );
 }
 
 export interface RefundSpendInput {
@@ -252,18 +238,19 @@ export interface RefundSpendInput {
 export async function refundSpend(
   db: Db,
   input: RefundSpendInput,
-  extra: BatchItem[] = [],
+  extra?: ExtraWrites,
 ): Promise<LedgerResult> {
   const spend = await findLedger(db, input.spendIdemKey);
   if (spend?.kind !== 'spend') return { applied: false, ledgerId: null };
   const parts = await db.select().from(creditAllocations).where(eq(creditAllocations.ledgerId, spend.id));
-  return runIdempotent(db, input.idemKey, async () => {
-    const account = await readAccount(db, spend.userId);
-    const debtPay = Math.min(account.debt, -spend.delta);
-    const ledgerId = newId('cl');
-    const items: BatchItem[] = [
-      commitAccount(db, spend.userId, account, -debtPay),
-      db.insert(creditLedger).values({
+  return runIdempotent(
+    db,
+    spend.userId,
+    input.idemKey,
+    async (tx, debt) => {
+      const debtPay = Math.min(debt, -spend.delta);
+      const ledgerId = newId('cl');
+      await tx.insert(creditLedger).values({
         id: ledgerId,
         userId: spend.userId,
         kind: 'refund',
@@ -271,23 +258,22 @@ export async function refundSpend(
         debtDelta: -debtPay,
         idemKey: input.idemKey,
         ref: input.ref ?? spend.ref,
-      }),
-    ];
-    let toDebt = debtPay;
-    for (const part of parts) {
-      const kept = Math.min(toDebt, part.amount);
-      toDebt -= kept;
-      if (part.amount - kept === 0) continue;
-      items.push(
-        db
+      });
+      await changeDebt(tx, spend.userId, -debtPay);
+      let toDebt = debtPay;
+      for (const part of parts) {
+        const kept = Math.min(toDebt, part.amount);
+        toDebt -= kept;
+        if (part.amount - kept === 0) continue;
+        await tx
           .update(creditLots)
           .set({ remaining: sql`${creditLots.remaining} + ${part.amount - kept}` })
-          .where(eq(creditLots.id, part.lotId)),
-      );
-    }
-    items.push(...extra);
-    return { ledgerId, items };
-  });
+          .where(eq(creditLots.id, part.lotId));
+      }
+      return ledgerId;
+    },
+    extra,
+  );
 }
 
 export interface RevokeInput {
@@ -300,26 +286,23 @@ export interface RevokeInput {
 }
 
 /** Claws back credits (refunds, chargebacks). Whatever the lots can't cover becomes debt, so balance can go negative. */
-export async function revokeCredits(
-  db: Db,
-  input: RevokeInput,
-  extra: BatchItem[] = [],
-): Promise<LedgerResult> {
+export async function revokeCredits(db: Db, input: RevokeInput, extra?: ExtraWrites): Promise<LedgerResult> {
   assertPositiveInt(input.amount);
-  return runIdempotent(db, input.idemKey, async () => {
-    const account = await readAccount(db, input.userId);
-    const lots = await activeLots(db, input.userId, Date.now());
-    const preferred = input.preferSourceRef
-      ? lots.filter((lot) => lot.sourceRef === input.preferSourceRef)
-      : [];
-    const ordered = [...preferred, ...lots.filter((lot) => !preferred.includes(lot))];
-    const plan = allocate(ordered, input.amount);
-    const taken = plan.reduce((sum, part) => sum + part.amount, 0);
-    const debtAdd = input.amount - taken;
-    const ledgerId = newId('cl');
-    const items: BatchItem[] = [
-      commitAccount(db, input.userId, account, debtAdd),
-      db.insert(creditLedger).values({
+  return runIdempotent(
+    db,
+    input.userId,
+    input.idemKey,
+    async (tx) => {
+      const lots = await activeLots(tx, input.userId, Date.now());
+      const preferred = input.preferSourceRef
+        ? lots.filter((lot) => lot.sourceRef === input.preferSourceRef)
+        : [];
+      const ordered = [...preferred, ...lots.filter((lot) => !preferred.includes(lot))];
+      const plan = allocate(ordered, input.amount);
+      const taken = plan.reduce((sum, part) => sum + part.amount, 0);
+      const debtAdd = input.amount - taken;
+      const ledgerId = newId('cl');
+      await tx.insert(creditLedger).values({
         id: ledgerId,
         userId: input.userId,
         kind: 'revoke',
@@ -327,20 +310,19 @@ export async function revokeCredits(
         debtDelta: debtAdd,
         idemKey: input.idemKey,
         ref: input.ref ?? null,
-      }),
-    ];
-    for (const part of plan) {
-      items.push(
-        db
+      });
+      await changeDebt(tx, input.userId, debtAdd);
+      for (const part of plan) {
+        await tx
           .update(creditLots)
           .set({ remaining: sql`${creditLots.remaining} - ${part.amount}` })
-          .where(eq(creditLots.id, part.lotId)),
-        db.insert(creditAllocations).values({ ledgerId, lotId: part.lotId, amount: part.amount }),
-      );
-    }
-    items.push(...extra);
-    return { ledgerId, items };
-  });
+          .where(eq(creditLots.id, part.lotId));
+        await tx.insert(creditAllocations).values({ ledgerId, lotId: part.lotId, amount: part.amount });
+      }
+      return ledgerId;
+    },
+    extra,
+  );
 }
 
 export interface Balance {
@@ -352,19 +334,14 @@ export interface Balance {
 }
 
 export async function getBalance(db: Db, userId: string, now = Date.now()): Promise<Balance> {
-  const [lots, debt] = await Promise.all([
+  const [lots, [account]] = await Promise.all([
     db
       .select({ remaining: creditLots.remaining, expiresAt: creditLots.expiresAt })
       .from(creditLots)
-      .where(
-        and(
-          eq(creditLots.userId, userId),
-          gt(creditLots.remaining, 0),
-          or(isNull(creditLots.expiresAt), gt(creditLots.expiresAt, now)),
-        ),
-      ),
-    currentDebt(db, userId),
+      .where(activeLotsWhere(userId, now)),
+    db.select({ debt: creditAccounts.debt }).from(creditAccounts).where(eq(creditAccounts.userId, userId)),
   ]);
+  const debt = account?.debt ?? 0;
   const total = lots.reduce((sum, lot) => sum + lot.remaining, 0);
   let nextExpiry: Balance['nextExpiry'] = null;
   for (const lot of lots) {

@@ -1,4 +1,3 @@
-import { env } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import type Stripe from 'stripe';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -22,11 +21,10 @@ import { WebhookSignatureError } from '../src/billing/provider';
 import { applyPayment, applySubscription, targetRevoked } from '../src/billing/reconcile';
 import { mapDispute } from '../src/billing/stripe';
 import { getBalance, spendCredits } from '../src/credits/ledger';
-import { createDb } from '../src/db/client';
 import { orders, payments, subscriptions } from '../src/db/schema';
 import { defineSite } from '../src/site';
+import { db } from './db';
 
-const db = createDb(env.DB);
 const DAY = 86_400_000;
 
 const site = defineSite({

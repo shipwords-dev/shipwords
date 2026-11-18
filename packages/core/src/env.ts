@@ -1,7 +1,8 @@
 // Bindings and secrets a site Worker must provide. Configure the site's wrangler.jsonc and .dev.vars to match.
 
 export interface CoreEnv {
-  DB: D1Database;
+  /** Postgres connection string, e.g. postgres://site:secret@db:5432/site. */
+  DATABASE_URL: string;
   /** send_email binding for Cloudflare Email Service. */
   EMAIL: SendEmail;
   /** Sender address; its domain must be enabled in Email Service. */

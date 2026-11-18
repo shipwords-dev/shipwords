@@ -1,4 +1,3 @@
-import { env } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import {
@@ -9,10 +8,9 @@ import {
   revokeCredits,
   spendCredits,
 } from '../src/credits/ledger';
-import { createDb } from '../src/db/client';
 import { creditLots } from '../src/db/schema';
+import { db } from './db';
 
-const db = createDb(env.DB);
 let seq = 0;
 const uid = () => `u_${++seq}_${crypto.randomUUID().slice(0, 8)}`;
 const DAY = 86_400_000;

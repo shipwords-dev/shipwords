@@ -1,5 +1,5 @@
 import { refundSpend } from '@shipwords/core/credits/ledger';
-import type { BatchItem, Db } from '@shipwords/core/db/client';
+import type { Db } from '@shipwords/core/db/client';
 import { quotaCounters } from '@shipwords/core/db/schema';
 import type { QuotaRule } from '@shipwords/core/quota/counters';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -29,8 +29,8 @@ export async function markSubmitted(db: Db, jobId: string, upstreamJobId: string
     .update(jobs)
     .set({ status: 'submitted', upstreamJobId, submittedAt: Date.now() })
     .where(and(eq(jobs.id, jobId), eq(jobs.status, 'queued')))
-    .run();
-  return result.meta.changes > 0;
+    .returning({ id: jobs.id });
+  return result.length > 0;
 }
 
 /** upstream_job_id stores upstream task IDs comma-separated in segment order; a single-part job has one ID. */
@@ -63,8 +63,8 @@ export async function appendUpstreamJob(
     .update(jobs)
     .set({ upstreamJobId: [...ids, upstreamJobId].join(',') })
     .where(and(eq(jobs.id, jobId), eq(jobs.status, 'submitted'), eq(jobs.upstreamJobId, job.upstreamJobId!)))
-    .run();
-  return result.meta.changes > 0;
+    .returning({ id: jobs.id });
+  return result.length > 0;
 }
 
 export interface StoredOutput {
@@ -77,8 +77,8 @@ export async function markSucceeded(db: Db, jobId: string, outputs: StoredOutput
     .update(jobs)
     .set({ status: 'succeeded', outputsJson: JSON.stringify(outputs), finishedAt: Date.now() })
     .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE)))
-    .run();
-  return result.meta.changes > 0;
+    .returning({ id: jobs.id });
+  return result.length > 0;
 }
 
 /**
@@ -89,15 +89,14 @@ export async function markForReview(db: Db, jobId: string, note: string): Promis
   await db
     .update(jobs)
     .set({ errorMessage: `needs review: ${note}`.slice(0, 500) })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'succeeded')))
-    .run();
+    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'succeeded')));
   const job = await loadJob(db, jobId);
   return job?.status === 'succeeded' ? job : null;
 }
 
 /** Record the upstream charge of an ended job; only bookkeeping, it never touches state or credits, so a re-read simply overwrites it. */
 export async function recordUpstreamCost(db: Db, jobId: string, usd: string): Promise<void> {
-  await db.update(jobs).set({ upstreamCostUsd: usd }).where(eq(jobs.id, jobId)).run();
+  await db.update(jobs).set({ upstreamCostUsd: usd }).where(eq(jobs.id, jobId));
 }
 
 /** Move an in-progress job to failed or canceled, then settle the refund. If the job already ended the state isn't changed, but settlement still runs. */
@@ -153,20 +152,22 @@ export async function settleFailure(db: Db, job: JobRow): Promise<void> {
     });
   }
   if (job.status === 'failed' && job.quotaJson && !job.quotaReleased) {
-    // The quota decrements and the "returned" flag share one batch: each decrement is conditioned on the flag not being set,
-    // so repeated calls return once, and a partial failure can't leave "flag set, count not returned".
-    const notReleased = sql`exists (select 1 from ${jobs} where ${jobs.id} = ${job.id} and ${jobs.quotaReleased} = 0)`;
+    // Setting the "returned" flag and the decrements share one transaction. The flag is set with a conditional update first: it locks the
+    // job row, so a concurrent call waits, then finds the flag set and returns nothing; a partial failure rolls back both.
     const rules = JSON.parse(job.quotaJson) as QuotaRule[];
-    const decrements = rules.map((rule) =>
-      db
-        .update(quotaCounters)
-        .set({ count: sql`max(${quotaCounters.count} - 1, 0)` })
-        .where(and(eq(quotaCounters.key, rule.key), eq(quotaCounters.window, rule.window), notReleased)),
-    );
-    // The flag must come last: the decrements above are conditioned on it not being set.
-    const markReleased = db.update(jobs).set({ quotaReleased: true }).where(eq(jobs.id, job.id));
-    const items: BatchItem[] = [...decrements, markReleased];
-    await db.batch(items as [BatchItem, ...BatchItem[]]);
+    await db.transaction(async (tx) => {
+      const claimed = await tx
+        .update(jobs)
+        .set({ quotaReleased: true })
+        .where(and(eq(jobs.id, job.id), eq(jobs.quotaReleased, false)))
+        .returning({ id: jobs.id });
+      if (claimed.length === 0) return;
+      for (const rule of rules)
+        await tx
+          .update(quotaCounters)
+          .set({ count: sql`greatest(${quotaCounters.count} - 1, 0)` })
+          .where(and(eq(quotaCounters.key, rule.key), eq(quotaCounters.window, rule.window)));
+    });
   }
 }
 
@@ -175,8 +176,7 @@ export async function claimGuestJobs(db: Db, guestId: string, userId: string): P
   await db
     .update(jobs)
     .set({ userId })
-    .where(and(eq(jobs.guestId, guestId), isNull(jobs.userId)))
-    .run();
+    .where(and(eq(jobs.guestId, guestId), isNull(jobs.userId)));
 }
 
 /** Best-effort cancel of upstream tasks (prep placeholders skipped): a task left running keeps billing. */

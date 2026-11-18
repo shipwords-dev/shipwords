@@ -23,14 +23,14 @@ async function increment(db: Db, rule: QuotaRule): Promise<boolean> {
       set: { count: sql`${quotaCounters.count} + 1` },
       setWhere: sql`${quotaCounters.count} < ${rule.limit}`,
     })
-    .run();
-  return result.meta.changes > 0;
+    .returning({ count: quotaCounters.count });
+  return result.length > 0;
 }
 
 async function decrement(db: Db, rule: QuotaRule) {
   await db
     .update(quotaCounters)
-    .set({ count: sql`max(${quotaCounters.count} - 1, 0)` })
+    .set({ count: sql`greatest(${quotaCounters.count} - 1, 0)` })
     .where(and(eq(quotaCounters.key, rule.key), eq(quotaCounters.window, rule.window)));
 }
 

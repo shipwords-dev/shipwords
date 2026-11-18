@@ -1,6 +1,6 @@
-import { env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { parseRange, r2Response } from '../src/r2-range';
+import { bucket } from './bucket';
 
 describe('parseRange', () => {
   it('serves the whole object without a usable range', () => {
@@ -25,12 +25,12 @@ describe('r2Response', () => {
   const key = 'test/range.bin';
   const body = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
   beforeAll(async () => {
-    await env.OUTPUTS.put(key, body, { httpMetadata: { contentType: 'video/mp4' } });
+    await bucket.put(key, body, { httpMetadata: { contentType: 'video/mp4' } });
   });
 
   it('returns 206 with the requested slice', async () => {
     const response = await r2Response(
-      env.OUTPUTS,
+      bucket,
       key,
       new Request('https://x/', { headers: { Range: 'bytes=10-19' } }),
     );
@@ -43,7 +43,7 @@ describe('r2Response', () => {
     ]);
   });
   it('returns the whole object and extra headers without a range', async () => {
-    const response = await r2Response(env.OUTPUTS, key, new Request('https://x/'), {
+    const response = await r2Response(bucket, key, new Request('https://x/'), {
       'Content-Type': 'video/mp4',
     });
     expect(response?.status).toBe(200);
@@ -52,16 +52,12 @@ describe('r2Response', () => {
     expect((await response!.arrayBuffer()).byteLength).toBe(50);
   });
   it('answers HEAD without a body and 416 past the end', async () => {
-    const head = await r2Response(env.OUTPUTS, key, new Request('https://x/', { method: 'HEAD' }));
+    const head = await r2Response(bucket, key, new Request('https://x/', { method: 'HEAD' }));
     expect(head?.status).toBe(200);
     expect(head?.body).toBeNull();
-    const bad = await r2Response(
-      env.OUTPUTS,
-      key,
-      new Request('https://x/', { headers: { Range: 'bytes=50-' } }),
-    );
+    const bad = await r2Response(bucket, key, new Request('https://x/', { headers: { Range: 'bytes=50-' } }));
     expect(bad?.status).toBe(416);
     expect(bad?.headers.get('Content-Range')).toBe('bytes */50');
-    expect(await r2Response(env.OUTPUTS, 'test/missing', new Request('https://x/'))).toBeNull();
+    expect(await r2Response(bucket, 'test/missing', new Request('https://x/'))).toBeNull();
   });
 });

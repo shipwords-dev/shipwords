@@ -1,6 +1,4 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits, spendCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import { user } from '@shipwords/core/db/schema';
 import { consumeQuota } from '@shipwords/core/quota/counters';
 import { eq } from 'drizzle-orm';
@@ -20,8 +18,8 @@ import {
   UpstreamError,
 } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
-
-const db = createDb(env.DB);
+import { bucket } from './bucket';
+import { db } from './db';
 
 const models = defineModels([
   {
@@ -80,8 +78,8 @@ async function paidJob(cost = 10, overrides: Partial<typeof jobs.$inferInsert> =
   const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
   const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
   await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-  await spendCredits(db, { userId, amount: cost, idemKey: spendKey(jobId) }, [
-    db.insert(jobs).values({
+  await spendCredits(db, { userId, amount: cost, idemKey: spendKey(jobId) }, (tx) =>
+    tx.insert(jobs).values({
       id: jobId,
       userId,
       modelId: 'fast',
@@ -92,13 +90,13 @@ async function paidJob(cost = 10, overrides: Partial<typeof jobs.$inferInsert> =
       upstream: 'yir',
       ...overrides,
     }),
-  ]);
+  );
   return { userId, jobId };
 }
 
 const deps = (adapter: FakeAdapter) => ({
   db,
-  bucket: env.OUTPUTS,
+  bucket: bucket,
   models,
   adapters: { yir: adapter },
   fetcher: outputFetcher,
@@ -121,7 +119,7 @@ describe('generation jobs', () => {
     expect(job?.status).toBe('succeeded');
     const [output] = JSON.parse(job!.outputsJson!);
     expect(output).toEqual({ key: `jobs/${jobId}/0.png`, mediaType: 'image/png' });
-    expect(await env.OUTPUTS.get(output.key)).not.toBeNull();
+    expect(await bucket.get(output.key)).not.toBeNull();
     expect((await getBalance(db, userId)).available).toBe(40);
   });
 
