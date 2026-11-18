@@ -1,11 +1,13 @@
 import { proxyRybbit } from '@shipwords/core/analytics';
 import handler from '@tanstack/react-start/server-entry';
 import { paraglideMiddleware } from '~/paraglide/server.js';
-// Imported here, not only from routes, so the job worker starts when the server does rather than on the first request.
-import { shutdown } from './core.server';
+import { shutdown, startJobWorker } from './core.server';
 
 // Server entry: pages and API go to TanStack Start. start.mjs serves it with srvx and calls shutdown() on SIGTERM.
 export { shutdown };
+
+// The job worker starts with the server, not on the first request, and only here: importing core.server elsewhere starts nothing.
+startJobWorker();
 
 export default {
   async fetch(request: Request): Promise<Response> {

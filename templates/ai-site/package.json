@@ -9,9 +9,10 @@
     "start": "node --env-file-if-exists=.env start.mjs",
     "preview": "vite build && node --env-file-if-exists=.env start.mjs",
     "typecheck": "paraglide-js compile --project ./project.inlang --outdir ./src/paraglide && tsr generate && tsc --noEmit",
-    "check": "pnpm typecheck && pnpm build && node ../../tools/check-site.mjs .",
+    "check": "pnpm typecheck && pnpm build && pnpm check:site",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "node --env-file-if-exists=.env migrate.mjs"
+    "db:migrate": "node --env-file-if-exists=.env migrate.mjs",
+    "check:site": "node ../../tools/check-site.mjs ."
   },
   "dependencies": {
     "@shipwords/core": "workspace:*",

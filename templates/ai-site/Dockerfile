@@ -10,6 +10,8 @@ COPY . .
 ARG SITE=templates/ai-site
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter "./${SITE}" build
+# The launch checks on the build that ships: required routes and pages, and no server-only text in the browser bundle.
+RUN pnpm --filter "./${SITE}" check:site
 # The site with its production dependencies only, workspace packages included, in a directory of its own.
 RUN pnpm --filter "./${SITE}" deploy --prod --legacy /app
 

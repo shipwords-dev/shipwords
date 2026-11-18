@@ -4,6 +4,7 @@
 // *.server.ts files and no .env values, and that the site imports no other site.
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseEnv } from 'node:util';
 
 const REQUIRED_FILES = [
   'README.md',
@@ -136,16 +137,8 @@ function serverTexts(dir) {
 export function devVars(dir, name = '.env') {
   const file = path.join(dir, name);
   if (!fs.existsSync(file)) return [];
-  return fs
-    .readFileSync(file, 'utf8')
-    .split(/\r?\n/)
-    .map((line) => line.match(/^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/))
-    .filter(Boolean)
-    .map(([, key, raw]) => {
-      const quoted = raw.match(/^(['"`])([\s\S]*?)\1/);
-      return [key, quoted ? quoted[2] : raw.replace(/\s+#.*$/, '').trim()];
-    })
-    .filter(([, value]) => value.length >= 8);
+  // Parsed the way the app reads it (node --env-file), so the values scanned for are exactly the ones the server gets.
+  return Object.entries(parseEnv(fs.readFileSync(file, 'utf8'))).filter(([, value]) => value.length >= 8);
 }
 
 function checkBuild(dir) {

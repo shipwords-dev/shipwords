@@ -17,6 +17,8 @@ const SKIP = new Set([
   '.preview',
   'paraglide',
   '.dev.vars',
+  '.env',
+  '.data',
   'worker-configuration.d.ts',
 ]);
 const SKIP_FILE = /routeTree\.gen\.ts$/;
