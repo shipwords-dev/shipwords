@@ -215,11 +215,14 @@ export function checkSite(dir) {
   for (const route of REQUIRED_ROUTES) {
     if (!fs.existsSync(path.join(dir, route))) problems.push(`Missing route ${route}`);
   }
-  if (!isTemplate && fs.existsSync(path.join(dir, 'wrangler.jsonc'))) {
-    const wrangler = fs.readFileSync(path.join(dir, 'wrangler.jsonc'), 'utf8');
-    if (wrangler.includes('ai-site-template')) problems.push('wrangler.jsonc still has the template name');
-    if (wrangler.includes('<set after wrangler d1 create'))
-      problems.push('wrangler.jsonc database_id is not set');
+  if (!isTemplate && fs.existsSync(path.join(dir, 'compose.yaml'))) {
+    const compose = fs.readFileSync(path.join(dir, 'compose.yaml'), 'utf8');
+    if (/^name: ai-site$/m.test(compose) || compose.includes('templates/ai-site'))
+      problems.push('compose.yaml still names the template');
+  }
+  if (!isTemplate && fs.existsSync(path.join(dir, '.env.example'))) {
+    if (fs.readFileSync(path.join(dir, '.env.example'), 'utf8').includes('noreply@example.com'))
+      problems.push('.env.example still sends from noreply@example.com');
   }
   if (!isTemplate && fs.existsSync(path.join(dir, 'site.config.ts'))) {
     if (fs.readFileSync(path.join(dir, 'site.config.ts'), 'utf8').includes('example.com')) {

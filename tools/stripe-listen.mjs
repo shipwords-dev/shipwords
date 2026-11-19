@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Usage: run node ../../tools/stripe-listen.mjs in a site directory
 // Starts stripe listen with the test key from .env and forwards webhooks to the site's dev server (APP_URL).
-// The signing secret (whsec) can change, so the current one is written back to .env first; the dev server reloads.
+// The signing secret (whsec) can change, so the current one is written back to .env first. The server reads .env only at start, so restart pnpm dev when it says the secret changed.
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';

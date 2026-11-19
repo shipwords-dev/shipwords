@@ -85,8 +85,8 @@ export async function grantSignupBonus(
   if (!result.applied) await releaseQuota(deps.db, rules);
 }
 
-// Without a secret Better Auth silently falls back to a public default (it only refuses when NODE_ENV=production, which Workers never set),
-// and anyone could then sign session tokens. 32 characters rules out the .dev.vars.example placeholder too.
+// Without a secret Better Auth silently falls back to a public default (it only refuses when NODE_ENV=production, which dev servers and tests
+// don't set), and anyone could then sign session tokens. 32 characters rules out the .env.example placeholder too.
 function authSecret(env: CoreEnv): string {
   const secret = env.BETTER_AUTH_SECRET;
   if (typeof secret !== 'string' || secret.length < 32) {

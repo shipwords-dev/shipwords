@@ -9,7 +9,7 @@ import { type JobRow, jobs } from './schema';
 export const FAILURE_STREAK = 3;
 
 /**
- * Failures written outside the runner, so nobody checks the streak when they end: dispatch_failed (older jobs whose Workflow never
+ * Failures written outside the runner, so nobody checks the streak when they end: dispatch_failed (older jobs whose run never
  * started), stale (the run kept dying, or nobody ran it in time) and workflow_failed (the catch around the runner, when the runner
  * itself couldn't finish). They count toward the
  * streak but leave the alert to the next failure the runner checks.
@@ -31,7 +31,7 @@ export const ALERT_LIST = 20;
  */
 export async function failureStreak(db: Db, job: JobRow): Promise<JobRow[] | null> {
   if (job.status !== 'failed' || !job.userId || job.finishedAt == null) return null;
-  // An unchecked failure never alerts itself, even when its Workflow resumes after a handler marked it stale and runs the check: the
+  // An unchecked failure never alerts itself, even when its run resumes after a handler marked it stale and runs the check: the
   // next runner failure, counting it as unchecked, alerts instead. Both alerting would send two for one streak.
   if (job.errorCode && UNCHECKED_FAILURES.includes(job.errorCode)) return null;
   const { userId, finishedAt, id } = job;

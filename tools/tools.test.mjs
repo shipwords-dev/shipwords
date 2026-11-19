@@ -10,7 +10,7 @@ import { checkSite, devVars, stringLiterals } from './check-site.mjs';
 import { isWorktree, portFor, sitePort } from './dev-port.mjs';
 import { readSiteConfig, readStatus, setVar, TOOLS_ROOT } from './lib.mjs';
 import { createSite, nextDevPort, parseArgs, validateSlug } from './new-site.mjs';
-import { replacementKey, replaceOutput, siteResources, sqlString } from './replace-output.mjs';
+
 import { listenArgs, parseVars } from './stripe-listen.mjs';
 
 const crawlHtml = `<html><head><title>Photo studio</title><meta content="Make a video" name="description"><link href="https://example.com" rel="canonical"></head><body><h1>Photo studio</h1><p>One photo. $9.98.</p><script type="application/ld+json">{"@type":"VideoObject","uploadDate":"2026-10-27T15:02:46Z"}</script></body></html>`;
@@ -126,7 +126,7 @@ test('new site: renames, writes README, check-site finds unfinished items', () =
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shipwords-'));
   fs.cpSync(path.join(TOOLS_ROOT, 'templates', 'ai-site'), path.join(root, 'templates', 'ai-site'), {
     recursive: true,
-    filter: (src) => !/node_modules|[\\/]dist[\\/]?|\.wrangler|[\\/]paraglide|\.dev\.vars$/.test(src),
+    filter: (src) => !/node_modules|[\\/]dist[\\/]?|[\\/]paraglide|[\\/]\.env$|[\\/]\.data/.test(src),
   });
   const { target } = createSite(root, {
     slug: 'ghibli-photo',
@@ -141,13 +141,20 @@ test('new site: renames, writes README, check-site finds unfinished items', () =
     url: 'https://ghibliphoto.ai',
   });
   assert.equal(readStatus(target), 'In development');
-  const wrangler = fs.readFileSync(path.join(target, 'wrangler.jsonc'), 'utf8');
-  assert.ok(wrangler.includes('"name": "ghibli-photo"'));
-  assert.ok(!wrangler.includes('ai-site-template'));
+  const compose = fs.readFileSync(path.join(target, 'compose.yaml'), 'utf8');
+  assert.ok(compose.includes('name: ghibli-photo'));
+  assert.ok(compose.includes('dockerfile: sites/ghibli-photo/Dockerfile'));
+  assert.ok(compose.includes('SITE: sites/ghibli-photo'));
+  assert.ok(!compose.includes('templates/ai-site'));
+  const dockerfile = fs.readFileSync(path.join(target, 'Dockerfile'), 'utf8');
+  assert.ok(dockerfile.includes('ARG SITE=sites/ghibli-photo'));
+  assert.ok(!dockerfile.includes('templates/ai-site'));
   assert.ok(
     fs.readFileSync(path.join(target, 'package.json'), 'utf8').includes('@shipwords/site-ghibli-photo'),
   );
-  assert.ok(wrangler.includes('noreply@ghibliphoto.ai'));
+  assert.ok(
+    fs.readFileSync(path.join(target, '.env.example'), 'utf8').includes('EMAIL_FROM=noreply@ghibliphoto.ai'),
+  );
   assert.ok(
     fs
       .readFileSync(path.join(target, 'src', 'site', 'legal.tsx'), 'utf8')
@@ -160,10 +167,9 @@ test('new site: renames, writes README, check-site finds unfinished items', () =
   ]) {
     assert.ok(fs.existsSync(path.join(target, file)), file);
   }
-  assert.ok(!fs.existsSync(path.join(target, '.dev.vars')));
+  assert.ok(!fs.existsSync(path.join(target, '.env')));
 
   assert.deepEqual(checkSite(target), [
-    'wrangler.jsonc database_id is not set',
     'messages/legal/en.json still has TODO placeholders (policy text or update date)',
     'messages/common/en.json still has TODO placeholders (policy text or update date)',
   ]);
@@ -235,7 +241,7 @@ test('check-site: fails when the browser bundle contains zh messages', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('check-site: string scanner reads strings inside template interpolations, and .dev.vars is read as dotenv', () => {
+test('check-site: string scanner reads strings inside template interpolations, and .env is read the way Node reads it', async () => {
   const source = [
     // biome-ignore lint/suspicious/noTemplateCurlyInString: source text containing template literals
     'const p = (dog) => `${dog ? "Replace the singer with the dog" : `keep ${"the original coach"}`} now`;',
@@ -255,24 +261,28 @@ test('check-site: string scanner reads strings inside template interpolations, a
   );
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipwords-'));
   fs.writeFileSync(
-    path.join(dir, '.dev.vars'),
+    path.join(dir, '.env'),
     [
       'export YIR_API_KEY="fake-secret-key-123456"',
       'STRIPE_SECRET_KEY=sk_test_abcdefgh # local test',
+      'PAYPAL_CLIENT_SECRET=paypal-secret-xyz#no-space-comment',
       "GOOGLE_CLIENT_SECRET='has # inside quotes'",
       '# COMMENTED=not-a-value-at-all',
       'SHORT=abc',
     ].join('\r\n'),
   );
-  assert.deepEqual(devVars(dir), [
-    ['YIR_API_KEY', 'fake-secret-key-123456'],
-    ['STRIPE_SECRET_KEY', 'sk_test_abcdefgh'],
-    ['GOOGLE_CLIENT_SECRET', 'has # inside quotes'],
-  ]);
+  // Exactly what node --env-file gives the app, so the scan looks for the values the server really has.
+  const { parseEnv } = await import('node:util');
+  const expected = Object.entries(parseEnv(fs.readFileSync(path.join(dir, '.env'), 'utf8'))).filter(
+    ([, v]) => v.length >= 8,
+  );
+  assert.deepEqual(devVars(dir), expected);
+  assert.ok(devVars(dir).some(([key]) => key === 'GOOGLE_CLIENT_SECRET'));
+  assert.ok(!devVars(dir).some(([key]) => key === 'COMMENTED'));
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('check-site: fails when the browser bundle contains server-only text or .dev.vars secrets', () => {
+test('check-site: fails when the browser bundle contains server-only text or .env secrets', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipwords-'));
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'dist', 'client'), { recursive: true });
@@ -287,7 +297,7 @@ test('check-site: fails when the browser bundle contains server-only text or .de
     ].join('\n'),
   );
   fs.writeFileSync(
-    path.join(dir, '.dev.vars'),
+    path.join(dir, '.env'),
     'APP_URL=http://127.0.0.1:5173\nSTRIPE_SECRET_KEY="sk_test_0123456789"\nRECAPTCHA_SITE_KEY=6Lpublic-site-key\n',
   );
   const leaks = () => checkSite(dir).filter((p) => p.startsWith('Build output'));
@@ -307,7 +317,7 @@ test('check-site: fails when the browser bundle contains server-only text or .de
   assert.deepEqual(leaks(), [
     'Build output dist/client/b.js contains server-only text from src/models.server.ts (" with the person in @image_1, keep the m…"); keep it out of files that pages import',
     'Build output dist/client/c.js contains server-only text from src/models.server.ts ("assets/demo/reference-clip.mp4…"); keep it out of files that pages import',
-    'Build output dist/client/c.js contains the value of STRIPE_SECRET_KEY from .dev.vars',
+    'Build output dist/client/c.js contains the value of STRIPE_SECRET_KEY from .env',
   ]);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -318,9 +328,16 @@ test('new site from a vendored shipwords: site lands in the workspace, scripts p
   assert.equal(target, path.join(root, 'sites', 'demo-tool'));
   const pkg = JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8'));
   const toolsDir = path.relative(target, path.join(TOOLS_ROOT, 'tools')).replaceAll(path.sep, '/');
-  assert.ok(pkg.scripts.dev.includes(`node ${toolsDir}/dev-port.mjs`));
+  assert.ok(pkg.scripts.dev.includes(`node --env-file-if-exists=.env ${toolsDir}/dev-port.mjs`));
   assert.ok(!pkg.scripts.check.includes('../../tools/'));
-  assert.ok(pkg.scripts.deploy.includes(`node ${toolsDir}/check-site.mjs . && wrangler deploy`));
+  assert.equal(pkg.scripts['check:site'], `node ${toolsDir}/check-site.mjs .`);
+  // The compose service and the image's build context point at where shipwords and the workspace really are.
+  const compose = fs.readFileSync(path.join(target, 'compose.yaml'), 'utf8');
+  const composeDir = path
+    .relative(target, path.join(TOOLS_ROOT, 'packages', 'jobs', 'compose'))
+    .replaceAll(path.sep, '/');
+  assert.ok(compose.includes(`build: ${composeDir}`));
+  assert.ok(compose.includes('context: ../..'));
   const drizzle = fs.readFileSync(path.join(target, 'drizzle.config.ts'), 'utf8');
   const packagesDir = path.relative(target, path.join(TOOLS_ROOT, 'packages')).replaceAll(path.sep, '/');
   assert.ok(drizzle.includes(`'${packagesDir}/core/src/db/schema.ts'`));
@@ -366,24 +383,4 @@ test('check-public: flags real-looking emails, IDs and live keys, accepts placeh
   assert.equal(isScanned('sites/x/migrations/meta/0_snapshot.json'), false);
   assert.equal(isScanned('pnpm-lock.yaml'), false);
   assert.equal(isScanned('sites/x/wrangler.jsonc'), true);
-});
-
-test('replace-output: new key per redo, outputs_json keeps the rest, resources read from wrangler.jsonc', () => {
-  const wrangler = `{ "d1_databases": [{ "binding": "DB", "database_name": "demo", "database_id": "x" }],
-    "r2_buckets": [{ "binding": "OUTPUTS", "bucket_name": "demo-outputs" }] }`;
-  assert.deepEqual(siteResources(wrangler), { bucket: 'demo-outputs', database: 'demo' });
-  assert.throws(() => siteResources('{}'), /OUTPUTS/);
-  assert.equal(replacementKey('job_abc123', 0, '.mp4', 42), 'jobs/job_abc123/0-r42.mp4');
-  assert.throws(() => replacementKey("job_x'; drop", 0, '.mp4'), /bad job id/);
-  const outputs = JSON.stringify([
-    { key: 'jobs/job_a/0.mp4', mediaType: 'video/mp4' },
-    { key: 'jobs/job_a/1.mp4', mediaType: 'video/mp4' },
-  ]);
-  assert.deepEqual(JSON.parse(replaceOutput(outputs, 1, 'jobs/job_a/1-r9.mp4')), [
-    { key: 'jobs/job_a/0.mp4', mediaType: 'video/mp4' },
-    { key: 'jobs/job_a/1-r9.mp4', mediaType: 'video/mp4' },
-  ]);
-  assert.throws(() => replaceOutput(outputs, 2, 'k'), /no output 2/);
-  assert.throws(() => replaceOutput(null, 0, 'k'), /no output 0/);
-  assert.equal(sqlString("it's"), "'it''s'");
 });

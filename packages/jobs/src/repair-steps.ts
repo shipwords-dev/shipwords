@@ -28,7 +28,7 @@ import type { PollResult, SubmitInput, UpstreamAdapter } from './upstream';
 import { UpstreamError } from './upstream';
 
 // Repair passes after compose (segment.repair) and the likeness check that can ask for them. Run inside one job's runner:
-// RepairContext carries what they share with it. Step names are Workflow cache keys and must not change.
+// RepairContext carries what they share with it. Step names are replay keys and must not change.
 
 export interface SegmentCheck {
   maxSimilarity: number;
@@ -424,7 +424,7 @@ export async function repairOutputs(
   try {
     return await runPasses();
   } catch (error) {
-    // A pass step that throws after its Workflow retries (status reads, the download, the container's extract or patch) fails the
+    // A pass step that throws after its step retries (status reads, the download, the container's extract or patch) fails the
     // job with a refund through the fallback; under onMiss 'deliver' the paid render is delivered instead, as on any other miss.
     if (repair.onMiss !== 'deliver') throw error;
     return giveUp(`a pass errored: ${String(error)}`.slice(0, 300), () => Promise.reject(error));

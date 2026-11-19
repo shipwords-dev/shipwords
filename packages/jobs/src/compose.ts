@@ -82,7 +82,7 @@ export interface PatchInput extends ExtractInput {
 export interface Composer {
   /** Crop a borderless 2x2 sheet in row-major order. Read-only and repeatable. */
   splitSheet?(input: { jobId: string; image: ArrayBuffer }): Promise<ArrayBuffer[]>;
-  /** Repeated calls with the same jobId give the same result, safe for Workflow retries. */
+  /** Repeated calls with the same jobId give the same result, safe for step retries. */
   compose(input: ComposeInput): Promise<{ song: ArrayBuffer; silent: ArrayBuffer }>;
   /**
    * Output check: for each point, the highest face similarity (cosine, 0–1) between the original person there and any face in the output.

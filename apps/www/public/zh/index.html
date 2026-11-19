@@ -223,7 +223,7 @@
             <li>
               <div class="shot term" aria-hidden="true"><span class="dots"><i></i><i></i><i></i></span><span><em>$</em> pnpm new-site</span><span class="ok">✓ 站点已就绪</span></div>
               <b>生成站点</b>
-              <p><code>pnpm new-site</code> 复制模板，接好名称、域名和数据库。</p>
+              <p><code>pnpm new-site</code> 复制模板，接好名称、域名和 Docker 配置。</p>
             </li>
             <li>
               <div class="shot cfg" aria-hidden="true"><span class="f">site.config.ts</span><span><em>price</em>: { amount: <u>499</u> },</span><span><em>credits</em>: <u>200</u>,</span></div>
@@ -273,19 +273,19 @@
             <details>
               <summary>要花多少钱？</summary>
               <p>
-                代码免费，MIT 许可，可以商用。你要付的是域名（按成本价每年约 10 美元）、Cloudflare 的用量费、每笔订单的 Stripe 或 PayPal 手续费，以及 Yir 上按次计费的模型费用，每个任务的成本上限可以在 <code>site.models.ts</code> 里设定。需要把多段视频拼接起来的站，要开 Cloudflare 的 Workers Paid 套餐。
+                代码免费，MIT 许可，可以商用。你要付的是域名（按成本价每年约 10 美元）、一台用 Docker 跑这些站的机器、Cloudflare 的用量费（R2 存储和发信）、每笔订单的 Stripe 或 PayPal 手续费，以及 Yir 上按次计费的模型费用，每个任务的成本上限可以在 <code>src/models.server.ts</code> 里设定。
               </p>
             </details>
             <details>
               <summary>我需要会写代码吗？</summary>
               <p>
-                你是在一个代码仓库里工作，但大部分代码由编程 Agent 来写：告诉它关键词，它就能把页面做出来，登录和收款已经写好。你需要能跑终端命令，会注册和配置 Stripe、Cloudflare 账号。
+                你是在一个代码仓库里工作，但大部分代码由编程 Agent 来写：告诉它关键词，它就能把页面做出来，登录和收款已经写好。你需要能跑终端命令，会在服务器上用 Docker，会注册和配置 Stripe、Cloudflare 账号。
               </p>
             </details>
             <details>
               <summary>部署在哪里？</summary>
               <p>
-                Cloudflare。每个站单独部署，有自己的数据库、文件存储和收款账户，上线或下线一个站都不影响其他站。
+                在你自己的机器上：每个站是一个跑在 Docker 容器里的 Node 服务，用 Postgres 数据库，前面套 Cloudflare，文件存在 R2。每个站单独部署，有自己的数据库、文件存储和收款账户，上线或下线一个站都不影响其他站。
               </p>
             </details>
             <details>
@@ -305,7 +305,7 @@
           <div>
             <!-- biome-ignore lint/a11y/useAnchorContent: aria-label names the link; the wordmark is drawn in CSS -->
             <a class="brand" href="/zh/" aria-label="shipwords"><span class="wordmark"></span></a>
-            <p class="blurb">每个新关键词，上线一个能收钱的 AI 站。开源，基于 Cloudflare。</p>
+            <p class="blurb">每个新关键词，上线一个能收钱的 AI 站。开源，用 Docker 部署。</p>
           </div>
           <div>
             <h3>项目</h3>
@@ -333,7 +333,7 @@
           </div>
         </div>
         <div class="legal">
-          <span>shipwords · MIT 许可 · 基于 Cloudflare</span>
+          <span>shipwords · MIT 许可 · Node、Postgres、Docker</span>
           <a href="/" hreflang="en" lang="en">English</a>
         </div>
       </div>

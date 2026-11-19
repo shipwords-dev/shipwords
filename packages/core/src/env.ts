@@ -1,4 +1,4 @@
-// Bindings and secrets a site Worker must provide. Configure the site's wrangler.jsonc and .dev.vars to match.
+// Settings and secrets a site's server reads from process.env. The site's .env.example lists them.
 
 export interface CoreEnv {
   /** Postgres connection string, e.g. postgres://site:secret@db:5432/site. */

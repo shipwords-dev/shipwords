@@ -56,3 +56,14 @@ jobs:
       - run: pnpm --filter @shipwords/core --filter @shipwords/jobs test:pg
 
       - run: pnpm --filter ./templates/ai-site check
+
+  images:
+    # The production images build from a clean checkout: the template's Dockerfile (install, build, launch checks, prod deploy)
+    # and the compose service.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: docker build -f templates/ai-site/Dockerfile -t shipwords-site .
+
+      - run: docker build -t shipwords-compose packages/jobs/compose

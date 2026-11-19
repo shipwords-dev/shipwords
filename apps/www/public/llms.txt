@@ -1,13 +1,13 @@
 # shipwords
 
-> MIT framework for a fleet of new-keyword AI sites on Cloudflare: one site per keyword, up in an afternoon. Each site is its own Worker (TanStack Start + React 19 + D1 + R2 + Workflows) with login, a guest trial, credits and Stripe or PayPal payments from day one. Credits, billing, auth, quota and generation jobs live once in shared packages; each site owns its pages, design and copy.
+> MIT framework for a fleet of new-keyword AI sites on Node, Postgres and Docker, behind Cloudflare: one site per keyword, up in an afternoon. Each site is its own TanStack Start + React 19 app in a Docker container, with its own Postgres database and an R2 bucket, with login, a guest trial, credits and Stripe or PayPal payments from day one. Credits, billing, auth, quota and generation jobs live once in shared packages; each site owns its pages, design and copy.
 
 ## For AI coding agents
 
 If a human sent you here to build a site, follow these steps. Run the commands yourself; stop and ask the human where marked **ask**.
 
 1. Read the rules in the repo after cloning: `AGENTS.md` is binding (directory boundaries, money paths, verification).
-2. Requirements: Node 24 and pnpm 10 (`corepack enable`). Git Bash or WSL on Windows.
+2. Requirements: Node 24, pnpm 10 (`corepack enable`) and a Postgres 17 you can reach (for example `docker run -d -e POSTGRES_PASSWORD=<password> -p 127.0.0.1:5432:5432 postgres:17-alpine`). Git Bash or WSL on Windows.
 3. Get the code. If the human has no fork yet, clone:
 
    ```bash
@@ -24,11 +24,12 @@ If a human sent you here to build a site, follow these steps. Run the commands y
    pnpm install
    ```
 
-5. Local secrets live outside the repo. Copy the example and generate the two random secrets; keep `UPSTREAM_MOCK=1` so generation works without any API key:
+5. Local settings live outside the repo. Create a database for the site, copy the example, set `DATABASE_URL` and generate the two random secrets; keep `UPSTREAM_MOCK=1` so generation works without any API key:
 
    ```bash
    mkdir -p ~/.config/shipwords
-   cp sites/<dir>/.dev.vars.example ~/.config/shipwords/<dir>.dev.vars
+   cp sites/<dir>/.env.example ~/.config/shipwords/<dir>.env
+   # set DATABASE_URL to the site's database
    # replace BETTER_AUTH_SECRET and GUEST_COOKIE_SECRET with 32 random bytes each (openssl rand -hex 32)
    pnpm setup:worktree
    ```
@@ -37,24 +38,24 @@ If a human sent you here to build a site, follow these steps. Run the commands y
 
    ```bash
    cd sites/<dir>
-   pnpm db:generate && pnpm db:migrate:local
+   pnpm db:generate && pnpm db:migrate
    pnpm dev
    ```
 
-   Sign-in code emails are printed in the terminal instead of being sent.
+   Sign-in code emails are printed in the terminal instead of being sent (`MAIL_LOG=1`).
 
 7. Make the site about the keyword:
    - Fill `sites/<dir>/README.md`: target keyword, search intent, competitors and how this site differs.
    - Write `DESIGN.md` first, then restyle `src/site/styles.css` and the pages. It must not look like the template.
-   - Rewrite home page copy, titles and FAQ for the keyword. Choose models in `site.models.ts`; set products, signup bonus and guest quota in `site.config.ts`.
+   - Rewrite home page copy, titles and FAQ for the keyword. Choose models: names and prices in `site.models.ts`, upstream models and cost caps in `src/models.server.ts`; set products, signup bonus and guest quota in `site.config.ts`.
    - Replace every `TODO` in `messages/legal/` (privacy, terms, refunds, DMCA).
-8. Verify in `sites/<dir>`: `pnpm typecheck && pnpm build` must pass. Then run `pnpm check`, which adds the launch checks: before launch it still reports the unset `database_id`, and the domain and support email while they are placeholders. Those wait for the launch handbook; fix everything else it reports.
+8. Verify in `sites/<dir>`: `pnpm typecheck && pnpm build` must pass. Then run `pnpm check`, which adds the launch checks: before launch it still reports the policy `TODO`s, and the domain and support email while they are placeholders. Those wait for the launch handbook; fix everything else it reports.
 
 ### Stop and ask the human before
 
 - Using real keys. Locally use test keys only: Stripe `sk_test_`, PayPal sandbox, and a Yir API key (https://yir.ai/?utm_source=shipwords&utm_medium=llms) only when the human wants real generations.
-- Creating Cloudflare resources (D1, R2, Email), running remote migrations, writing secrets with `wrangler secret put`, or configuring Stripe/PayPal webhooks.
-- Deploying to production. Deploys run from main, one site at a time, after the human confirms.
+- Creating a server, production databases or Cloudflare resources (R2, Email Sending, API tokens), running production migrations, writing production secrets, or configuring Stripe/PayPal webhooks.
+- Deploying to production. Deploys run from main, one site at a time, after the human confirms: each site is a Docker image built and started on the human's machine.
 
 Then walk the human through the launch handbook below.
 
@@ -63,12 +64,12 @@ Then walk the human through the launch handbook below.
 - [README](https://raw.githubusercontent.com/shipwords-dev/shipwords/main/README.md): what you get and quick start
 - [Rules for AI coding agents](https://raw.githubusercontent.com/shipwords-dev/shipwords/main/AGENTS.md)
 - [Local development](https://raw.githubusercontent.com/shipwords-dev/shipwords/main/docs/local-development.md): secrets, mock upstream, Stripe and PayPal test webhooks
-- [Site launch handbook](https://raw.githubusercontent.com/shipwords-dev/shipwords/main/docs/site-launch.md): domain, Cloudflare resources, secrets, payments, checks, deploy, search
+- [Site launch handbook](https://raw.githubusercontent.com/shipwords-dev/shipwords/main/docs/site-launch.md): domain, machine and database, Cloudflare, settings, payments, checks, Docker deploy, search
 - [Architecture](https://raw.githubusercontent.com/shipwords-dev/shipwords/main/docs/architecture.md): design choices and trade-offs
 
 ## Links
 
 - [GitHub](https://github.com/shipwords-dev/shipwords)
 - [Discussions](https://github.com/shipwords-dev/shipwords/discussions): search Q&A before asking; post setup questions in Q&A and launched sites in Show and tell
-- [Tiny Desk AI](https://tinydeskai.io/?utm_source=shipwords&utm_medium=llms): a live site built with shipwords; its source is in [sites/tinydeskai-example](https://github.com/shipwords-dev/shipwords/tree/main/sites/tinydeskai-example)
+- [Tiny Desk AI](https://tinydeskai.io/?utm_source=shipwords&utm_medium=llms): a live site built with shipwords; its source is in [sites/tinydeskai-example](https://github.com/shipwords-dev/shipwords/tree/main/sites/tinydeskai-example) (still on the Workers setup of release v0.2.0 until it is moved over)
 - [Yir](https://yir.ai/?utm_source=shipwords&utm_medium=llms): default generation API, one key for GPT Image, Nano Banana, Seedream, FLUX, Seedance, Veo, Kling, Wan and more

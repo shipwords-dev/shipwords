@@ -23,7 +23,7 @@ export const YIR_USER_AGENT = `shipwords ${DEFAULT_USER_AGENT}`;
 
 /**
  * The SDK already retries network errors and 502/503/504 on submits and status reads, and Yir retries the task across providers,
- * so an error that reaches us is final: retrying in the Workflow would only keep the user waiting. A rate limit (429) is the exception.
+ * so an error that reaches us is final: retrying the step would only keep the user waiting. A rate limit (429) is the exception.
  */
 function toUpstreamError(error: unknown): UpstreamError {
   const e = error as { code?: string; message?: string; status?: number };

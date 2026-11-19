@@ -97,7 +97,7 @@ const PREP_EXTENSIONS: Readonly<Record<string, string>> = {
 };
 
 /**
- * Each Workflow step retries on its own; once retries are exhausted step.do throws. This fallback marks the job failed and refunds,
+ * Each step retries on its own; once retries are exhausted step.do throws. This fallback marks the job failed and refunds,
  * otherwise the job would stay in progress forever and the user's credits would never come back.
  */
 export async function runGeneration(deps: RunnerDeps, jobId: string, step: StepRunner): Promise<void> {
@@ -352,7 +352,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     });
   const fail = (code: string, message: string) => stop(`fail:${code}`, code, message);
 
-  // Timeout counts from job creation and is only checked inside a step: on Workflow replay, code outside steps runs again.
+  // Timeout counts from job creation and is only checked inside a step: on replay, code outside steps runs again.
   const deadline = setup.createdAt + setup.timeoutMinutes * 60_000;
   const prepCount = setup.prep ?? 0;
   /** Prep results: prep segment ID → image URL returned by the upstream; video segments' prep:<slot> placeholders are replaced with it at submit. */
@@ -492,7 +492,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       for (const partId of polled.hedge) {
         hedged.add(partId);
         const part = pending.find((candidate) => candidate.partId === partId)!;
-        // Best effort and no Workflow retries: if the copy can't be placed, keep waiting on the original.
+        // Best effort and no step retries: if the copy can't be placed, keep waiting on the original.
         const copy = await step.do(`hedge:${partId}`, async (info) => {
           const job = await activeJob(deps.db, jobId);
           if (!job) return null;
@@ -870,7 +870,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   }
   let finalOutputs = outputs;
   if (setup.compose) {
-    // Compose failures throw: once Workflow retries run out the fallback fails the job with a full refund. Retries write the same keys, so it's idempotent.
+    // Compose failures throw: once step retries run out the fallback fails the job with a full refund. Retries write the same keys, so it's idempotent.
     const composed = await step.do('compose', () => composeOutputs(deps, jobId, partKeys, outputs.length));
     if (!composed) return;
     finalOutputs = composed;

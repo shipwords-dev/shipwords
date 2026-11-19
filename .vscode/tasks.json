@@ -58,14 +58,14 @@
       "presentation": { "panel": "dedicated", "reveal": "always" }
     },
     {
-      "label": "template: local DB migrations (db:migrate:local)",
+      "label": "template: DB migrations (db:migrate, DATABASE_URL from .env)",
       "type": "shell",
-      "command": "pnpm db:migrate:local",
+      "command": "pnpm db:migrate",
       "options": { "cwd": "${workspaceFolder}/templates/ai-site" },
       "problemMatcher": []
     },
     {
-      // Start the dev server first; uses the test key in .dev.vars and forwards to APP_URL/api/webhooks/stripe.
+      // Start the dev server first; uses the test key in .env and forwards to APP_URL/api/webhooks/stripe.
       "label": "template: Stripe webhook forwarding (stripe listen)",
       "type": "shell",
       "command": "node ../../tools/stripe-listen.mjs",

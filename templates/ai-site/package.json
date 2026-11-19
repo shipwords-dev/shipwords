@@ -12,7 +12,8 @@
     "check": "pnpm typecheck && pnpm build && pnpm check:site",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node --env-file-if-exists=.env migrate.mjs",
-    "check:site": "node ../../tools/check-site.mjs ."
+    "check:site": "node ../../tools/check-site.mjs .",
+    "replace-output": "node --env-file-if-exists=.env replace-output.mjs"
   },
   "dependencies": {
     "@shipwords/core": "workspace:*",
