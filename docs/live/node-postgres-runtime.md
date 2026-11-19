@@ -1,6 +1,6 @@
 # Node and Postgres runtime
 
-Status: in progress. Steps 2–6 (database, job runs, interfaces, template, tools/CI/docs) are done; step 7 (a real site moves) is not started. Work happens on the `node-postgres` branch and merges into `main` once a real site runs on it; the last Cloudflare Workers release is tag `v0.2.0`. `docs/architecture.md`, `docs/local-development.md` and `docs/site-launch.md` already describe the new setup; this page goes once step 7 is done.
+Status: in progress. Steps 2–6 (database, job runs, interfaces, template, tools/CI/docs) are done. Step 7 is in progress: the first real site runs on this branch locally (production build, mock upstream, its production data imported into a scratch database), with a contract test from its real config through the runner to the SDK; real services (R2 over S3, email, the compose service on the server), a paid test and the cutover wait for the owner. Work happens on the `node-postgres` branch and merges into `main` once a real site runs on it; the last Cloudflare Workers release is tag `v0.2.0`. `docs/architecture.md`, `docs/local-development.md` and `docs/site-launch.md` already describe the new setup; this page goes once step 7 is done.
 
 A site becomes a Node server in a Docker container with a Postgres database. Cloudflare Workers, D1, Workflows and Containers stop being a runtime; Cloudflare stays in front as DNS, CDN and WAF, and R2 stays as object storage.
 
