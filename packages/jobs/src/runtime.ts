@@ -76,7 +76,7 @@ export function startSiteJobWorker(
   env: JobsEnv,
   models: readonly ModelDefinition[],
   site: SiteConfig,
-  options: SiteRunnerOptions & { db?: Db; worker?: WorkerOptions } = {},
+  options: SiteRunnerOptions & { db?: Db; store?: ObjectStore; worker?: WorkerOptions } = {},
 ): JobWorker {
   const db = options.db ?? createDb(env.DATABASE_URL);
   return startJobWorker(runnerDeps(env, db, models, site, options), options.worker);
