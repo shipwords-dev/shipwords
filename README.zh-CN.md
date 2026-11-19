@@ -112,7 +112,7 @@ Agent 会克隆仓库、生成站点并在本地跑起来。它遵守的规则�
 | `sites/<site>`             | 你的站，一个关键词一个，各自单独部署                                                                                                                                                |
 | `sites/tinydeskai-example` | tinydeskai.io 的完整源码（视频特效：照片槽位、整段一次编辑、结果检查、ffmpeg 拼接、内容页）；迁移之前仍是 `v0.2.0` 版的 Cloudflare Workers 部署方式                                 |
 | `apps/<sidecar>`           | 可选的小型 Worker，不属于任何单个站                                                                                                                                                 |
-| `tools/`                   | `new-site` 脚手架、`check-site` 上线检查、`list-sites`、worktree 初始化、dev 端口、Stripe webhook 转发（只用 Node 内置模块，带测试）                                                |
+| `tools/`                   | `new-site` 脚手架、`check-site` 上线检查、`list-sites`、worktree 初始化、dev 端口、Stripe webhook 转发、D1 导入（只用 Node 内置模块，带测试）                                       |
 | `docs/`                    | 架构、本地开发、上线手册（英文）                                                                                                                                                    |
 
 每个站是一个 TanStack Start + React 19 应用，由 Node 跑在独立的 Docker 容器里，有自己的 Postgres 数据库，文件存在 S3 兼容的存储桶（Cloudflare R2）里。Cloudflare 仍在最前面做 DNS 和 CDN。
@@ -135,6 +135,7 @@ pnpm lint && pnpm test:tools
 - [架构与设计取舍](docs/architecture.md)
 - [本地开发](docs/local-development.md)
 - [上线手册](docs/site-launch.md)
+- [从 Cloudflare Workers 迁移](docs/migrating-from-workers.md)（`v0.2.0` 及更早的站，英文）
 - [AI 编程 Agent 规则](AGENTS.md)
 - [贡献指南](CONTRIBUTING.md) 与 [安全政策](SECURITY.md)
 

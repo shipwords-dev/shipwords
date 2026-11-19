@@ -12,7 +12,7 @@
     "new-site": "node tools/new-site.mjs",
     "list-sites": "node tools/list-sites.mjs",
     "setup:worktree": "node tools/setup-worktree.mjs",
-    "test:tools": "node --test tools/tools.test.mjs",
+    "test:tools": "node --test tools/tools.test.mjs tools/import-d1.test.mjs",
     "check:packages": "pnpm --filter @shipwords/core --filter @shipwords/jobs check",
     "check:template": "pnpm --filter ./templates/ai-site check",
     "check:public": "node tools/check-public.mjs"

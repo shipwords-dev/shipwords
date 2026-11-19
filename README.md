@@ -112,7 +112,7 @@ The code is free under MIT, including commercial use. What you pay for:
 | `sites/<site>`             | Your sites, one per keyword, each deployed on its own                                                                                                                                                                                                   |
 | `sites/tinydeskai-example` | The full source of tinydeskai.io (video effect: photo slots, one-pass video edit, output check, ffmpeg compose, content pages); still on the Cloudflare Workers setup of release `v0.2.0` until it is moved over                                        |
 | `apps/<sidecar>`           | Optional small Workers that belong to no single site                                                                                                                                                                                                    |
-| `tools/`                   | `new-site` scaffolder, `check-site` launch checks, `list-sites`, worktree setup, dev-port, Stripe webhook forwarding (Node built-ins only, with tests)                                                                                                  |
+| `tools/`                   | `new-site` scaffolder, `check-site` launch checks, `list-sites`, worktree setup, dev-port, Stripe webhook forwarding, D1 import (Node built-ins only, with tests)                                                                                       |
 | `docs/`                    | Architecture, local development, launch handbook                                                                                                                                                                                                        |
 
 Each site is a TanStack Start + React 19 app served by Node in its own Docker container, with its own Postgres database and an S3-compatible bucket (Cloudflare R2). Cloudflare stays in front as DNS and CDN.
@@ -135,6 +135,7 @@ pnpm lint && pnpm test:tools
 - [Architecture and design choices](docs/architecture.md)
 - [Local development](docs/local-development.md)
 - [Site launch handbook](docs/site-launch.md)
+- [Migrating a site from Cloudflare Workers](docs/migrating-from-workers.md) (sites on `v0.2.0` or earlier)
 - [Rules for AI coding agents](AGENTS.md)
 - [Contributing](CONTRIBUTING.md) and [security policy](SECURITY.md)
 
