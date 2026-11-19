@@ -45,8 +45,16 @@ export interface LikenessInput {
   jobId: string;
   /** Composed video (R2 key). */
   key: string;
-  /** One per person: their photo (an R2 key, or a URL such as an upstream prep result) and the seconds [start, end) they appear in. */
-  people: { photo: { key: string } | { url: string }; ranges: [number, number][] }[];
+  /**
+   * One per person: their photo (an R2 key, or a URL such as an upstream prep result), the seconds [start, end) they appear in, and
+   * optionally per range the spots of that shot as fractions of width and height, theirs first: then the face in their spot is scored,
+   * not the best face in the frame (which in a group shot finds someone else).
+   */
+  people: {
+    photo: { key: string } | { url: string };
+    ranges: [number, number][];
+    spots?: [number, number][][];
+  }[];
 }
 
 export interface ExtractInput {
@@ -80,7 +88,8 @@ export interface Composer {
    */
   faces(input: FacesInput): Promise<number[]>;
   /**
-   * Likeness check: per person, the median over sampled frames of their ranges of the best face similarity (cosine, 0–1) to their photo;
+   * Likeness check: per person, the median over sampled frames of their ranges of the similarity (cosine, 0–1) between their photo and the
+   * face in their spot (or the best face in the frame, without spots);
    * null when the photo shows no face (an animal, say) or no frame was read. Same order as people. Read-only, repeatable.
    */
   likeness(input: LikenessInput): Promise<(number | null)[]>;
@@ -172,7 +181,10 @@ export function containerComposer(namespace: DurableObjectNamespace, bucket: R2B
     },
     async likeness(input) {
       const form = new FormData();
-      form.set('people', JSON.stringify(input.people.map(({ ranges }) => ({ ranges }))));
+      form.set(
+        'people',
+        JSON.stringify(input.people.map(({ ranges, spots }) => ({ ranges, ...(spots ? { spots } : {}) }))),
+      );
       form.set('video', await blobOf(bucket, input.key), 'video.mp4');
       // A photo can be listed several times (each likeness slot is also scored against the others' photos): fetch each once, in parallel.
       const blobs = new Map<string, Promise<Blob>>();

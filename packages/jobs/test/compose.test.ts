@@ -12,7 +12,15 @@ import {
   parsePoints,
   splitAtCuts,
 } from '../compose/compose.mjs';
-import { nextRepairPass, shotFrames } from '../src/repair';
+import {
+  judgeLikeness,
+  likenessAsks,
+  likenessShots,
+  missedAfterLikeness,
+  nextRepairPass,
+  SWAP_MARGIN,
+  shotFrames,
+} from '../src/repair';
 
 // ffmpeg itself runs in the container; here we only check args: retime ratio, frame-count cut, concat order, optional audio.
 describe('compose args', () => {
@@ -436,5 +444,156 @@ describe('repair planning', () => {
       shots: [0, 2],
     });
     expect(nextRepairPass(repair, filled, ['nobody'], [])).toBeNull();
+  });
+});
+
+describe('likeness asks', () => {
+  // A wide shot with three people (0, and again 3 on the same camera), a close-up (1), and a two-shot where "keys" shows in the corner (2).
+  const repair = {
+    upstreamModel: 'vendor/replace',
+    prompt: () => 'replace',
+    parameters: {},
+    maxCost: '0.10',
+    rounds: 3,
+    onMiss: 'deliver' as const,
+    shots: [['keys', 'left', 'right'], ['lead'], ['sax', 'keys'], ['keys', 'left', 'right']],
+    likeness: { lead: 0.4, keys: { min: 0.35, shots: [0, 3] } },
+  };
+  const segment = {
+    cuts: [5.333, 11.625, 15.0],
+    target: 17.688,
+    check: {
+      original: 'assets/demo/clip.mp4',
+      faces: {
+        keys: [
+          [0.395, 0.496, 0],
+          [0.87, 0.824, 12.5],
+        ] as const,
+        left: [0.073, 0.204, 0] as const,
+        right: [0.859, 0.224, 0] as const,
+        lead: [0.793, 0.323, 5.4] as const,
+        sax: [0.186, 0.287, 11.67] as const,
+      },
+      maxSimilarity: 0.45,
+    },
+    repair,
+  };
+  const everyone = ['lead', 'sax', 'keys', 'left', 'right'];
+
+  it('scores each person on the face in their spot, one range per shot, own spot first; only the named shots', () => {
+    const asks = likenessAsks(segment, 24, everyone, {});
+    expect(asks.map(({ slot }) => slot)).toEqual(['lead', 'keys']);
+    const [lead, keys] = asks;
+    expect(lead).toEqual({
+      slot: 'lead',
+      min: 0.4,
+      photos: ['lead', 'sax', 'keys', 'left', 'right'],
+      ranges: [[128 / 24, 279 / 24]],
+      spots: [[[0.793, 0.323]]],
+    });
+    // The wide shots each get their own range (not merged), with the point read at 0 s reused for shot 3 (same people, same camera);
+    // the corner half face in shot 2 is not scored.
+    expect(keys!.ranges).toEqual([
+      [0, 128 / 24],
+      [360 / 24, 425 / 24],
+    ]);
+    expect(keys!.spots).toEqual([
+      [
+        [0.395, 0.496],
+        [0.073, 0.204],
+        [0.859, 0.224],
+      ],
+      [
+        [0.395, 0.496],
+        [0.073, 0.204],
+        [0.859, 0.224],
+      ],
+    ]);
+    expect(keys!.photos).toEqual(['keys', 'lead', 'sax', 'left', 'right']);
+  });
+
+  it('pets are neither checked nor a rival of anyone; unfilled seats are left out', () => {
+    const asks = likenessAsks(segment, 24, ['lead', 'keys', 'left'], { keys: 'pet', left: 'person' });
+    expect(asks.map(({ slot, photos }) => [slot, photos])).toEqual([['lead', ['lead', 'left']]]);
+  });
+
+  it('a person without a spot in a shot is scored on the best face, as before', () => {
+    const noPoint = {
+      ...segment,
+      check: { ...segment.check, faces: { ...segment.check.faces, lead: [0.5, 0.5, 0] as const } },
+    };
+    const [lead] = likenessAsks(noPoint, 24, ['lead'], {});
+    expect(lead!.spots).toBeUndefined();
+  });
+
+  it('judges own score against the threshold, and a swap only when another photo wins by more than the margin', () => {
+    const asks = likenessAsks(segment, 24, ['lead', 'keys'], {});
+    // lead: 0.44 passes 0.4; keys: 0.24 under 0.35 (unlike its photo).
+    expect(judgeLikeness(asks, [0.44, 0.1, 0.24, 0.1])).toEqual({
+      missed: ['keys'],
+      passed: ['lead'],
+      swapped: [],
+    });
+    // keys looks like its photo (0.6) but the lead's photo matches that face by more than the margin: the lead's customer sits there.
+    expect(judgeLikeness(asks, [0.6, 0.1, 0.6, 0.6 + SWAP_MARGIN + 0.01])).toEqual({
+      missed: ['keys'],
+      passed: ['lead'],
+      swapped: ['keys'],
+    });
+    // A look-alike within the margin is not a swap; no face in the spot (null) is neither missed nor passed.
+    expect(judgeLikeness(asks, [null, 0.1, 0.6, 0.75])).toEqual({
+      missed: [],
+      passed: ['keys'],
+      swapped: [],
+    });
+    // Exactly the margin is not more than it (0.47 + 0.2 is 0.6699999999999999 in floating point).
+    expect(judgeLikeness(asks, [null, 0.1, 0.47, 0.67]).swapped).toEqual([]);
+    expect(judgeLikeness(asks, [null, 0.1, 0.47, 0.671]).swapped).toEqual(['keys']);
+  });
+
+  it('a likeness pass clears an original-face miss only in the shots it scored', () => {
+    const scored = likenessShots(repair);
+    expect(scored).toEqual({ lead: [1], keys: [0, 3] });
+    const passed = { missed: [], passed: ['keys'] };
+    // The original keys player is still in the sax shot's corner (shot 2): the wide-shot pass doesn't clear it.
+    expect(missedAfterLikeness(['keys'], ['keys'], passed, { keys: [2] }, scored)).toEqual(['keys']);
+    // Seen in a wide shot, which the pass scored: a profile false alarm, cleared as before.
+    expect(missedAfterLikeness(['keys'], ['keys'], passed, { keys: [0] }, scored)).toEqual([]);
+  });
+
+  it('a focus that leaves out the first group never uses its crop box there', () => {
+    // keys sits left in shot 0 (its crop box) and right in shot 1; only shot 1 is scored.
+    const cropped = {
+      ...repair,
+      shots: [['keys', 'left'], ['keys'], ['lead'], ['left']],
+      crops: { keys: [0, 0, 0.4, 0.4] as const },
+    };
+    const focus = { keys: [1] };
+    const first = nextRepairPass(cropped, ['keys', 'left', 'lead'], ['keys'], [], {}, focus)!;
+    expect(first).toEqual({ slots: ['keys'], shots: [1] });
+    expect(nextRepairPass(cropped, ['keys', 'left', 'lead'], ['keys'], [first], {}, focus)).toEqual({
+      slots: ['keys'],
+      shots: [1],
+    });
+  });
+
+  it('a slot missed for likeness alone is repaired only in the shots it was scored in', () => {
+    const filled = everyone;
+    const focus = { keys: likenessShots(repair).keys! };
+    const first = nextRepairPass(repair, filled, ['keys'], [], {}, focus)!;
+    expect(first).toEqual({ slots: ['keys'], shots: [0, 3] });
+    // Not the sax shot's corner next: a pass there can't change the wide-shot score.
+    expect(nextRepairPass(repair, filled, ['keys'], [first], {}, focus)).toEqual({
+      slots: ['keys'],
+      shots: [0, 3],
+    });
+    // Also seen as the original in the corner: both groups.
+    const both = { keys: [2, ...focus.keys] };
+    const corner = nextRepairPass(repair, filled, ['keys'], [], { keys: [2] }, both)!;
+    expect(corner).toEqual({ slots: ['keys'], shots: [2] });
+    expect(nextRepairPass(repair, filled, ['keys'], [corner], { keys: [2] }, both)).toEqual({
+      slots: ['keys'],
+      shots: [0, 3],
+    });
   });
 });

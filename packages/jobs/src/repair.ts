@@ -1,8 +1,20 @@
 // Repair planning for effect segments whose output check found original people (segment.repair): which shots and slots the next pass covers.
 // Pure functions; the runner executes the passes and the compose container cuts and blends the frames.
 
-import { type CropBox, type EffectRepair, type FacePoint, pointsOf, type SlotKind } from './models';
+import {
+  type CropBox,
+  type EffectRepair,
+  type EffectSegment,
+  type FacePoint,
+  likenessRule,
+  pointsOf,
+  type SlotKind,
+  shotAt,
+  shotSpots,
+} from './models';
 import type { SubmitInput } from './upstream';
+
+export { shotAt };
 
 /** The check points of the given slots, flattened in slot order, and whose each one is. */
 export function checkPoints(
@@ -45,17 +57,30 @@ export function judgeCheck(
 
 /**
  * Slots still missed after both checks: a face the swap check matched to the original but that clearly looks like the user's photo is a
- * false alarm (a profile shot keeps the original's outline); a face the likeness check missed (unlike its photo, or closer to another
- * filled slot's photo) is missed however it scored. In `slots` order.
+ * false alarm (a profile shot keeps the original's outline), as long as the likeness check scored every shot the original was seen in
+ * (where; scored: slot → its likeness shots, all of them when absent); a face the likeness check missed (unlike its photo, or closer to
+ * another filled slot's photo) is missed however it scored. In `slots` order.
  */
 export function missedAfterLikeness(
   slots: readonly string[],
   faceMissed: readonly string[],
   likeness: { missed: readonly string[]; passed: readonly string[] },
+  where: Readonly<Record<string, readonly number[]>> = {},
+  scored: Readonly<Record<string, readonly number[]>> = {},
 ): string[] {
+  // A pass on the wide shots says nothing about an original left in another shot's corner.
+  const cleared = (slot: string) =>
+    likeness.passed.includes(slot) &&
+    (!scored[slot] || (where[slot] ?? []).every((shot) => scored[slot]!.includes(shot)));
   return slots.filter(
-    (slot) =>
-      (faceMissed.includes(slot) && !likeness.passed.includes(slot)) || likeness.missed.includes(slot),
+    (slot) => (faceMissed.includes(slot) && !cleared(slot)) || likeness.missed.includes(slot),
+  );
+}
+
+/** Slot → the shots its repair.likeness threshold is scored in. */
+export function likenessShots(repair: EffectRepair): Record<string, number[]> {
+  return Object.fromEntries(
+    Object.keys(repair.likeness ?? {}).map((slot) => [slot, likenessRule(repair, slot)!.shots]),
   );
 }
 
@@ -124,7 +149,7 @@ export function shotGroups(shots: readonly (readonly string[])[]): { shots: numb
  * framing, so a person gets one face and one set of accessories across them. Groups where the check saw the original
  * (where: slot → shot indices) come first, then the slot's other groups it has not had a pass on. After that, when the slot has a crop
  * box and its first group has had a whole-frame pass for it, the pass repairs that box alone; otherwise the slot's groups take turns
- * again (with a new seed).
+ * again (with a new seed). focus (slot → shot indices) limits a slot to the groups with those shots.
  */
 export function nextRepairPass(
   repair: EffectRepair,
@@ -132,6 +157,7 @@ export function nextRepairPass(
   failing: readonly string[],
   done: readonly RepairPass[],
   where: Readonly<Record<string, readonly number[]>> = {},
+  focus: Readonly<Record<string, readonly number[]>> = {},
 ): RepairPass | null {
   // Unfilled slots keep the original person on purpose and are never repaired.
   const candidates = failing.filter(
@@ -143,7 +169,13 @@ export function nextRepairPass(
     undefined,
   );
   if (!slot) return null;
-  const groups = shotGroups(repair.shots).filter((group) => group.slots.includes(slot));
+  const all = shotGroups(repair.shots).filter((group) => group.slots.includes(slot));
+  // A slot missed for its likeness is repaired only where that was scored (plus where the original was seen): a pass elsewhere can't
+  // change its score.
+  const aimed = focus[slot]
+    ? all.filter((group) => group.shots.some((shot) => focus[slot]!.includes(shot)))
+    : all;
+  const groups = aimed.length > 0 ? aimed : all;
   const same = (pass: RepairPass, group: { shots: number[] }) => pass.shots.join() === group.shots.join();
   const mine = done.filter((pass) => pass.slots.includes(slot));
   const covered = (group: { shots: number[] }) => mine.some((pass) => !pass.crop && same(pass, group));
@@ -152,7 +184,8 @@ export function nextRepairPass(
   const whole = (group: { shots: number[] }): RepairPass => ({ slots: [slot], shots: group.shots });
   const fresh = [...flagged, ...groups].find((group) => !covered(group));
   if (fresh) return whole(fresh);
-  const crop = repair.crops?.[slot];
+  // The crop box belongs to the slot's first group of all; a focus that leaves that group out never uses it.
+  const crop = groups.includes(all[0]!) ? repair.crops?.[slot] : undefined;
   const first = groups[0]!;
   if (crop && (flagged.length === 0 || flagged.includes(first)))
     return { slots: [slot], shots: first.shots, crop };
@@ -214,12 +247,6 @@ export function checkWindows(
   });
 }
 
-/** Shot index of a time (seconds) on the segment's timeline, given its cuts. */
-export function shotAt(cuts: readonly number[], seconds: number): number {
-  const index = cuts.findIndex((cut) => seconds < cut);
-  return index === -1 ? cuts.length : index;
-}
-
 /**
  * Frame ranges [start, end) of the given shots in the final cut, adjacent shots merged.
  * Shot i runs from cut i - 1 (0 for the first) to cut i (target for the last). Compose rounds each shot's length to frames on its own
@@ -244,4 +271,89 @@ export function shotFrames(
     else ranges.push([start, end]);
   }
   return ranges;
+}
+
+/**
+ * How much more another person's photo must match a slot's face than the slot's own photo before the slot counts as swapped: two
+ * customers can look alike. Stored tiny-desk renders: a wrong person beat their own photo by 0.3–0.56, a look-alike at a small
+ * back-row face by 0.41, right people by under 0.15.
+ */
+export const SWAP_MARGIN = 0.2;
+
+/** One likeness slot to score: its threshold, the people whose photos are scored on its face (itself first), and where to look. */
+export interface LikenessAsk {
+  slot: string;
+  min: number;
+  /** The slot, then every other filled person (pets left out): one score each, in this order. */
+  photos: string[];
+  /** Seconds [start, end), one per likeness shot. */
+  ranges: [number, number][];
+  /** Per range, the spots of that shot as [x, y], the slot's own first; absent when a shot has no point for the slot. */
+  spots?: [number, number][][];
+}
+
+/**
+ * The likeness check of a composed video (repair.likeness): for each filled person with a threshold, the shots it is scored in (one
+ * range each, so each carries its own shot's spots) and the photos scored on that face. Pets are skipped: SFace is a human face model
+ * and animals of a kind match each other.
+ */
+export function likenessAsks(
+  segment: Pick<EffectSegment, 'cuts' | 'target' | 'check'> & { repair: EffectRepair },
+  fps: number,
+  filled: readonly string[],
+  kinds: Readonly<Record<string, SlotKind>>,
+): LikenessAsk[] {
+  const { repair, cuts, target, check } = segment;
+  const people = filled.filter((slot) => kinds[slot] !== 'pet');
+  return people.flatMap((slot) => {
+    const rule = likenessRule(repair, slot);
+    if (!rule || !cuts || target === undefined || !check) return [];
+    const ranges: [number, number][] = [];
+    const spots: [number, number][][] = [];
+    for (const shot of rule.shots) {
+      const [start, end] = shotFrames(cuts, target, fps, [shot])[0]!;
+      const here = shotSpots(check.faces, repair.shots, cuts, shot);
+      ranges.push([start / fps, end / fps]);
+      spots.push(
+        [slot, ...repair.shots[shot]!.filter((other) => other !== slot)].flatMap((who) =>
+          here[who] ? [here[who]] : [],
+        ),
+      );
+    }
+    // Validated configs have every spot; a range without the slot's own would score someone else, so then score the best face instead.
+    const spotted = rule.shots.every((shot) => shotSpots(check.faces, repair.shots, cuts, shot)[slot]);
+    return [
+      {
+        slot,
+        min: rule.min,
+        photos: [slot, ...people.filter((other) => other !== slot)],
+        ranges,
+        ...(spotted ? { spots } : {}),
+      },
+    ];
+  });
+}
+
+/**
+ * Read likeness scores (one per photo of each ask, in order): a slot whose own score is under its threshold, or whose face another
+ * person's photo matches by more than SWAP_MARGIN better, is missed; a slot with no score (no face in the photo or in its spot) is neither.
+ */
+export function judgeLikeness(
+  asks: readonly LikenessAsk[],
+  scores: readonly (number | null)[],
+): { missed: string[]; passed: string[]; swapped: string[] } {
+  const verdict = { missed: [] as string[], passed: [] as string[], swapped: [] as string[] };
+  let at = 0;
+  for (const { slot, min, photos } of asks) {
+    const own = scores[at];
+    const others = scores.slice(at + 1, at + photos.length).filter((score): score is number => score != null);
+    at += photos.length;
+    if (own == null) continue;
+    // In thousandths: scores come rounded to 3 places, and 0.47 + 0.2 is 0.6699999999999999 in floating point.
+    if (others.some((score) => Math.round((score - own) * 1000) > Math.round(SWAP_MARGIN * 1000)))
+      verdict.swapped.push(slot);
+    if (own < min || verdict.swapped.includes(slot)) verdict.missed.push(slot);
+    else verdict.passed.push(slot);
+  }
+  return verdict;
 }

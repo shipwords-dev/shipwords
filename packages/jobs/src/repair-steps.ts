@@ -12,6 +12,9 @@ import {
   checkWindows,
   fitAspect,
   judgeCheck,
+  judgeLikeness,
+  likenessAsks,
+  likenessShots,
   missedAfterLikeness,
   nextRepairPass,
   photoOf,
@@ -89,8 +92,9 @@ interface Likeness {
 const NO_LIKENESS: Likeness = { missed: [], passed: [], swapped: [] };
 
 /**
- * Filled slots of a composed video that don't look enough like their photos (repair.likeness), each scored over the shots it is in,
- * and against every other filled slot's photo over the same shots: a face closer to someone else's photo than to its own is a swap.
+ * Filled slots of a composed video that don't look enough like their photos (repair.likeness), each scored on the face in its spot over
+ * its likeness shots, and against every other filled person's photo on the same face: a face clearly closer to someone else's photo
+ * (by more than SWAP_MARGIN) is a swap.
  * Soft by design: a check error or a photo with no face counts as no miss, so this only ever adds repair passes, never fails or refunds.
  */
 async function unlike(
@@ -114,50 +118,34 @@ async function unlike(
     !deps.composer
   )
     return NO_LIKENESS;
-  const { likeness, shots } = repair;
-  const { cuts, target } = segment;
   const result = await step
     .do(stepName, async (): Promise<Likeness> => {
       const row = await activeJob(deps.db, jobId);
       if (!row) return NO_LIKENESS;
       const model = deps.models.find((m) => m.id === row.modelId)!;
-      const filled = partsOf(row, model)[index]!.slots ?? [];
+      const part = partsOf(row, model)[index]!;
+      const filled = part.slots ?? [];
       const references = ctx.submitInput(row, index).references;
-      const slots = filled.filter((slot) => likeness[slot] !== undefined);
-      if (slots.length === 0) return NO_LIKENESS;
+      const asks = likenessAsks({ ...segment, repair }, fps, filled, part.kinds ?? {});
+      if (asks.length === 0) return NO_LIKENESS;
       // Site uploads (the photo itself when prep fell back to it) are read from the bucket, not over HTTP from the site.
       const files = deps.fileUrl?.('') ?? null;
       const photo = (slot: string) => {
         const url = identityPhoto(ctx, repair.photoView, references, filled, slot);
         return files && url.startsWith(files) ? { key: url.slice(files.length) } : { url };
       };
-      // Per likeness slot: its own photo first, then each other filled slot's photo, all over the likeness slot's shots.
-      const people = slots.flatMap((slot) => {
-        const ofSlot = shots.flatMap((inShot, i) => (inShot.includes(slot) ? [i] : []));
-        const ranges = shotFrames(cuts, target!, fps, ofSlot).map(
-          ([start, end]) => [start / fps, end / fps] as [number, number],
-        );
-        return [slot, ...filled.filter((other) => other !== slot)].map((who) => ({
-          photo: photo(who),
-          ranges,
-        }));
-      });
+      const people = asks.flatMap(({ photos, ranges, spots }) =>
+        photos.map((who) => ({ photo: photo(who), ranges, ...(spots ? { spots } : {}) })),
+      );
       const scores = await deps.composer!.likeness({ jobId, key, people });
-      deps.log?.('likeness checked', { jobId, part: partId, key, slots, scores });
-      const verdict: Likeness = { missed: [], passed: [], swapped: [] };
-      let at = 0;
-      for (const slot of slots) {
-        const own = scores[at];
-        const others = scores
-          .slice(at + 1, at + filled.length)
-          .filter((score): score is number => score != null);
-        at += filled.length;
-        if (own == null) continue;
-        if (others.some((score) => score > own)) verdict.swapped.push(slot);
-        if (own < likeness[slot]! || verdict.swapped.includes(slot)) verdict.missed.push(slot);
-        else verdict.passed.push(slot);
-      }
-      return verdict;
+      deps.log?.('likeness checked', {
+        jobId,
+        part: partId,
+        key,
+        slots: asks.map(({ slot }) => slot),
+        scores,
+      });
+      return judgeLikeness(asks, scores);
     })
     .catch((error: unknown) => {
       deps.log?.('likeness check errored', { jobId, part: partId, key, error: String(error) });
@@ -210,12 +198,19 @@ export async function repairOutputs(
   const passes: RepairPass[] = [];
   let current = composed[0]!.key;
   let silent = composed[1]!.key;
+  const scored = likenessShots(repair);
   const first = await unlike(ctx, `likeness:${partId}`, partId, index, current);
   missed = missedAfterLikeness(
     [...initial, ...first.missed.filter((slot) => !initial.includes(slot))],
     initial,
     first,
+    where,
+    scored,
   );
+  // Slots the last likeness check missed: their passes go to the shots it scored (and where the original was seen).
+  let unlikeMissed = first.missed;
+  const focus = () =>
+    Object.fromEntries(unlikeMissed.map((slot) => [slot, [...(where[slot] ?? []), ...(scored[slot] ?? [])]]));
   if (first.swapped.length > 0)
     deps.log?.('faces swapped between slots', { jobId, part: partId, slots: first.swapped });
   if (missed.length === 0) return composed;
@@ -286,7 +281,7 @@ export async function repairOutputs(
       // or a resume after the planner or the timeline (cuts, frame size) changed, must put that clip back into the same frames.
       // Rounds cached before this step existed plan again with the current rules; deploy such a change when no job is between repair steps.
       const planned = await step.do(`${label}:pass`, async () => {
-        const pass = nextRepairPass(repair, job.slots, missed, passes, where);
+        const pass = nextRepairPass(repair, job.slots, missed, passes, where, focus());
         if (!pass) return null;
         return {
           pass,
@@ -401,7 +396,8 @@ export async function repairOutputs(
       const unlikeNow = await unlike(ctx, `${label}:likeness`, partId, index, current);
       const judged = judgeCheck(check.faces!, slots, scores, check.maxSimilarity, cuts);
       where = judged.where;
-      missed = missedAfterLikeness(job.slots, judged.missed, unlikeNow);
+      missed = missedAfterLikeness(job.slots, judged.missed, unlikeNow, where, scored);
+      unlikeMissed = unlikeNow.missed;
       if (missed.length < best.missed.length)
         best = { song: current, silent, missed, swapped: unlikeNow.swapped };
       if (missed.length > 0) continue;

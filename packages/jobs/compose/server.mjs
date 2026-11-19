@@ -5,8 +5,9 @@
 // GET  /files/<id>/song.mp4 | /files/<id>/silent.mp4  read results.
 // POST /faces  multipart: video (model output), original (unmasked clip of the shot), seconds, points (JSON [[x, y], ...]).
 //   Returns { similarity: [...] }: per point, how closely any face in the output matches the original person there (faces.py). Read-only.
-// POST /likeness  multipart: video (composed), people (JSON [{ ranges: [[start, end], ...] seconds }, ...]), photo-0…photo-N.
-//   Returns { similarity: [...] }: per person, how much their face in those ranges looks like their photo, or null (faces.py). Read-only.
+// POST /likeness  multipart: video (composed), people (JSON [{ ranges: [[start, end], ...] seconds, spots?: [[[x, y], ...] per range] }, ...]),
+//   photo-0…photo-N. Returns { similarity: [...] }: per person, how much their face in those ranges (the face in their spot, own spot first,
+//   when spots are given) looks like their photo, or null (faces.py). Read-only.
 // POST /extract  multipart: manifest (JSON: { ranges: [[start, end), ...] frames, crop?: [x, y, w, h], width, height, fps }), video.
 //   Returns those frames joined into one MP4 with the same stretch of the video's soundtrack, if it has one (the box only, scaled
 //   up, with crop): the input of a repair pass. Read-only.
@@ -212,12 +213,28 @@ async function likeness(req) {
     range.length === 2 &&
     range.every((value) => Number.isFinite(value) && value >= 0 && value <= 60) &&
     range[0] < range[1];
+  const point = (spot) =>
+    Array.isArray(spot) &&
+    spot.length === 2 &&
+    spot.every((value) => Number.isFinite(value) && value >= 0 && value <= 1);
+  // Optional spots: per range, this person's spot first, then the other people's spots in that shot.
+  const spotted = (person) =>
+    person.spots === undefined ||
+    (Array.isArray(person.spots) &&
+      person.spots.length === person.ranges.length &&
+      person.spots.every(
+        (spots) => Array.isArray(spots) && spots.length > 0 && spots.length <= 10 && spots.every(point),
+      ));
   if (
     !Array.isArray(people) ||
     people.length === 0 ||
     people.length > 10 ||
     !people.every(
-      (person) => Array.isArray(person?.ranges) && person.ranges.length > 0 && person.ranges.every(valid),
+      (person) =>
+        Array.isArray(person?.ranges) &&
+        person.ranges.length > 0 &&
+        person.ranges.every(valid) &&
+        spotted(person),
     )
   )
     throw new Error('bad people');
@@ -230,7 +247,7 @@ async function likeness(req) {
     for (const [i, person] of people.entries()) {
       const photo = join(dir, `photo-${i}`);
       await save(form, `photo-${i}`, photo);
-      args.push({ photo, ranges: person.ranges });
+      args.push({ photo, ranges: person.ranges, ...(person.spots ? { spots: person.spots } : {}) });
     }
     const { stdout } = await run('python3', ['faces.py', 'likeness', video, JSON.stringify(args)]);
     const similarity = JSON.parse(stdout);

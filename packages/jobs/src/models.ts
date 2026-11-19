@@ -187,11 +187,15 @@ export interface EffectRepair {
   aspect?: number;
   /**
    * Slot → lowest likeness (cosine, 0–1) between the person's photo and their face in the shots they are in, checked on the composed
-   * video. A filled slot below it is repaired like a missed swap and counts as missed when picking the best version. Needs onMiss
-   * 'deliver': a person who doesn't look enough like their photo is never a reason to refund. For close-ups only: small or profile
-   * faces score low even when right.
+   * video; `{ min, shots }` scores only those shots (e.g. not another shot's corner where only half the face shows). The face is the one in
+   * the slot's spot (its check.faces point in that shot's group; every person in those shots needs one), so in a group shot someone else's
+   * face never counts. The same face is scored against the other filled people's photos: one that beats the slot's own by more than
+   * SWAP_MARGIN means the wrong person sits there. A filled slot below the threshold or swapped is repaired like a missed swap and counts
+   * as missed when picking the best version. Pet slots are skipped (SFace is a human face model). Needs onMiss 'deliver': a person who
+   * doesn't look enough like their photo is never a reason to refund. Small or profile faces score low even when right: only set it where
+   * stored renders show a gap between right and wrong people.
    */
-  likeness?: Readonly<Record<string, number>>;
+  likeness?: Readonly<Record<string, number | LikenessRule>>;
   /**
    * Prep view (1–3) to use as each slot's photo in repair passes and the likeness check, instead of the image the segment sent. For a segment
    * that sends a composite per person (a two-panel image: face and outfit), point this at a plain face view, so the replace model and the
@@ -216,8 +220,51 @@ export interface EffectCheck {
 
 export type FacePoint = readonly [number, number] | readonly [number, number, number];
 
+/** A repair.likeness threshold scored only in some of the slot's shots (shot indices as in repair.shots). */
+export interface LikenessRule {
+  min: number;
+  shots: readonly number[];
+}
+
 /** Most face points (check) or people (likeness) the compose container takes in one call (compose.mjs parsePoints, server.mjs). */
 const CONTAINER_LIMIT = 10;
+
+/** Shot index of a time (seconds) on the segment's timeline, given its cuts. */
+export function shotAt(cuts: readonly number[], seconds: number): number {
+  const index = cuts.findIndex((cut) => seconds < cut);
+  return index === -1 ? cuts.length : index;
+}
+
+/** A repair.likeness entry: the lowest likeness and the shots it is scored in (all of the slot's shots unless it names some), or null. */
+export function likenessRule(repair: EffectRepair, slot: string): { min: number; shots: number[] } | null {
+  const value = repair.likeness?.[slot];
+  if (value === undefined) return null;
+  const all = repair.shots.flatMap((inShot, i) => (inShot.includes(slot) ? [i] : []));
+  return typeof value === 'number'
+    ? { min: value, shots: all }
+    : { min: value.min, shots: all.filter((shot) => value.shots.includes(shot)) };
+}
+
+/**
+ * Where each person of a shot sits: their check.faces point that falls in the shot's group (the point's shot by its time, and every
+ * shot listing the same people, which share the camera), as [x, y]. People with no point there are left out.
+ */
+export function shotSpots(
+  faces: Readonly<Record<string, FacePoint | readonly FacePoint[]>>,
+  shots: readonly (readonly string[])[],
+  cuts: readonly number[],
+  shot: number,
+): Record<string, [number, number]> {
+  const people = (index: number) => [...(shots[index] ?? [])].sort().join();
+  const spots: Record<string, [number, number]> = {};
+  for (const slot of shots[shot] ?? []) {
+    const point = (faces[slot] ? pointsOf(faces[slot]) : []).find(
+      (candidate) => people(shotAt(cuts, candidate[2] ?? 0)) === people(shot),
+    );
+    if (point) spots[slot] = [point[0], point[1]];
+  }
+  return spots;
+}
 
 /** A check.faces entry as a list of points. */
 export function pointsOf(entry: FacePoint | readonly FacePoint[]): readonly FacePoint[] {
@@ -627,10 +674,43 @@ function validateRepair(modelId: string, effect: EffectSpec, segment: EffectSegm
       ))
   )
     throw new Error(`${where}.photoView must be a prep view (1–3) that some slot of this segment has`);
-  for (const [slot, min] of Object.entries(repair.likeness ?? {})) {
+  for (const [slot, value] of Object.entries(repair.likeness ?? {})) {
     if (repair.onMiss !== 'deliver') throw new Error(`${where}.likeness needs onMiss 'deliver'`);
-    if (!shots.some((slots) => slots.includes(slot)) || !(min > 0 && min < 1))
-      throw new Error(`${where}.likeness must map slots in some shot to a similarity between 0 and 1`);
+    const min = typeof value === 'number' ? value : value.min;
+    const inShots = shots.flatMap((slots, i) => (slots.includes(slot) ? [i] : []));
+    if (
+      inShots.length === 0 ||
+      !(min > 0 && min < 1) ||
+      (typeof value !== 'number' &&
+        (value.shots.length === 0 || value.shots.some((shot) => !inShots.includes(shot))))
+    )
+      throw new Error(
+        `${where}.likeness must map slots in some shot to a similarity between 0 and 1, and name only shots the slot is in`,
+      );
+    // Whole groups only: the original-face check reports a group by its point's shot, so a pass on part of a group could clear an
+    // original left in its other shots.
+    const scored = likenessRule(repair, slot)!.shots;
+    const people = (index: number) => [...shots[index]!].sort().join();
+    if (
+      scored.some((shot) =>
+        inShots.some((other) => people(other) === people(shot) && !scored.includes(other)),
+      )
+    )
+      throw new Error(`${where}.likeness ${slot}: shots must take whole groups (shots with the same people)`);
+    // The face scored is the one in the slot's spot, so everyone in those shots needs a check point there to split the frame,
+    // each at a different place.
+    for (const shot of scored) {
+      const spots = shotSpots(segment.check!.faces, shots, segment.cuts!, shot);
+      const missing = shots[shot]!.filter((other) => !spots[other]);
+      if (missing.length)
+        throw new Error(
+          `${where}.likeness ${slot}: shot ${shot} needs check.faces points for ${missing.join(', ')} in that shot's group`,
+        );
+      if (new Set(Object.values(spots).map((spot) => spot.join())).size !== Object.keys(spots).length)
+        throw new Error(
+          `${where}.likeness ${slot}: people in shot ${shot} need check.faces points at different places`,
+        );
+    }
   }
 }
 

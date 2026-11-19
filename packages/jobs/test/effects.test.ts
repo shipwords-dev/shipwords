@@ -1808,14 +1808,23 @@ describe('effect compose', () => {
           expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded', errorMessage: null });
         });
 
-        it('the face looks like it should but more like another filled slot: a swap, repaired', async () => {
+        it('the face looks like it should but clearly more like another filled slot: a swap, repaired', async () => {
           const { jobId, adapter } = await repairJob();
           const composer = new FakeComposer();
-          // solo looks enough like its photo (0.6), but more like front's (0.7).
-          composer.likenessScores = [[0.6, 0.7, 0.1]];
+          // solo looks enough like its photo (0.6), but more like front's by over SWAP_MARGIN (0.85).
+          composer.likenessScores = [[0.6, 0.85, 0.1]];
           await runGeneration(likenessDeps(adapter, composer), jobId, durableSteps());
           expect(adapter.submits).toHaveLength(2);
           expect(adapter.submits[1]!.input.prompt).toBe('replace solo');
+          expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
+        });
+
+        it('another photo matches a little better (two people who look alike): not a swap, no pass', async () => {
+          const { jobId, adapter } = await repairJob();
+          const composer = new FakeComposer();
+          composer.likenessScores = [[0.6, 0.75, 0.1]];
+          await runGeneration(likenessDeps(adapter, composer), jobId, durableSteps());
+          expect(adapter.submits).toHaveLength(1);
           expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
         });
 
@@ -1831,9 +1840,9 @@ describe('effect compose', () => {
               jobId,
               key: `jobs/${jobId}/1.mp4`,
               people: [
-                { photo: { key: 'uploads/up_s.png' }, ranges: [[2, 4]] },
-                { photo: { key: 'uploads/up_f.png' }, ranges: [[2, 4]] },
-                { photo: { key: 'uploads/up_e.png' }, ranges: [[2, 4]] },
+                { photo: { key: 'uploads/up_s.png' }, ranges: [[2, 4]], spots: [[[0.5, 0.4]]] },
+                { photo: { key: 'uploads/up_f.png' }, ranges: [[2, 4]], spots: [[[0.5, 0.4]]] },
+                { photo: { key: 'uploads/up_e.png' }, ranges: [[2, 4]], spots: [[[0.5, 0.4]]] },
               ],
             },
             expect.objectContaining({ key: `jobs/${jobId}/repair-band-0-song.mp4` }),
@@ -2043,8 +2052,15 @@ describe('effect compose', () => {
             },
           },
         ]);
-      expect(withExtraRepair({ likeness: { front: 0.5, edge: 0.5 } })).not.toThrow();
-      expect(withExtraRepair({ likeness: { front: 0.5, edge: 0.5, solo: 0.5 } })).toThrow(/at most 10/);
+      // Likeness scores the face in each person's spot, so everyone in a likeness shot needs a check point in that shot's group.
+      const spotted = { front: [0.5, 0.5], edge: [0.1, 0.1], solo: [0.9, 0.1], extra: [0.5, 0.4, 3] };
+      expect(withExtraRepair({ likeness: { front: 0.5, edge: 0.5 } }, spotted)).not.toThrow();
+      expect(withExtraRepair({ likeness: { front: 0.5, edge: 0.5, solo: 0.5 } }, spotted)).toThrow(
+        /at most 10/,
+      );
+      expect(withExtraRepair({ likeness: { front: 0.5 } })).toThrow(
+        /shot 0 needs check.faces points for solo/,
+      );
       const four = [
         [0.1, 0.1],
         [0.2, 0.2],
@@ -2062,6 +2078,30 @@ describe('effect compose', () => {
       expect(withRepair({ repair: { ...repair, likeness: { solo: 0.5 } } })).toThrow(/onMiss 'deliver'/);
       expect(withRepair({ repair: { ...deliver, likeness: { solo: 1.2 } } })).toThrow(/likeness/);
       expect(withRepair({ repair: { ...deliver, likeness: { nobody: 0.5 } } })).toThrow(/likeness/);
+      // { min, shots } scores only some of the person's shots, and only shots they are in.
+      expect(
+        withRepair({ repair: { ...deliver, likeness: { front: { min: 0.35, shots: [0, 2] } } } }),
+      ).not.toThrow();
+      expect(withRepair({ repair: { ...deliver, likeness: { front: { min: 0.35, shots: [1] } } } })).toThrow(
+        /name only shots the slot is in/,
+      );
+      expect(withRepair({ repair: { ...deliver, likeness: { front: { min: 0.35, shots: [] } } } })).toThrow(
+        /likeness/,
+      );
+      expect(withRepair({ repair: { ...deliver, likeness: { front: { min: 0, shots: [0] } } } })).toThrow(
+        /likeness/,
+      );
+      // Shots 0 and 2 have the same people (one group): scoring only one could clear an original left in the other.
+      expect(withRepair({ repair: { ...deliver, likeness: { front: { min: 0.35, shots: [0] } } } })).toThrow(
+        /whole groups/,
+      );
+      // Two people at the same point can't be told apart.
+      expect(
+        withRepair({
+          repair: { ...deliver, likeness: { front: 0.5 } },
+          check: { ...band.check!, faces: { front: [0.5, 0.5], edge: [0.5, 0.5], solo: [0.5, 0.4, 3] } },
+        }),
+      ).toThrow(/different places/);
     });
   });
 });
