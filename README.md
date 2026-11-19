@@ -72,11 +72,11 @@ Requirements: Node 24 (see `.nvmrc`), pnpm 10 (`corepack enable`), Postgres 17 (
 
    ```bash
    mkdir -p ~/.config/shipwords
-   cp sites/my-tool/.env.example ~/.config/shipwords/my-tool.env   # set DATABASE_URL, fill in test keys
+   cp sites/my-tool/.env.example ~/.config/shipwords/my-tool.env   # set DATABASE_URL and the two secrets
    pnpm setup:worktree
    ```
 
-   Apart from `DATABASE_URL`, the example file runs as-is: email sign-in works (the code is printed in the dev server's terminal), new accounts get sign-up credits, and generations use the mock upstream (`UPSTREAM_MOCK=1`), so no model key is needed. Fill in more as you need it:
+   Once `DATABASE_URL` is set and `BETTER_AUTH_SECRET` and `GUEST_COOKIE_SECRET` hold 32 random bytes each (`openssl rand -hex 32`; the placeholders are refused), the example file runs as-is: email sign-in works (the code is printed in the dev server's terminal), new accounts get sign-up credits, and generations use the mock upstream (`UPSTREAM_MOCK=1`), so no model key is needed. Fill in more as you need it:
    - **Real generations**: a [Yir API key](https://yir.ai/?utm_source=shipwords&utm_medium=readme), with `UPSTREAM_MOCK` turned off.
    - **Buying credits**: a Stripe test key (`sk_test_…`), then `node ../../tools/stripe-listen.mjs` in the site directory to forward webhooks.
    - **Guest free tries**: reCAPTCHA keys. Without them, visitors sign in before their first generation.

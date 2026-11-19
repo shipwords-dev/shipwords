@@ -72,11 +72,11 @@ Agent 会克隆仓库、生成站点并在本地跑起来。它遵守的规则�
 
    ```bash
    mkdir -p ~/.config/shipwords
-   cp sites/my-tool/.env.example ~/.config/shipwords/my-tool.env   # 填 DATABASE_URL 和测试 key
+   cp sites/my-tool/.env.example ~/.config/shipwords/my-tool.env   # 填 DATABASE_URL 和两个密钥
    pnpm setup:worktree
    ```
 
-   除了 `DATABASE_URL`，示例文件不改也能跑：邮箱登录可用（验证码打印在 dev server 的终端里），新账户有注册赠送积分，生成走模拟上游（`UPSTREAM_MOCK=1`），不需要任何模型 key。需要时再补：
+   设好 `DATABASE_URL`，再把 `BETTER_AUTH_SECRET` 和 `GUEST_COOKIE_SECRET` 各换成 32 字节随机值（`openssl rand -hex 32`，占位值会被拒绝），示例文件其余不改也能跑：邮箱登录可用（验证码打印在 dev server 的终端里），新账户有注册赠送积分，生成走模拟上游（`UPSTREAM_MOCK=1`），不需要任何模型 key。需要时再补：
    - **真实生成**：填 [Yir API key](https://yir.ai/?utm_source=shipwords&utm_medium=readme)，并关掉 `UPSTREAM_MOCK`。
    - **购买积分**：填 Stripe 测试 key（`sk_test_…`），然后在站点目录运行 `node ../../tools/stripe-listen.mjs` 转发 webhook。
    - **游客免费试用**：填 reCAPTCHA key。不填的话，访客要先登录才能生成。

@@ -24,17 +24,17 @@ A site runs as a Docker container on a machine you control, with a Postgres data
 - The site's `compose.yaml` runs the site, its own Postgres 17 and the compose service. Several sites on one machine share one Postgres and one compose service instead: give each site a database and a role of its own,
 
   ```sql
-  create role <dir> login password '<password>';
-  create database <dir> owner <dir>;
+  create role <name> login password '<password>';   -- <name>: the dir name with _ for -, e.g. my_tool
+  create database <name> owner <name>;
   ```
 
-  set `SITE_DATABASE_URL` (and `SITE_COMPOSE_URL`) in the site's `.env`, and leave the `db` and `compose` services out of its `compose.yaml`. Give each site its own host port in `ports`.
+  set `SITE_DATABASE_URL` (and `SITE_COMPOSE_URL`) in the site's `.env`, and in its `compose.yaml` delete the `db` and `compose` services, the site's `depends_on` and the `db` volume (`docker compose config --quiet` must pass). Attach the site to the Docker network of the shared Postgres and compose service (`networks`) so those addresses resolve, and give each site its own host port in `ports`.
 - The compose service is only needed by effect sites that stitch video. It listens on the internal Docker network only.
 
 ## 4. Cloudflare (confirm)
 
 - **DNS and CDN:** point the domain at the machine with a proxied record, so all traffic passes through Cloudflare. A reverse proxy on the machine forwards the domain to the site's port (`127.0.0.1:3000` in the template).
-- **Origin accepts Cloudflare only.** Guest quotas and visitor IPs trust the `cf-connecting-ip` header, which anyone can send to an open origin. Firewall the proxy's public ports to [Cloudflare's IP ranges](https://www.cloudflare.com/ips/), or have the proxy drop that header on requests from anywhere else.
+- **Origin accepts Cloudflare only.** Guest quotas and visitor IPs trust the `cf-connecting-ip` header, which anyone can send to an open origin. Firewall the proxy's public ports to [Cloudflare's IP ranges](https://www.cloudflare.com/ips/). Dropping the header for other callers is not enough: without it the app falls back to `x-real-ip`, which a caller can send too.
 - **Bucket:** create an R2 bucket (for example `<dir>-outputs`) and an R2 API token with object read and write on it. Its S3 credentials go into `S3_ENDPOINT` (`https://<account id>.r2.cloudflarestorage.com`), `S3_BUCKET`, `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`.
 - Add an R2 lifecycle rule on `uploads/` (for example, delete after 2 days) that matches the retention promised in your privacy policy.
 - **Email:** enable Email Sending for the domain and add the DNS records it asks for. Create an API token with Email Sending permission (and Workers AI, if the site describes images with `effect.describe`); it goes into `CLOUDFLARE_API_TOKEN` with `CLOUDFLARE_ACCOUNT_ID`. Set `EMAIL_FROM` to an address on the domain.
@@ -42,7 +42,7 @@ A site runs as a Docker container on a machine you control, with a Postgres data
 
 ## 5. Settings and secrets (confirm)
 
-On the machine, create `sites/<dir>/.env` from `.env.example`, readable only by you. It is never committed and never part of the image (`.dockerignore` excludes it); the container reads it at start.
+On the machine, create `sites/<dir>/.env` from `.env.example`, readable only by you. It is never committed and never part of the image (`.dockerignore` excludes it); the container reads it at start. A repo that vendors shipwords as a submodule builds from its own root, so it needs a copy of shipwords' `.dockerignore` there; without it the image build stops when it sees a `.env`.
 
 - `APP_URL=https://<domain>`. Remove `UPSTREAM_MOCK` (with live payment keys the job worker refuses to start while it is set) and `MAIL_LOG`, and drop `STORAGE_DIR` once `S3_*` is set.
 - `POSTGRES_PASSWORD` for the site's own Postgres, or `SITE_DATABASE_URL` for a shared one.
@@ -82,7 +82,7 @@ Each site picks one provider in `site.config.ts` under `billing.provider`: `stri
 
 ## 7. Pre-launch checks
 
-- `pnpm --filter "./sites/<dir>" check` passes (build, required routes, no template placeholders, no cross-site imports). The image build runs the same launch checks.
+- `pnpm --filter "./sites/<dir>" check` passes (build, required routes, no template placeholders, no cross-site imports). The image build runs the same checks except the scan for `.env` values in the browser bundle, since the image never sees `.env`; that scan runs here, with the site's `.env` in place.
 - Locally in Stripe test mode (or PayPal sandbox), walk the whole flow: sign in, buy the cheapest pack, generate, receive the output, full and partial refunds claw back credits, a dispute claws back and a won dispute restores.
 - Run the production image locally with `docker compose up --build` (see [local development](local-development.md)) and run the main flow once on it.
 - Privacy, terms, refunds and DMCA pages exist and the footer shows the contact email. Review the refund terms yourself.

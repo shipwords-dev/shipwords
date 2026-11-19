@@ -74,6 +74,8 @@ export function createSite(root, options) {
   const source = path.join(templatesRoot, 'templates', template);
   const target = path.join(root, 'sites', slug);
   if (!fs.existsSync(source)) throw new Error(`Template not found: templates/${template}`);
+  // check-site treats the template's name in compose.yaml as a leftover, so a site can't share it.
+  if (slug === template) throw new Error(`${slug} is the template's name; pick another dir name`);
   if (fs.existsSync(target)) throw new Error(`Site already exists: sites/${slug}`);
   const devPort = nextDevPort(root);
   copyDir(source, target);
@@ -96,13 +98,13 @@ export function createSite(root, options) {
   const workspaceRoot = path.relative(target, root).replaceAll(path.sep, '/');
   edit(path.join(target, 'compose.yaml'), (text) =>
     text
-      .replace(/^name: ai-site$/m, `name: ${slug}`)
+      .replace(/^name: ai-site$/m, `name: "${slug}"`)
       .replaceAll('templates/ai-site', sitePath)
       .replace(/context: \.\.\/\.\./, `context: ${workspaceRoot}`)
       .replace('build: ../../packages/jobs/compose', `build: ${relativeTo('packages/jobs/compose')}`),
   );
   edit(path.join(target, 'Dockerfile'), (text) =>
-    text.replaceAll('templates/ai-site', sitePath).replaceAll('ai-site', slug),
+    text.replace(/-t ai-site\b/, `-t ${slug}`).replaceAll('templates/ai-site', sitePath),
   );
   edit(path.join(target, '.env.example'), (text) => text.replace('noreply@example.com', `noreply@${domain}`));
   edit(path.join(target, 'site.config.ts'), (text) =>
@@ -168,10 +170,16 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.met
   const slug = options.slug;
   console.log(`Created sites/${slug}. Next:
 
-    1. pnpm install
+  1. pnpm install
   2. A local database: create ${slug.replaceAll('-', '_')}_dev (and a role for it) on your Postgres.
   3. Local settings: copy sites/${slug}/.env.example to ~/.config/shipwords/${slug}.env, fill it in (DATABASE_URL, secrets;
      MAIL_LOG=1 and UPSTREAM_MOCK=1 to start), then pnpm setup:worktree
   4. cd sites/${slug} && pnpm db:generate && pnpm db:migrate && pnpm dev
   5. Before launch, go through docs/site-launch.md (domain ${domain}, database, bucket, email, Stripe, reCAPTCHA).`);
+  // The site image builds from the workspace root; without shipwords' .dockerignore there, .env files would enter the build
+  // (the Dockerfile refuses to build then).
+  if (!fs.existsSync(path.join(ROOT, '.dockerignore'))) {
+    console.log(`
+  The workspace root has no .dockerignore. Copy ${path.relative(ROOT, path.join(TOOLS_ROOT, '.dockerignore')).replaceAll(path.sep, '/')} there before building the site's image.`);
+  }
 }

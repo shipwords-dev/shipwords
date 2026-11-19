@@ -7,6 +7,10 @@ FROM node:24-slim AS build
 RUN corepack enable
 WORKDIR /repo
 COPY . .
+# A workspace root without this repo's .dockerignore (a parent repo that vendors shipwords) would send every .env into the build.
+RUN if find . \( -name node_modules -o -name .git \) -prune -o \( -name '.env' -o -name '.env.*' \) ! -name '.env.example' -print | grep -q .; then \
+      echo 'A .env file is in the build context: put a .dockerignore like the one in shipwords at the workspace root.' >&2; exit 1; \
+    fi
 ARG SITE=templates/ai-site
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter "./${SITE}" build

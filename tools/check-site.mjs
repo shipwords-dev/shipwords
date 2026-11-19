@@ -217,12 +217,17 @@ export function checkSite(dir) {
   }
   if (!isTemplate && fs.existsSync(path.join(dir, 'compose.yaml'))) {
     const compose = fs.readFileSync(path.join(dir, 'compose.yaml'), 'utf8');
-    if (/^name: ai-site$/m.test(compose) || compose.includes('templates/ai-site'))
+    if (/^name: "?ai-site"?$/m.test(compose) || compose.includes('templates/ai-site'))
       problems.push('compose.yaml still names the template');
   }
   if (!isTemplate && fs.existsSync(path.join(dir, '.env.example'))) {
-    if (fs.readFileSync(path.join(dir, '.env.example'), 'utf8').includes('noreply@example.com'))
-      problems.push('.env.example still sends from noreply@example.com');
+    // new-site without --domain writes noreply@<dir>.example.com.
+    if (
+      /^EMAIL_FROM=.*@(?:[a-z0-9-]+.)*example.coms*$/im.test(
+        fs.readFileSync(path.join(dir, '.env.example'), 'utf8'),
+      )
+    )
+      problems.push('.env.example still sends from an example.com address');
   }
   if (!isTemplate && fs.existsSync(path.join(dir, 'site.config.ts'))) {
     if (fs.readFileSync(path.join(dir, 'site.config.ts'), 'utf8').includes('example.com')) {

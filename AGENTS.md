@@ -69,7 +69,7 @@ Changes to generation models or SDKs, media references, subject grouping, prepar
 
 ## 5. Preview and deploy
 
-- Preview locally: in the site directory, `pnpm preview` serves the production build, and `docker compose up --build` runs the production image with its own Postgres. Neither touches production.
+- Preview locally: in the site directory, `pnpm preview` serves the production build, and `docker compose up --build` runs the production image with its own Postgres. Both use the database, bucket and keys in the site's `.env` and run the job worker, so run them only with a local `.env` (local database, `STORAGE_DIR`, test keys), never one that points at production.
 - **Production deploys run only from main, one site at a time, and need explicit confirmation from the user.** A deploy builds the site's Docker image on its machine and restarts its container ([launch handbook](docs/site-launch.md) §8). For package changes, deploy one site and watch it before deploying the other live sites.
 - Production migrations (`docker compose run --rm site node migrate.mjs`), creating databases, buckets, tokens or other Cloudflare resources, and configuring Stripe/PayPal or secrets all need explicit confirmation from the user.
 

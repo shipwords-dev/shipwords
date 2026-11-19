@@ -14,7 +14,7 @@
 4. Keep each site's settings outside the repo: copy the site's `.env.example` to `~/.config/shipwords/<site-dir>.env` (set `SHIPWORDS_SECRETS` to use another directory). Set `DATABASE_URL` to the site's database and use test keys only (`sk_test_`, PayPal sandbox, a test reCAPTCHA key).
 5. `pnpm setup:worktree`: copies each file into its site as `.env` and sets `APP_URL` to this worktree's dev port.
 
-The example file runs as it is once `DATABASE_URL` is set: sign-in codes go to the log (`MAIL_LOG=1`), files go to a local directory (`STORAGE_DIR`), and generations use the mock upstream (`UPSTREAM_MOCK=1`). A [Yir API key](https://yir.ai/?utm_source=shipwords&utm_medium=docs) (`YIR_API_KEY`) is only needed for real generations.
+The example file runs once `DATABASE_URL` is set and `BETTER_AUTH_SECRET` and `GUEST_COOKIE_SECRET` hold 32 random bytes each (`openssl rand -hex 32`; the placeholders are refused): sign-in codes go to the log (`MAIL_LOG=1`), files go to a local directory (`STORAGE_DIR`), and generations use the mock upstream (`UPSTREAM_MOCK=1`). A [Yir API key](https://yir.ai/?utm_source=shipwords&utm_medium=docs) (`YIR_API_KEY`) is only needed for real generations.
 
 ## Running a site
 
@@ -39,7 +39,7 @@ pnpm dev                # the site's devPort from package.json; a worktree adds 
   ```
 
   Then set `COMPOSE_URL=http://localhost:8080` in `.env`.
-- **The whole site in containers:** `docker compose up --build` in the site directory builds the production image and runs it with its own Postgres and the compose service, as on a server. It reads the same `.env`, which then also needs `POSTGRES_PASSWORD` (or `SITE_DATABASE_URL` for a database you already run, at an address the container can reach), and `APP_URL=http://localhost:3000` while you run it this way. Apply migrations first with `docker compose run --rm site node migrate.mjs`. The image is a production build, so `MAIL_LOG` is ignored there.
+- **The whole site in containers:** `docker compose up --build` in the site directory builds the production image and runs it with its own Postgres and the compose service, as on a server. It reads the same `.env`, which then also needs `POSTGRES_PASSWORD` for that Postgres (to use a database you already run instead, see the shared setup in the [launch handbook](site-launch.md) §3), and `APP_URL=http://localhost:3000` while you run it this way. Apply migrations first with `docker compose run --rm site node migrate.mjs`. The image is a production build, so `MAIL_LOG` is ignored there.
 - The dev server listens on `127.0.0.1` only. If a client resolves `localhost` to `::1`, call `127.0.0.1` and send `Origin: http://localhost:<port>` (Better Auth checks the origin).
 - Google sign-in locally must use `localhost`, not `127.0.0.1`, and the origin and callback must be registered on your OAuth client.
 

@@ -142,7 +142,7 @@ test('new site: renames, writes README, check-site finds unfinished items', () =
   });
   assert.equal(readStatus(target), 'In development');
   const compose = fs.readFileSync(path.join(target, 'compose.yaml'), 'utf8');
-  assert.ok(compose.includes('name: ghibli-photo'));
+  assert.ok(compose.includes('name: "ghibli-photo"'));
   assert.ok(compose.includes('dockerfile: sites/ghibli-photo/Dockerfile'));
   assert.ok(compose.includes('SITE: sites/ghibli-photo'));
   assert.ok(!compose.includes('templates/ai-site'));
@@ -214,6 +214,30 @@ test('new site: renames, writes README, check-site finds unfinished items', () =
   assert.ok(checkSite(target).includes('Missing src/models.server.ts'));
   assert.throws(() => createSite(root, { slug: 'ghibli-photo', template: 'ai-site' }), /already exists/);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('new site: names that look like YAML keywords or contain the template name, and the default domain', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shipwords-'));
+  fs.cpSync(path.join(TOOLS_ROOT, 'templates', 'ai-site'), path.join(root, 'templates', 'ai-site'), {
+    recursive: true,
+    filter: (src) => !/node_modules|[\\/]dist[\\/]?|[\\/]paraglide|[\\/]\.env$|[\\/]\.data/.test(src),
+  });
+  const make = (slug) => createSite(root, { slug, domain: null, name: null, template: 'ai-site' }).target;
+
+  // A dir name containing "ai-site" is written once, not replaced again inside the new path.
+  const dockerfile = fs.readFileSync(path.join(make('my-ai-site'), 'Dockerfile'), 'utf8');
+  assert.ok(dockerfile.includes('ARG SITE=sites/my-ai-site\n'));
+  assert.ok(dockerfile.includes('-t my-ai-site .'));
+  assert.ok(!dockerfile.includes('my-my-ai-site'));
+
+  // "null" is a valid dir name; unquoted it would not be a string in YAML.
+  const target = make('null');
+  assert.ok(fs.readFileSync(path.join(target, 'compose.yaml'), 'utf8').includes('name: "null"'));
+  assert.ok(!checkSite(target).includes('compose.yaml still names the template'));
+  // Without --domain the sender is noreply@null.example.com, which still needs replacing before launch.
+  assert.ok(checkSite(target).includes('.env.example still sends from an example.com address'));
+
+  assert.throws(() => make('ai-site'), /template's name/);
 });
 
 test('check-site: fails when the browser bundle contains zh messages', () => {
