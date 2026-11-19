@@ -7,7 +7,7 @@
     "dev": "node --env-file-if-exists=.env ../../tools/dev-port.mjs vite dev",
     "build": "vite build",
     "start": "node --env-file-if-exists=.env start.mjs",
-    "preview": "vite build && node --env-file-if-exists=.env start.mjs",
+    "preview": "vite build && node --env-file-if-exists=.env ../../tools/dev-port.mjs node start.mjs",
     "typecheck": "paraglide-js compile --project ./project.inlang --outdir ./src/paraglide && tsr generate && tsc --noEmit",
     "check": "pnpm typecheck && pnpm build && pnpm check:site",
     "db:generate": "drizzle-kit generate",

@@ -1,4 +1,5 @@
 import { proxyRybbit } from '@shipwords/core/analytics';
+import { publicRequest } from '@shipwords/core/http';
 import handler from '@tanstack/react-start/server-entry';
 import { paraglideMiddleware } from '~/paraglide/server.js';
 import { admin, shutdown, startJobWorker } from './core.server';
@@ -11,7 +12,9 @@ export { admin, shutdown };
 startJobWorker();
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(incoming: Request): Promise<Response> {
+    // Behind the proxy the server sees http://; give the site's own host its public https origin before anything reads request.url.
+    const request = publicRequest(incoming, process.env.APP_URL);
     // Liveness for the container: answers without touching the database.
     if (new URL(request.url).pathname === '/healthz') return new Response('ok');
     // Rybbit analytics goes through this site's /stats/ and is proxied upstream here.

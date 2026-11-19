@@ -60,3 +60,31 @@ export async function readJson<T>(request: Request): Promise<T | null> {
     return null;
   }
 }
+
+/**
+ * The request as the visitor sent it. Behind the reverse proxy the server sees http://<host> even though the visitor used https (the
+ * proxy and Cloudflare terminate TLS), so anything built from request.url (an Origin check, a redirect, an absolute link) would use the
+ * wrong scheme. Requests for the site's own host get APP_URL's origin; other hosts (a www alias, localhost in dev) pass through.
+ */
+export function publicRequest(request: Request, appUrl: string | undefined): Request {
+  if (!appUrl) return request;
+  let site: URL;
+  try {
+    site = new URL(appUrl);
+  } catch {
+    return request;
+  }
+  const url = new URL(request.url);
+  if (url.hostname !== site.hostname || (url.protocol === site.protocol && url.port === site.port))
+    return request;
+  url.protocol = site.protocol;
+  url.port = site.port;
+  const hasBody = request.body !== null && request.method !== 'GET' && request.method !== 'HEAD';
+  return new Request(url, {
+    method: request.method,
+    headers: request.headers,
+    signal: request.signal,
+    redirect: request.redirect,
+    ...(hasBody ? { body: request.body, duplex: 'half' } : {}),
+  } as RequestInit);
+}
