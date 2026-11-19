@@ -99,26 +99,39 @@ function editPrompt(images: Readonly<Record<string, string>>, { kinds, describe 
   ].join(' ');
 }
 
-/** How each seat is named in the repair (Pruna p-video-replace) prompt: by position, since a swapped person no longer wears the original's clothes. */
-const SPOT: Record<Seat, string> = {
-  lead: 'the lead singer',
-  sax: 'the saxophone player',
-  keys: 'the keyboard player sitting at the front center',
-  backLeft: 'the backing singer standing at the back left',
-  backRight: 'the backing singer standing at the back right',
-};
+/** Shot index (cuts at 5.333, 11.625 and 15.000 s): 0 wide, 1 lead close-up, 2 sax close-up, 3 wide. */
+const SAX_SHOT = 2;
 
-/** Wording from the tested repair runs: with several people, say who each image is, then keep position, motion and mouth movements. */
-function repairPrompt(slots: readonly string[], kinds: Readonly<Record<string, SlotKind>>) {
+/**
+ * How each seat is named in the repair (Pruna p-video-replace) prompt: by position only. By repair time the frame already holds the person Kling swapped in,
+ * wearing the customer's clothes, so the original's clothes can't name them. Keys shows only half a face in the sax close-up's lower right, so that pass names the corner.
+ */
+function spot(seat: Seat, shots: readonly number[]) {
+  if (seat === 'keys' && shots.includes(SAX_SHOT))
+    return 'the person partly visible in the lower right corner';
+  return {
+    lead: 'the lead singer',
+    sax: 'the saxophone player',
+    keys: 'the keyboard player sitting at the front center',
+    backLeft: 'the backing singer standing at the back left',
+    backRight: 'the backing singer standing at the back right',
+  }[seat];
+}
+
+/**
+ * Pruna's official wording: one sentence naming who to replace by position, one keeping lip sync, motion, audio and camera.
+ * The engine replaces one person per pass; replacing three in one pass with a prompt listing everything to keep changed mouths and gestures (a customer complaint on 11-18).
+ */
+function repairPrompt(
+  slots: readonly string[],
+  kinds: Readonly<Record<string, SlotKind>>,
+  shots: readonly number[] = [],
+) {
   const who = (slot: string) => (kinds[slot] === 'pet' ? 'animal' : 'person');
-  const keep =
-    'face, hair and clothes. Keep the position, pose, gestures, head direction and mouth movements. Do not change anyone else.';
-  if (slots.length === 1)
-    return `Replace ${SPOT[slots[0] as Seat]} with the ${who(slots[0]!)} in the image: ${keep}`;
-  const images = slots
-    .map((slot, i) => `image ${i + 1} is ${SPOT[slot as Seat]}, replaced with the ${who(slot)} in it`)
-    .join('; ');
-  return `In order, ${images}. Replace each of them: ${keep}`;
+  const swaps = slots
+    .map((slot, i) => `${spot(slot as Seat, shots)} with the ${who(slot)} from reference image ${i + 1}`)
+    .join(', and ');
+  return `Replace ${swaps}. Keep lip sync, motion, audio, and camera from the source video. Do not change anyone else or the background.`;
 }
 
 const CLIP = 'assets/tinydesk/full-17s.mp4';
@@ -132,18 +145,22 @@ const CLIP = 'assets/tinydesk/full-17s.mp4';
  */
 const PREP_BASE =
   'Make a realistic reference photo of the main person or animal in this image, for a character reference sheet. Keep exactly the same individual: the same face and features, skin tone or fur, age, hairstyle, glasses and facial hair, with natural skin or fur texture. Only this one subject: remove any other people or animals and their arms or hands, phone status bars, app interface, captions, stickers and watermarks. Keep their own outfit exactly as in the photo, including any wig, hat, glasses and accessories, and keep every logo, letter, number and team mark on the clothes exactly as it is. Plain light wall background, soft even daylight, sharp focus, no added text, labels or borders.';
-/** The second: a plain face, used only as the identity photo for repair (Pruna) and the likeness check (repair.photoView), never sent to Kling; the replace model would take the two-panel image's headless torso for a second person. */
-const PREP_FACE = `${PREP_BASE} Output one front-facing head-and-shoulders portrait of this individual, centered, relaxed natural smile, face large and sharp, nobody else in the image.`;
+/**
+ * The second: a front chest-up portrait, used only as the identity photo for repair (Pruna) and the likeness check (repair.photoView), never sent to Kling; the replace model would take the two-panel image's headless torso for a second person.
+ * Pruna recommends a front chest-up identity photo: it replaces the whole person, not just the face.
+ */
+const PREP_FACE = `${PREP_BASE} Output one front-facing chest-up portrait of this individual, from the top of the head down to the chest with the top of their outfit visible, centered, relaxed natural smile, face large and sharp, nobody else in the image.`;
 const PREP_PAIR = `${PREP_BASE} Output exactly one borderless 1 by 2 character reference sheet: two equal portrait panels side by side covering the entire canvas, divided exactly at 50% width, with no gap or line between them. Each panel shows the same individual independently, wholly inside its own panel. Left panel: front-facing head-and-shoulders close-up, relaxed natural smile, face large and sharp. Right panel: the same individual front-facing, framed from the neck down to the waist so the face is not shown again; for a person, the whole front of their top with its logo, letters or number and any badge or accessory clearly visible; for an animal, its body and coat. Show only what the photo shows: do not add trousers, shoes or other clothing that is not visible in it. Keep identical skin tone or fur, outfit, colors, letters, numbers and team marks in both panels. Do not mirror or invent visible clothing details. Same pale background and lighting in both panels. No labels, captions or borders.`;
 
 export default serverModels(catalog, {
   'tiny-desk': {
     upstream: 'yir',
     upstreamModel: 'klingai/kling-4.0',
-    // Kling is quoted at $3.06 (billed as 18 s), capped at 3.40. A missed swap does not rerun Kling: Pruna repairs it, up to 4 rounds at 0.40 each.
+    // Kling is quoted at $3.06 (billed as 18 s), capped at 3.40. A missed swap does not rerun Kling: Pruna repairs it one person per pass,
+    // up to 5 passes at 0.40 each (an 8 s wide shot costs about $0.24).
     // Once Kling has charged, credits are not refunded: if someone is still missed after the repairs, the version with the fewest misses is delivered and REVIEW_EMAIL gets a review alert.
     // Prep: two images per person (two-panel and face), five people cost $0.085, capped at $0.15; a slow one gets no hedge copy (prep.hedge: false),
-    // since two copies could look different. Caps add up to Kling 3.40 + repair 4×0.40 + prep 0.15 = 5.15.
+    // since two copies could look different. Caps add up to Kling 3.40 + repair 5×0.40 + prep 0.15 = 5.55.
     // The job cap of 5.60 stays below the net per video of the cheapest pack (10 for $59.99, about 5.80 after fees), so even a fully repaired job breaks even.
     maxCost: '5.60',
     // Usually about 8 minutes (6 to generate, 2 for the face check and compose); each repair round adds a few minutes, plus room for upstream queues.
@@ -198,15 +215,17 @@ export default serverModels(catalog, {
             },
             maxSimilarity: 0.45,
           },
-          // The wide shots (shots 1 and 4) are one group: keys and the two backing singers, repaired full frame with all three photos; the sax close-up is another (sax and keys in the corner).
-          // Full-frame repair often skips the top-corner backing singers, so those are cropped and repaired alone too (11-09: the back-right customer wore red like the original; Kling only swapped clothes).
-          // Crops use Pruna's 7:9 output ratio and are aligned to the background frame by frame when pasted back (align.py in the container).
+          // Which shots each person appears in is fixed: the wide shots (shots 1 and 4) share one camera and are one group, joined into one clip and repaired together
+          // so a person's face and accessories match in both; the sax close-up is another group (sax and keys in the lower right).
+          // One person per pass with only their photo; the cut clip carries the same span of the song (Pruna lip-syncs to it), and the output replaces the whole frame:
+          // no crops and no background-aligned paste-back. On 11-18 a customer complaint showed three swaps in one pass changing mouths and gestures, and aligned
+          // paste-back leaving double faces at the edges; pasting back only the face looked obviously spliced.
           repair: {
             upstreamModel: 'pruna/p-video-replace',
             prompt: repairPrompt,
             parameters: { resolution: '720p' },
             maxCost: '0.40',
-            rounds: 4,
+            rounds: 5,
             onMiss: 'deliver',
             shots: [
               ['keys', 'backLeft', 'backRight'],
@@ -214,12 +233,10 @@ export default serverModels(catalog, {
               ['sax', 'keys'],
               ['keys', 'backLeft', 'backRight'],
             ],
-            crops: { backLeft: [0, 0, 0.444, 0.3875], backRight: [0.5, 0, 0.5, 0.3875] },
-            aspect: 7 / 9,
             // Also repair a lead close-up unlike the photo or more like someone else: in six jobs on 10-30/31 the lead scored 0.44–0.66 vs the prepped photo; 0.44 drew a "can't recognize him" complaint.
             // The sax is a side view while playing (always 0.33–0.36) and faces in the wide shots are small, so those scores are unreliable and have no threshold.
             likeness: { lead: 0.5 },
-            // Repair and the likeness check use the second prep image (the face), not the two-panel image sent to Kling.
+            // Repair and the likeness check use the second prep image (front chest-up), not the two-panel image sent to Kling.
             photoView: 1,
           },
         },
