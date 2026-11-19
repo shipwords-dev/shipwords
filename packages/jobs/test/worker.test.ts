@@ -1,7 +1,7 @@
 import { getBalance, grantCredits, spendCredits } from '@shipwords/core/credits/ledger';
 import type { Db } from '@shipwords/core/db/client';
 import type { Core } from '@shipwords/core/server';
-import { eq } from 'drizzle-orm';
+import { and, eq, ne } from 'drizzle-orm';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createJobs } from '../src/handlers';
 import {
@@ -630,28 +630,38 @@ describe('job worker', () => {
     expect(adapter.submits).toHaveLength(1);
   });
 
-  it('does not renew a lease that already expired', async () => {
+  it('does not renew a lease that already expired', { timeout: 20_000 }, async () => {
     const { jobId } = await paidJob();
-    const download = gated(imageResponse);
-    download.hold();
-    const w = worker({
-      db,
-      bucket,
-      models,
-      adapters: { yir: new FakeAdapter() },
-      fetcher: () => download.call(),
-    });
-    await until(async () => download.calls() > 0);
-    // Expired, and nobody claimed it yet: the next heartbeat must treat it as lost, not revive it.
-    const token = (await runOf(jobId)).lockedBy;
+    // Only this run: a run an earlier test's worker handed back would be claimed too, block on the held download, and keep the
+    // worker busy, so `active` would never reach 0.
     await db
       .update(jobRuns)
-      .set({ lockedUntil: Date.now() - 1 })
-      .where(eq(jobRuns.id, jobId));
-    await until(async () => w.active === 0);
-    expect((await runOf(jobId)).lockedUntil).toBeLessThan(Date.now());
-    expect((await runOf(jobId)).lockedBy).toBe(token);
-    download.release();
+      .set({ status: 'dead' })
+      .where(and(eq(jobRuns.status, 'pending'), ne(jobRuns.id, jobId)));
+    const download = gated(imageResponse);
+    download.hold();
+    // Released however the test ends: a held download keeps a step in flight, and stop() in afterEach would wait on it.
+    try {
+      const w = worker({
+        db,
+        bucket,
+        models,
+        adapters: { yir: new FakeAdapter() },
+        fetcher: () => download.call(),
+      });
+      await until(async () => download.calls() > 0, 10_000);
+      // Expired, and nobody claimed it yet: the next heartbeat must treat it as lost, not revive it.
+      const token = (await runOf(jobId)).lockedBy;
+      await db
+        .update(jobRuns)
+        .set({ lockedUntil: Date.now() - 1 })
+        .where(eq(jobRuns.id, jobId));
+      await until(async () => w.active === 0, 10_000);
+      expect((await runOf(jobId)).lockedUntil).toBeLessThan(Date.now());
+      expect((await runOf(jobId)).lockedBy).toBe(token);
+    } finally {
+      download.release();
+    }
   });
 
   it('retries the start-up backfill until it succeeds', async () => {

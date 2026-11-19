@@ -81,8 +81,7 @@ describe('GET /files', () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
     const keys = [`jobs/${jobId}/kept/prep-left-0.png`, `jobs/${jobId}/kept/uploads/up_a.png`];
-    for (const key of keys)
-      await bucket.put(key, new Uint8Array([1]), { contentType: 'image/png' });
+    for (const key of keys) await bucket.put(key, new Uint8Array([1]), { contentType: 'image/png' });
     for (const status of ['queued', 'submitted', 'succeeded'] as const) {
       await db.update(jobs).set({ status }).where(eq(jobs.id, jobId));
       for (const key of keys) expect((await ctx.file(key)).status).toBe(404);

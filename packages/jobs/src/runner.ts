@@ -292,9 +292,11 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
               if (await deps.bucket.head(target)) continue;
               const source = await deps.bucket.get(key);
               if (!source) throw new Error('upload missing');
-              await deps.bucket.put(target, await source.arrayBuffer(), {
-                httpMetadata: source.httpMetadata ?? {},
-              });
+              await deps.bucket.put(
+                target,
+                await source.arrayBuffer(),
+                source.contentType ? { contentType: source.contentType } : {},
+              );
             } catch (error) {
               failed.push({ key, error: String(error) });
             }

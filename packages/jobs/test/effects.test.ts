@@ -2282,29 +2282,27 @@ describe('prep and reference audio', () => {
 
     it("copies each of this site's uploads before the first submit; the upload itself stays for the lifecycle rule", async () => {
       const { jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
-      await env.OUTPUTS.put('uploads/up_a.png', new Uint8Array([7, 7]), {
-        httpMetadata: { contentType: 'image/png' },
-      });
+      await bucket.put('uploads/up_a.png', new Uint8Array([7, 7]), { contentType: 'image/png' });
       const adapter = finished(jobId);
       let atFirstSubmit: boolean | undefined;
       adapter.onSubmit = async () => {
-        atFirstSubmit ??= Boolean(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_a.png`));
+        atFirstSubmit ??= Boolean(await bucket.head(`jobs/${jobId}/kept/uploads/up_a.png`));
       };
       const names: string[] = [];
       await runGeneration(keepDeps(adapter), jobId, durableSteps(new Map(), names));
       expect(names.slice(0, 2)).toEqual(['load', 'keep:uploads']);
       expect(atFirstSubmit).toBe(true);
-      const kept = await env.OUTPUTS.get(`jobs/${jobId}/kept/uploads/up_a.png`);
+      const kept = await bucket.get(`jobs/${jobId}/kept/uploads/up_a.png`);
       expect(new Uint8Array(await kept!.arrayBuffer())).toEqual(new Uint8Array([7, 7]));
-      expect(kept!.httpMetadata?.contentType).toBe('image/png');
-      expect(await env.OUTPUTS.head('uploads/up_a.png')).not.toBeNull();
+      expect(kept!.contentType).toBe('image/png');
+      expect(await bucket.head('uploads/up_a.png')).not.toBeNull();
       expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
     });
 
     it("a missing upload is logged and skipped; another host's URL that looks like an upload is never copied", async () => {
       const { jobId } = await prepJob({ left: '/files/uploads/up_gone.png' });
       // A preset's media on another host whose path happens to look like one of our uploads, and that name exists locally.
-      await env.OUTPUTS.put('uploads/up_z.png', new Uint8Array([1]));
+      await bucket.put('uploads/up_z.png', new Uint8Array([1]));
       const row = (await loadJob(db, jobId))!;
       const input = JSON.parse(row.inputJson) as { parts: { references: { url: string; role: string }[] }[] };
       input.parts.at(-1)!.references.push({
@@ -2322,8 +2320,8 @@ describe('prep and reference audio', () => {
         durableSteps(),
       );
       expect(logs).toContain('upload copy failed');
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_gone.png`)).toBeNull();
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_z.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_gone.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_z.png`)).toBeNull();
       expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
     });
 
@@ -2333,13 +2331,13 @@ describe('prep and reference audio', () => {
       const { fileUrl: _, ...noOrigin } = keepDeps(finished(jobId));
       await runGeneration({ ...noOrigin, log: (event) => logs.push(event) }, jobId, durableSteps());
       expect(logs).toContain('upload copy failed');
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
       expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
     });
 
     it('off by default: a model without keepUploads copies nothing and runs no extra step', async () => {
       const { jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
-      await env.OUTPUTS.put('uploads/up_a.png', new Uint8Array([7]));
+      await bucket.put('uploads/up_a.png', new Uint8Array([7]));
       const names: string[] = [];
       await runGeneration(
         { ...prepDeps(finished(jobId)), fileUrl: (key: string) => `https://site/files/${key}` },
@@ -2347,7 +2345,7 @@ describe('prep and reference audio', () => {
         durableSteps(new Map(), names),
       );
       expect(names).not.toContain('keep:uploads');
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
     });
   });
 
