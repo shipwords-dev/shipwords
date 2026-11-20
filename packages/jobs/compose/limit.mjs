@@ -56,13 +56,16 @@ export function createLane(max, maxWaiting) {
 
 /** The service's lanes from its environment: MAX_JOBS / MAX_WAITING (background), MAX_INTERACTIVE_JOBS / MAX_INTERACTIVE_WAITING. */
 export function createLanes(env = process.env) {
-  const count = (value, fallback, min) => {
-    const n = value === undefined || value === '' ? Number.NaN : Math.floor(Number(value));
-    return Number.isFinite(n) ? Math.max(min, n) : fallback;
+  // As before the lanes: a slot count that is unset, empty, 0 or not a number falls back to its default; a queue length that is
+  // unset (or not a number) does, while an explicit 0 or empty value means no queue.
+  const slots = (value, fallback) => Math.max(1, Number(value) || fallback);
+  const queue = (value, fallback) => {
+    const n = Number(value ?? fallback);
+    return Number.isNaN(n) ? fallback : Math.max(0, n);
   };
   return {
-    background: createLane(count(env.MAX_JOBS, 2, 1), count(env.MAX_WAITING, 8, 0)),
-    interactive: createLane(count(env.MAX_INTERACTIVE_JOBS, 1, 1), count(env.MAX_INTERACTIVE_WAITING, 4, 0)),
+    background: createLane(slots(env.MAX_JOBS, 2), queue(env.MAX_WAITING, 8)),
+    interactive: createLane(slots(env.MAX_INTERACTIVE_JOBS, 1), queue(env.MAX_INTERACTIVE_WAITING, 4)),
   };
 }
 

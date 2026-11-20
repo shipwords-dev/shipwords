@@ -70,25 +70,82 @@ describe('compose over HTTP', () => {
 
   it('marks every call of a request-path composer as interactive, and leaves job steps in the background lane', async () => {
     const store = memoryStore();
-    await store.put('jobs/j2/0.mp4', 'seg0');
-    await store.put('assets/track.mp3', 'track');
-    const lanes: (string | undefined)[] = [];
+    for (const key of [
+      'jobs/j2/0.mp4',
+      'jobs/j2/out.mp4',
+      'jobs/j2/patch.mp4',
+      'assets/orig.mp4',
+      'assets/track.mp3',
+    ])
+      await store.put(key, key);
+    await store.put('jobs/j2/photo.png', 'photo');
+    const calls: { path: string; lane: string | null; type: string | null }[] = [];
     const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      lanes.push(new Headers(init?.headers).get('x-compose-lane') ?? undefined);
-      return new Response(String(input).endsWith('/silent.mp4') ? 'silent' : 'song');
+      const url = new URL(String(input));
+      // Build the request the way fetch would: a multipart body must keep its own boundary next to the lane header.
+      const request = new Request(url, init);
+      calls.push({
+        path: url.pathname,
+        lane: request.headers.get('x-compose-lane'),
+        type: request.headers.get('content-type'),
+      });
+      const json = (body: unknown) => Response.json(body);
+      if (url.pathname === '/split-sheet') return json({ images: ['YQ==', 'Yg==', 'Yw==', 'ZA=='] });
+      if (url.pathname === '/faces') return json({ similarity: [0.1] });
+      if (url.pathname === '/likeness') return json({ similarity: [0.5] });
+      return new Response(url.pathname.endsWith('/silent.mp4') ? 'silent' : 'video');
     }) as typeof fetch;
-    const input = {
+    const cut = {
       jobId: 'j2',
-      segments: [{ key: 'jobs/j2/0.mp4', target: 6, fit: 'trim' as const }],
-      audio: { key: 'assets/track.mp3', start: 0, duration: 6 },
-      width: 1280,
-      height: 720,
+      key: 'jobs/j2/out.mp4',
+      ranges: [[0, 24]] as [number, number][],
+      width: 720,
+      height: 1280,
       fps: 24,
     };
-    await httpComposer('http://c', store, fetcher, { lane: 'interactive' }).compose(input);
-    expect(lanes).toEqual(['interactive', 'interactive']);
-    lanes.length = 0;
-    await httpComposer('http://c', store, fetcher).compose(input);
-    expect(lanes).toEqual([undefined, undefined]);
+    async function everyCall(composer: ReturnType<typeof httpComposer>) {
+      await composer.splitSheet!({ jobId: 'j2', image: new Uint8Array([1]).buffer });
+      await composer.compose({
+        jobId: 'j2',
+        segments: [{ key: 'jobs/j2/0.mp4', target: 6, fit: 'trim' }],
+        audio: { key: 'assets/track.mp3', start: 0, duration: 6 },
+        width: 720,
+        height: 1280,
+        fps: 24,
+      });
+      await composer.faces({
+        jobId: 'j2',
+        key: 'jobs/j2/out.mp4',
+        originalKey: 'assets/orig.mp4',
+        seconds: 6,
+        points: [[0.5, 0.5]],
+      });
+      await composer.likeness({
+        jobId: 'j2',
+        key: 'jobs/j2/out.mp4',
+        people: [{ photo: { key: 'jobs/j2/photo.png' }, ranges: [[0, 1]] }],
+      });
+      await composer.extract(cut);
+      await composer.patch({ ...cut, name: 'j2_p0', patchKey: 'jobs/j2/patch.mp4' });
+    }
+    const paths = [
+      '/split-sheet',
+      '/compose',
+      '/files/j2/silent.mp4',
+      '/faces',
+      '/likeness',
+      '/extract',
+      '/patch',
+      '/files/j2_p0/silent.mp4',
+    ];
+    await everyCall(httpComposer('http://c', store, fetcher, { lane: 'interactive' }));
+    expect(calls.map((c) => c.path)).toEqual(paths);
+    expect(calls.every((c) => c.lane === 'interactive')).toBe(true);
+    for (const call of calls.filter((c) => c.path.startsWith('/files/') === false))
+      expect(call.type, call.path).toMatch(/^multipart\/form-data; boundary=/);
+    calls.length = 0;
+    await everyCall(httpComposer('http://c', store, fetcher));
+    expect(calls.map((c) => c.path)).toEqual(paths);
+    expect(calls.every((c) => c.lane === null)).toBe(true);
   });
 });

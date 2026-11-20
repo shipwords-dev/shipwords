@@ -71,4 +71,43 @@ describe('compose service lanes', () => {
         return running;
       });
   });
+
+  it('keeps the limits the service had before the lanes for every way a value can be set', async () => {
+    /** How many requests a lane runs at once and how many it queues before it refuses one. */
+    async function capacity(env: Record<string, string>, lane: 'background' | 'interactive' = 'background') {
+      const target = createLanes(env)[lane];
+      const hold = gate();
+      const started: Promise<unknown>[] = [];
+      for (let i = 0; i < 50; i++) {
+        const run = target.run(() => hold.opened);
+        run.catch(() => {});
+        started.push(run);
+      }
+      await tick();
+      const result = { running: target.running, waiting: target.waiting };
+      hold.open();
+      await Promise.allSettled(started);
+      return result;
+    }
+    expect(await capacity({})).toEqual({ running: 2, waiting: 8 });
+    // A slot count of 0, empty or not a number falls back to the default, as MAX_JOBS did.
+    expect(await capacity({ MAX_JOBS: '0' })).toEqual({ running: 2, waiting: 8 });
+    expect(await capacity({ MAX_JOBS: '' })).toEqual({ running: 2, waiting: 8 });
+    expect(await capacity({ MAX_JOBS: 'x' })).toEqual({ running: 2, waiting: 8 });
+    expect(await capacity({ MAX_JOBS: '-3' })).toEqual({ running: 1, waiting: 8 });
+    expect(await capacity({ MAX_JOBS: '4' })).toEqual({ running: 4, waiting: 8 });
+    // An explicit 0 or empty queue length means no queue, as MAX_WAITING did; a negative one too.
+    expect(await capacity({ MAX_WAITING: '0' })).toEqual({ running: 2, waiting: 0 });
+    expect(await capacity({ MAX_WAITING: '' })).toEqual({ running: 2, waiting: 0 });
+    expect(await capacity({ MAX_WAITING: '-1' })).toEqual({ running: 2, waiting: 0 });
+    // Not a number: bounded at the default rather than unbounded.
+    expect(await capacity({ MAX_WAITING: 'x' })).toEqual({ running: 2, waiting: 8 });
+    expect(await capacity({}, 'interactive')).toEqual({ running: 1, waiting: 4 });
+    expect(
+      await capacity({ MAX_INTERACTIVE_JOBS: '0', MAX_INTERACTIVE_WAITING: '0' }, 'interactive'),
+    ).toEqual({
+      running: 1,
+      waiting: 0,
+    });
+  });
 });
