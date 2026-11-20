@@ -110,13 +110,33 @@ async function blobOf(bucket: ObjectStore, key: string): Promise<Blob> {
   return new Blob([await object.arrayBuffer()], { type: 'application/octet-stream' });
 }
 
+export interface HttpComposerOptions {
+  /**
+   * The service's concurrency lane (compose/limit.mjs). Job steps use the default, background. A site that stitches inside a web
+   * request, while the visitor waits, passes 'interactive': it gets slots that background work never takes, so it doesn't queue behind
+   * every site's swap checks and repairs on the machine.
+   */
+  lane?: 'background' | 'interactive';
+}
+
 /**
  * The compose service (packages/jobs/compose) over HTTP at baseUrl. One service per machine: compose and patch leave their results
  * in the service's work directory under the job or pass name, and the silent copy is fetched from there right after.
  */
-export function httpComposer(baseUrl: string, bucket: ObjectStore, fetcher: typeof fetch = fetch): Composer {
+export function httpComposer(
+  baseUrl: string,
+  bucket: ObjectStore,
+  fetcher: typeof fetch = fetch,
+  options: HttpComposerOptions = {},
+): Composer {
   const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-  const call = (path: string, init?: RequestInit) => fetcher(`${base}${path}`, init);
+  const lane: Record<string, string> =
+    options.lane === 'interactive' ? { 'x-compose-lane': 'interactive' } : {};
+  const call = (path: string, init?: RequestInit) =>
+    fetcher(`${base}${path}`, {
+      ...init,
+      headers: { ...lane, ...(init?.headers as Record<string, string>) },
+    });
   return {
     async splitSheet(input) {
       const form = new FormData();

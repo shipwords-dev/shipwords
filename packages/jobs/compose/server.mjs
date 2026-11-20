@@ -15,7 +15,8 @@
 //   put back: a whole-frame clip covers the frame and replaces them; a box is lined up frame by frame on the background (align.py;
 //   stretched over the box if that fails). Results also stay in /tmp/compose/<id>/ (song.mp4, silent.mp4) like compose.
 // Repeating compose with the same id overwrites the same files, so step retries are idempotent.
-// Heavy requests run at most MAX_JOBS (default 2) at a time; the rest wait. Work directories are removed KEEP_MS (default 2 h)
+// Heavy requests run at most MAX_JOBS (default 2) at a time, plus MAX_INTERACTIVE_JOBS (default 1) for requests sent with
+// x-compose-lane: interactive (limit.mjs); the rest wait. Work directories are removed KEEP_MS (default 2 h)
 // after they were last written, since no container teardown cleans them any more.
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -40,6 +41,7 @@ import {
   parseWindows,
   splitAtCuts,
 } from './compose.mjs';
+import { Busy, createLanes, laneOf } from './limit.mjs';
 
 const run = promisify(execFile);
 const ROOT = '/tmp/compose';
@@ -427,37 +429,10 @@ const armIdleExit = () => {
 armIdleExit();
 if (MAX_LIFETIME_MS > 0) setTimeout(() => process.exit(0), MAX_LIFETIME_MS);
 
-// ffmpeg and the face checks are CPU-heavy: a few at a time, a bounded number wait (their bodies unread until their turn), and
-// beyond that requests are refused with 503 so the caller's step retries later instead of piling up connections.
-const MAX_JOBS = Math.max(1, Number(process.env.MAX_JOBS) || 2);
-const MAX_WAITING = Math.max(0, Number(process.env.MAX_WAITING ?? 8));
-let running = 0;
-const waiting = [];
-class Busy extends Error {}
-async function limited(req, work) {
-  if (running >= MAX_JOBS) {
-    if (waiting.length >= MAX_WAITING) throw new Busy('busy');
-    await new Promise((resolve, reject) => {
-      const entry = { resolve, reject };
-      waiting.push(entry);
-      // A caller that gives up leaves the queue.
-      req.once('close', () => {
-        const index = waiting.indexOf(entry);
-        if (index >= 0) {
-          waiting.splice(index, 1);
-          reject(new Error('caller went away'));
-        }
-      });
-    });
-  }
-  running++;
-  try {
-    return await work();
-  } finally {
-    running--;
-    waiting.shift()?.resolve();
-  }
-}
+// ffmpeg and the face checks are CPU-heavy: a few at a time per lane (limit.mjs). A stitch a visitor waits on (x-compose-lane:
+// interactive) has its own slots, so it never queues behind the machine's background job steps.
+const lanes = createLanes();
+const limited = (req, work) => lanes[laneOf(req.headers)].run(work, (leave) => req.once('close', leave));
 
 // Work directories in use (a compose or patch writing them, a download reading them) are never swept.
 const inUse = new Map();

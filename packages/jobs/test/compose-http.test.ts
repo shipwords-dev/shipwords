@@ -67,4 +67,28 @@ describe('compose over HTTP', () => {
       }),
     ).rejects.toThrow(/extract failed: 500 boom/);
   });
+
+  it('marks every call of a request-path composer as interactive, and leaves job steps in the background lane', async () => {
+    const store = memoryStore();
+    await store.put('jobs/j2/0.mp4', 'seg0');
+    await store.put('assets/track.mp3', 'track');
+    const lanes: (string | undefined)[] = [];
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      lanes.push(new Headers(init?.headers).get('x-compose-lane') ?? undefined);
+      return new Response(String(input).endsWith('/silent.mp4') ? 'silent' : 'song');
+    }) as typeof fetch;
+    const input = {
+      jobId: 'j2',
+      segments: [{ key: 'jobs/j2/0.mp4', target: 6, fit: 'trim' as const }],
+      audio: { key: 'assets/track.mp3', start: 0, duration: 6 },
+      width: 1280,
+      height: 720,
+      fps: 24,
+    };
+    await httpComposer('http://c', store, fetcher, { lane: 'interactive' }).compose(input);
+    expect(lanes).toEqual(['interactive', 'interactive']);
+    lanes.length = 0;
+    await httpComposer('http://c', store, fetcher).compose(input);
+    expect(lanes).toEqual([undefined, undefined]);
+  });
 });
