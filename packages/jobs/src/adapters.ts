@@ -10,6 +10,12 @@ export interface JobsEnv extends StoreEnv, MailerEnv {
   DATABASE_URL: string;
   YIR_API_KEY: string;
   YIR_BASE_URL?: string;
+  /**
+   * `1` or `true`: Yir demo mode, for an end-to-end run without paid generation. Submits are only quoted (the Gateway still checks
+   * the parameters) and return demo Jobs whose results are fixed DEMO-badged files; billing is 0. Testing only: customers would be
+   * charged credits for demo videos, so never leave it set on a site that takes orders (check it before going live).
+   */
+  YIR_DEMO?: string;
   /** Yir referral code included for people deploying this starter; optional for your own sites. */
   YIR_REFERRAL_CODE?: string;
   /** The compose service (packages/jobs/compose), e.g. http://compose:8080; sites without effect compose don't need it. */
@@ -40,6 +46,7 @@ export function createAdapters(env: JobsEnv): Record<string, UpstreamAdapter> {
       apiKey: env.YIR_API_KEY,
       ...(env.YIR_BASE_URL ? { baseURL: env.YIR_BASE_URL } : {}),
       ...(env.YIR_REFERRAL_CODE ? { referralCode: env.YIR_REFERRAL_CODE } : {}),
+      demo: yirDemo(env),
     }),
   };
 }
@@ -50,4 +57,9 @@ export function fixedMockResult(env: JobsEnv) {
     song: env.UPSTREAM_MOCK_RESULT,
     silent: env.UPSTREAM_MOCK_RESULT_SILENT ?? env.UPSTREAM_MOCK_RESULT,
   };
+}
+
+/** Whether the site turned on Yir demo mode (YIR_DEMO=1 or true). */
+export function yirDemo(env: Pick<JobsEnv, 'YIR_DEMO'>): boolean {
+  return ['1', 'true'].includes(env.YIR_DEMO?.trim().toLowerCase() ?? '');
 }

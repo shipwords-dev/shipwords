@@ -2,8 +2,11 @@ import { getBalance, grantCredits, spendCredits } from '@shipwords/core/credits/
 import { user } from '@shipwords/core/db/schema';
 import type { Mailer } from '@shipwords/core/email/mailer';
 import { consumeQuota } from '@shipwords/core/quota/counters';
+import { YirSubmissionUncertainError } from '@yir-ai/sdk/server';
+import { isDemoJobID } from '@yir-ai/sdk/shared';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
+import { yirDemo } from '../src/adapters';
 import { sumUsd } from '../src/cost';
 import { ALERT_LIST, FAILURE_STREAK, failureStreak } from '../src/failures';
 import { cancelQueued, loadJob, markFailed, markSubmitted, markSucceeded, spendKey } from '../src/lifecycle';
@@ -508,7 +511,7 @@ describe('Yir errors', () => {
     expect((await getBalance(db, userId)).available).toBe(50);
   });
 
-  it('only a rate limit stays retryable; network errors are final', async () => {
+  it('only a rate limit and an uncertain submit stay retryable; other network errors are final', async () => {
     await expect(
       rejecting({ status: 429, code: 'YIR_RATE_LIMITED', message: 'slow' }).adapter.submit(input, 'k1'),
     ).rejects.toMatchObject({ code: 'YIR_RATE_LIMITED', retryable: true });
@@ -516,6 +519,125 @@ describe('Yir errors', () => {
       code: 'yir_error',
       retryable: false,
     });
+    await expect(
+      rejecting(new YirSubmissionUncertainError('k3', new TypeError('socket hang up'))).adapter.submit(
+        input,
+        'k3',
+      ),
+    ).rejects.toMatchObject({
+      code: 'submission_outcome_uncertain',
+      message: 'socket hang up',
+      retryable: true,
+    });
+  });
+
+  it('an uncertain submit is retried with the same key and recovers the Job: no failure, no refund', async () => {
+    const { userId, jobId } = await paidJob();
+    const keys: string[] = [];
+    const client = {
+      submitImage: async (_request: unknown, key: string) => {
+        keys.push(key);
+        if (keys.length === 1) throw new YirSubmissionUncertainError(key, new TypeError('socket hang up'));
+        return { id: 'yir_job_1' };
+      },
+      getJobStatus: async () => ({ status: 'succeeded' }),
+      getJob: async () => ({
+        result: { availability: 'available', files: [{ url: 'https://up/x.png', media_type: 'image/png' }] },
+      }),
+    };
+    // Steps rethrow like the worker does and run again (the worker retries with backoff).
+    const retrying: StepRunner = {
+      async do(_name, fn) {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await fn();
+          } catch (error) {
+            if (attempt >= 3) throw error;
+          }
+        }
+      },
+      async sleep() {},
+    };
+    await runGeneration(
+      { ...deps(new FakeAdapter()), adapters: { yir: new YirAdapter({ apiKey: 'k' }, client as never) } },
+      jobId,
+      retrying,
+    );
+    expect(keys).toEqual([jobId, jobId]);
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded', upstreamJobId: 'yir_job_1' });
+    expect((await getBalance(db, userId)).available).toBe(40);
+  });
+
+  it('cancel: a finished Job (resolved since SDK 0.14) and an unfinished demo Job are not errors', async () => {
+    const cancelling = (cancelJob: () => Promise<unknown>) =>
+      new YirAdapter({ apiKey: 'k' }, { cancelJob } as never).cancel('j');
+    await expect(cancelling(async () => ({ id: 'j', status: 'succeeded' }))).resolves.toBeUndefined();
+    await expect(
+      cancelling(async () => {
+        throw new Error('demo_cancel_unsupported');
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      cancelling(async () => {
+        throw { status: 404, code: 'YIR_JOB_NOT_FOUND', message: 'gone' };
+      }),
+    ).rejects.toMatchObject({ code: 'YIR_JOB_NOT_FOUND' });
+  });
+});
+
+describe('Yir demo mode', () => {
+  it('only the site env turns it on, never a stray YIR_DEMO in the process environment', () => {
+    expect(yirDemo({ YIR_DEMO: '1' })).toBe(true);
+    expect(yirDemo({ YIR_DEMO: ' TRUE ' })).toBe(true);
+    expect(yirDemo({ YIR_DEMO: '0' })).toBe(false);
+    expect(yirDemo({})).toBe(false);
+  });
+
+  it('demo submits are quoted, not submitted, and finish locally with a free DEMO result', async () => {
+    const paths: string[] = [];
+    vi.stubGlobal('fetch', async (request: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(request instanceof Request ? request.url : String(request));
+      paths.push(`${init?.method ?? (request instanceof Request ? request.method : 'GET')} ${url.pathname}`);
+      if (url.pathname === '/v1/images/quotes') {
+        const body = JSON.parse(String(init?.body));
+        return Response.json({
+          object: 'quote',
+          model: body.model,
+          operation: 'generate_image',
+          input_mode: body.input.type,
+          parameters: { aspect_ratio: '1:1', n: 1 },
+          currency: 'USD',
+          expires_at: 1900000000,
+          primary: { kind: 'fixed', amount: '0.04' },
+          official: { kind: 'fixed', amount: '0.08' },
+          supply: { available: true, issues: [] },
+        });
+      }
+      return Response.json({ error: { code: 'UNEXPECTED', message: url.pathname } }, { status: 500 });
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const adapter = new YirAdapter({ apiKey: 'k', demo: true });
+      const { upstreamJobId } = await adapter.submit(
+        {
+          upstreamModel: 'openai/gpt-image-2',
+          kind: 'image',
+          prompt: 'p',
+          references: [],
+          parameters: { aspect_ratio: '1:1' },
+        },
+        'k-demo',
+      );
+      expect(isDemoJobID(upstreamJobId)).toBe(true);
+      expect(paths).toEqual(['POST /v1/images/quotes']);
+      // Answered locally, no request: still running right after submit, nothing charged (settles when it ends).
+      expect(await adapter.poll(upstreamJobId, 0)).toEqual({ state: 'running' });
+      expect(await adapter.cost(upstreamJobId)).toEqual({ usd: '0', settled: false });
+      expect(paths).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+      warn.mockRestore();
+    }
   });
 });
 

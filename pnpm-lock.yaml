@@ -74,8 +74,8 @@ importers:
         specifier: workspace:*
         version: link:../core
       '@yir-ai/sdk':
-        specifier: 0.13.0
-        version: 0.13.0
+        specifier: 0.15.0
+        version: 0.15.0
       aws4fetch:
         specifier: 1.0.20
         version: 1.0.20
@@ -1884,8 +1884,8 @@ packages:
   '@vitest/utils@4.1.12':
     resolution: {integrity: sha512-Q3awXrwOfEV+qc3WmO5ONyE0yO7Q1gQ9/oyHxGLZ/pl7N3NO/ZztqQwKLuwMkV+CA1JYSIeO3gkHnRDIo4AVaA==}
 
-  '@yir-ai/sdk@0.13.0':
-    resolution: {integrity: sha512-IYx9ZpmpHRPSQcyvJ1O2DiW/JTQkN1ihySXlkHtLqB2ezPc0vCv/+uWM2j9C08K9qBUDketVbjCKxAZLrw5aSg==}
+  '@yir-ai/sdk@0.15.0':
+    resolution: {integrity: sha512-RPGOM0FNKCQt5h5611XhtZetM6SWzoPgl44A6jnrKoAOWdZVpDl1jdYpg0KFlZqAAIKOu3jFhaR1zAT/zu/CPg==}
     hasBin: true
 
   acorn@8.19.0:
@@ -4187,7 +4187,7 @@ snapshots:
       convert-source-map: 2.0.0
       tinyrainbow: 3.2.0
 
-  '@yir-ai/sdk@0.13.0':
+  '@yir-ai/sdk@0.15.0':
     dependencies:
       '@ai-sdk/provider': 4.0.13
       '@types/json-schema': 7.0.15

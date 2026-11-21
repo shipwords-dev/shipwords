@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@shipwords/core": "workspace:*",
-    "@yir-ai/sdk": "0.13.0",
+    "@yir-ai/sdk": "0.15.0",
     "aws4fetch": "1.0.20",
     "drizzle-orm": "0.45.4"
   },
