@@ -241,8 +241,40 @@ test('import-d1: private-assets/ counts as ignored only when .dockerignore lists
       fs.writeFileSync(path.join(dir, '.dockerignore'), `.git\r\n${line}\r\n`);
       assert.equal(privateAssetsDockerIgnored(dir), true, line);
     }
+    // The last matching rule wins in Docker: a negation after the exclusion may bring the export back, so it doesn't count.
+    for (const tail of ['!private-assets/x.sql', '!private-assets', '!**/*.sql', '  !sites/**  ']) {
+      fs.writeFileSync(path.join(dir, '.dockerignore'), `**/private-assets\n${tail}\n`);
+      assert.equal(privateAssetsDockerIgnored(dir), false, tail);
+    }
+    // A negation before it is overridden; comments don't count as rules.
+    fs.writeFileSync(
+      path.join(dir, '.dockerignore'),
+      '**/.env\n!**/.env.example\n**/private-assets\n# !private-assets\n',
+    );
+    assert.equal(privateAssetsDockerIgnored(dir), true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('import-d1: private-assets/ must be spelled exactly so on disk', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'import-d1-case-'));
+  try {
+    fs.mkdirSync(path.join(repo, 'Private-Assets'));
+    const dump = path.join(repo, 'Private-Assets', 'dump.sql');
+    fs.writeFileSync(dump, '');
+    // Docker's "private-assets" rule doesn't match "Private-Assets", even where the file system ignores case.
+    assert.throws(() => assertDumpOutsideRepo(dump, repo, () => true), /dockerignore/);
+    // Typed in lower case on a case-insensitive file system, it is still the directory spelled "Private-Assets".
+    const typed = path.join(repo, 'private-assets', 'dump.sql');
+    if (fs.existsSync(typed))
+      assert.throws(() => assertDumpOutsideRepo(typed, repo, () => true), /dockerignore/);
+    fs.rmSync(path.join(repo, 'Private-Assets'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'private-assets'));
+    fs.writeFileSync(typed, '');
+    assertDumpOutsideRepo(typed, repo, () => true);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 });
 

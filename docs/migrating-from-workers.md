@@ -86,16 +86,17 @@ Data the Worker kept outside D1 (R2 listings or metadata, KV) doesn't come with 
 
 ## 5. Cutover (confirm)
 
-Pick a quiet moment, and wait until no job is queued or running on the Worker (check `jobs.status` in D1). The job worker gives queued jobs without a run a fresh run, but a job that was mid-way on the Worker would start its steps again and could pay the upstream twice.
+Pick a quiet moment. The site is down for the few minutes between steps 1 and 6. Any write that reaches D1 after the final export is lost: the import tool won't import into a database that already has rows, and a webhook the Worker answered with 200 won't be delivered again.
 
-1. Stop writes on the Worker: a temporary Cloudflare WAF custom rule on the site's hostname that blocks every method but GET and HEAD. Pages still load; orders, sign-ins and new jobs are refused for the few minutes of the switch, and a payment provider retries a refused webhook later, so it lands on the new site. Remove the rule after step 5 (the DNS change). Without it, a payment confirmed or a job started between the export and the DNS change exists only in D1, the webhook was already answered, and the import tool will not import into a database that now has rows.
-2. Final export of D1 (`wrangler d1 export … --remote`), outside every repository.
-3. Import for real: run the tool without `--yes` against the site's real database, check the printed target, then again with `--yes --database <the name it printed>`.
-4. Fill any tables from non-D1 data (section 4).
-5. In Cloudflare: remove the Worker's custom domains (and routes) for the site, create the proxied DNS records pointing at the machine, and set SSL to Full (strict). Cloudflare switches within seconds.
-6. Check: home page and a few pages through the domain, sign-in, the payment provider's webhook endpoint answers 400 to an unsigned request, `docker compose logs -f site` is clean, and D1 received no new writes after the export.
-7. Make the old deploy impossible: empty the Worker's `routes`, and make main's deploy scripts fail with a message pointing at the new deploy, so nobody redeploys the Worker onto the domain by habit.
-8. Run one real paid generation (the cheapest product), and check that credits, the job, the output in R2, the email and the download all work.
+1. Close the site: a temporary Cloudflare WAF custom rule that blocks **every** request to the site's hostnames, pages included. The Worker writes on some GETs too: in `v0.2.0`, reading the job list claims a guest's jobs and settles refunds for failed ones. Check from outside that the home page and an API path both answer 403. Payment providers retry refused webhooks (Stripe for up to 3 days, PayPal up to 25 times over 3 days), so they reach the new site after the switch.
+2. Drain: wait until no job is queued or running in D1 (`jobs.status`) and no instance of the site's Workflow is running. Requests accepted before step 1 can still finish, and a job left mid-way would start its steps again on the new site and could pay the upstream twice. Then count the rows in each D1 table.
+3. Final export of D1 (`wrangler d1 export … --remote`), outside every repository, and count the rows again. If any count changed, something was still writing: go back to step 2.
+4. Import for real: run the tool without `--yes` against the site's real database, check the printed target, then again with `--yes --database <the name it printed>`.
+5. Fill any tables from non-D1 data (section 4).
+6. In Cloudflare: remove the Worker's custom domains (and routes) for the site, create the proxied DNS records pointing at the machine, and set SSL to Full (strict). Cloudflare switches within seconds. Then remove the WAF rule from step 1, which applies to the hostname whichever origin serves it.
+7. Check: home page and a few pages through the domain, sign-in, the payment provider's webhook endpoint answers 400 to an unsigned request, `docker compose logs -f site` is clean, and D1's row counts are still the ones from step 3.
+8. Make the old deploy impossible: empty the Worker's `routes`, and make main's deploy scripts fail with a message pointing at the new deploy, so nobody redeploys the Worker onto the domain by habit.
+9. Run one real paid generation (the cheapest product), and check that credits, the job, the output in R2, the email and the download all work.
 
 **Rollback** is only a DNS change while the new database has no business writes since the cutover (orders, payments, ledger entries, jobs): delete the new records and bind the domains back to the Worker. After the first write, stop writes on the new site and copy those rows back into D1 first; webhooks the new site already accepted won't be delivered again.
 

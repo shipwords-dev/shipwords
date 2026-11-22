@@ -319,7 +319,11 @@ export async function importDump(
   }
 }
 
-/** True when the repository root's .dockerignore leaves private-assets/ out of the build context. */
+/**
+ * True when the repository root's .dockerignore leaves private-assets/ out of the build context. Docker applies the rules in
+ * order and the last match wins, so an exclusion only counts when no negation ("!…") follows it: a later "!private-assets/x.sql"
+ * or "!**\/*.sql" would bring the export back. Any later negation is refused rather than matched, which errs on the safe side.
+ */
 export function privateAssetsDockerIgnored(root) {
   let text;
   try {
@@ -327,7 +331,23 @@ export function privateAssetsDockerIgnored(root) {
   } catch {
     return false;
   }
-  return text.split(/\r?\n/).some((line) => /^(\*\*\/|\/)?private-assets\/?(\*\*)?$/.test(line.trim()));
+  let excluded = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    if (line.startsWith('!')) excluded = false;
+    else if (/^(\*\*\/|\/)?private-assets\/?(\*\*)?$/.test(line)) excluded = true;
+  }
+  return excluded;
+}
+
+/** The path as the file system spells it (Docker matches names case-sensitively), or the resolved path if it doesn't exist. */
+function onDisk(p) {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
 }
 
 /**
@@ -335,17 +355,24 @@ export function privateAssetsDockerIgnored(root) {
  * where that repository's .dockerignore leaves it out of the build context.
  */
 export function assertDumpOutsideRepo(file, repoRoots, dockerIgnored = privateAssetsDockerIgnored) {
-  const resolved = path.resolve(file);
+  const resolved = onDisk(file);
   // By whole path segments: "..notes" is a directory inside, ".." is the parent.
-  const inside = (dir) => {
+  const relativeTo = (dir) => {
     const rel = path.relative(dir, resolved);
-    return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+    return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)
+      ? rel
+      : null;
   };
-  for (const root of [repoRoots].flat().map((r) => path.resolve(r)))
-    if (inside(root) && !(inside(path.join(root, 'private-assets')) && dockerIgnored(root)))
+  // Directly under <root>/private-assets/, spelled exactly so: on Windows path.relative ignores case, Docker's rules don't.
+  const inPrivateAssets = (rel) =>
+    rel.split(path.sep)[0] === 'private-assets' && rel.split(path.sep).length > 1;
+  for (const root of [repoRoots].flat().map(onDisk)) {
+    const rel = relativeTo(root);
+    if (rel !== null && !(inPrivateAssets(rel) && dockerIgnored(root)))
       throw new Error(
         `the export ${resolved} is inside a repository: move it outside (or under a private-assets/ that is gitignored and listed in the repository's .dockerignore)`,
       );
+  }
 }
 
 /**
