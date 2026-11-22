@@ -1,6 +1,7 @@
 import type { Db } from '@shipwords/core/db/client';
 import { user } from '@shipwords/core/db/schema';
 import { emailCopy } from '@shipwords/core/email/copy';
+import type { Mailer } from '@shipwords/core/email/mailer';
 import type { SiteConfig } from '@shipwords/core/site';
 import { eq } from 'drizzle-orm';
 import { ALERT_LIST } from './failures';
@@ -18,7 +19,7 @@ function firstOutputUrl(job: JobRow, baseURL: string): string | null {
  * Sent in English to the address in REVIEW_EMAIL; the user isn't told anything beyond their normal result email.
  */
 export function emailReview(options: {
-  email: SendEmail;
+  email: Mailer;
   from: string;
   to: string;
   site: Pick<SiteConfig, 'name'>;
@@ -52,7 +53,7 @@ export function emailReview(options: {
  * Sent in English to the address in REVIEW_EMAIL, once per streak; the user only gets their normal failure emails.
  */
 export function emailFailures(options: {
-  email: SendEmail;
+  email: Mailer;
   from: string;
   to: string;
   site: Pick<SiteConfig, 'name'>;
@@ -93,7 +94,7 @@ export function emailFailures(options: {
  */
 export function emailOnFinish(options: {
   db: Db;
-  email: SendEmail;
+  email: Mailer;
   from: string;
   site: Pick<SiteConfig, 'name' | 'defaultLocale'>;
   baseURL: string;

@@ -28,7 +28,7 @@ import type { PollResult, SubmitInput, UpstreamAdapter } from './upstream';
 import { UpstreamError } from './upstream';
 
 // Repair passes after compose (segment.repair) and the likeness check that can ask for them. Run inside one job's runner:
-// RepairContext carries what they share with it. Step names are Workflow cache keys and must not change.
+// RepairContext carries what they share with it. Step names are replay keys and must not change.
 
 export interface SegmentCheck {
   maxSimilarity: number;
@@ -225,7 +225,7 @@ export async function repairOutputs(
         const object = await deps.bucket.get(source);
         if (!object) throw new Error(`repair output missing: ${source}`);
         await deps.bucket.put(output.key, await object.arrayBuffer(), {
-          httpMetadata: { contentType: 'video/mp4' },
+          contentType: 'video/mp4',
         });
       }
       return true;
@@ -303,16 +303,25 @@ export async function repairOutputs(
       const cut = { jobId, key: current, ...planned.geometry };
       const clip = await step.do(`${label}:extract`, async () => {
         const bytes = await deps.composer!.extract(cut);
-        await deps.bucket.put(work(String(round)), bytes, { httpMetadata: { contentType: 'video/mp4' } });
+        await deps.bucket.put(work(String(round)), bytes, { contentType: 'video/mp4' });
         return work(String(round));
       });
       const position = ctx.partCount + round;
-      const submitted = await step.do(`${label}:submit`, async () => {
+      /** The pass's recorded upstream ID, if the slot was filled (by this call or a replay of it); done if the job ended. */
+      const recorded = async () => {
+        const row = await activeJob(deps.db, jobId);
+        if (!row) return { done: true as const };
+        const id = upstreamIds(row)[position];
+        return id ? { upstreamJobId: id } : null;
+      };
+      const submitted = await step.do(`${label}:submit`, async (info) => {
         const row = await activeJob(deps.db, jobId);
         if (!row) return { done: true as const };
         const existing = upstreamIds(row)[position];
         if (existing) return { upstreamJobId: existing };
-        if (Date.now() > deadline) return { timeout: true as const };
+        // Past the deadline, a first attempt never submits; a later one may follow an attempt the upstream accepted, so it submits
+        // again with the same key to recover that task, and the timeout that follows cancels it.
+        if (Date.now() > deadline && (info?.attempt ?? 1) === 1) return { timeout: true as const };
         const input = repairInput(
           repair,
           pass,
@@ -324,12 +333,19 @@ export async function repairOutputs(
         );
         try {
           const { upstreamJobId } = await adapter.submit(input, `${jobId}:${partId}:repair:${round}`);
-          if (!(await appendUpstreamJob(deps.db, jobId, position, upstreamJobId))) {
+          if (await appendUpstreamJob(deps.db, jobId, position, upstreamJobId, deps.fence))
+            return { upstreamJobId };
+          // The slot was filled meanwhile, or the job ended: keep the recorded task, cancel a different one this call placed. With
+          // the job active and the slot empty, this run may have lost the job to another that recovers this very task: retry.
+          const now = await recorded();
+          if (!now) throw new Error(`could not record repair task ${upstreamJobId} at ${position}`);
+          if ('done' in now || now.upstreamJobId !== upstreamJobId)
             await adapter.cancel(upstreamJobId).catch(() => undefined);
-            return { done: true as const };
-          }
-          return { upstreamJobId };
+          return now;
         } catch (error) {
+          // A late error from an attempt another one already got past must not end the pass.
+          const now = await recorded();
+          if (now) return now;
           if (error instanceof UpstreamError && !error.retryable) return { rejected: error.code };
           throw error;
         }
@@ -353,7 +369,7 @@ export async function repairOutputs(
         if (!response.ok || !response.body)
           throw new Error(`download repair ${round} failed: ${response.status}`);
         await deps.bucket.put(work(`${round}-out`), response.body, {
-          httpMetadata: { contentType: 'video/mp4' },
+          contentType: 'video/mp4',
         });
         return work(`${round}-out`);
       });
@@ -363,7 +379,7 @@ export async function repairOutputs(
           name: `${jobId}-repair-${partId}-${round}`,
           patchKey,
         });
-        const meta = { httpMetadata: { contentType: 'video/mp4' } };
+        const meta = { contentType: 'video/mp4' };
         await deps.bucket.put(work(`${round}-song`), song, meta);
         await deps.bucket.put(work(`${round}-silent`), quiet, meta);
         return { song: work(`${round}-song`), silent: work(`${round}-silent`) };
@@ -408,7 +424,7 @@ export async function repairOutputs(
   try {
     return await runPasses();
   } catch (error) {
-    // A pass step that throws after its Workflow retries (status reads, the download, the container's extract or patch) fails the
+    // A pass step that throws after its step retries (status reads, the download, the container's extract or patch) fails the
     // job with a refund through the fallback; under onMiss 'deliver' the paid render is delivered instead, as on any other miss.
     if (repair.onMiss !== 'deliver') throw error;
     return giveUp(`a pass errored: ${String(error)}`.slice(0, 300), () => Promise.reject(error));

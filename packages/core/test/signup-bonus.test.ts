@@ -1,13 +1,11 @@
-import { env } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { grantSignupBonus } from '../src/auth/server';
 import { getBalance } from '../src/credits/ledger';
-import { createDb } from '../src/db/client';
 import { quotaCounters } from '../src/db/schema';
 import { defineSite } from '../src/site';
+import { db } from './db';
 
-const db = createDb(env.DB);
 let seq = 0;
 const uid = () => `u_${++seq}_${crypto.randomUUID().slice(0, 8)}`;
 // Each test runs on its own UTC day, so the shared daily counters start at zero.

@@ -69,6 +69,11 @@ export interface EffectDescribe {
   instruction: string;
   /** Which prep view to describe (index into the slot's prep prompts, or its last view when it has fewer); defaults to 0. */
   view?: number;
+  /**
+   * A vision model on the AI Gateway, such as 'openai/gpt-6.2-sol'. Used when the runtime has AI_GATEWAY_API_KEY; without the key,
+   * or without a model here, the runtime falls back to Workers AI (DESCRIBE_MODEL in describe.ts) when it has Cloudflare credentials.
+   */
+  model?: string;
 }
 
 /** Prep sub-task: one per slot with prep, using the user's photo as reference. */
@@ -529,6 +534,7 @@ function validateEffect(model: ModelDefinition, effect: EffectSpec) {
     if (
       !effect.prep ||
       !effect.describe.instruction.trim() ||
+      (effect.describe.model !== undefined && !effect.describe.model.trim()) ||
       !Number.isInteger(view) ||
       view < 0 ||
       !effect.slots.some((slot) => view < prepViews(slot).length)
@@ -777,7 +783,7 @@ export interface JobPart {
   /** Effect video segments: what each filled slot's photo shows. */
   kinds?: Record<string, SlotKind>;
   /** Effect video segments whose prompt asks for descriptions: the instruction and the image of each slot to describe (prep placeholders). */
-  describe?: { instruction: string; images: Record<string, string> };
+  describe?: { instruction: string; model?: string; images: Record<string, string> };
 }
 
 /** A slot's value in a create request: an upload path, or { photo, kind } to say what it shows. Null if malformed. */
@@ -897,6 +903,7 @@ export function effectParts(
         ? {
             describe: {
               instruction: describe.instruction,
+              ...(describe.model ? { model: describe.model } : {}),
               images: Object.fromEntries(
                 asked.map((slotId) => [
                   slotId,

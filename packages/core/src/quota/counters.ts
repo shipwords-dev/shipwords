@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, lt, sql } from 'drizzle-orm';
 import type { Db } from '../db/client';
 import { quotaCounters } from '../db/schema';
 
@@ -13,6 +13,11 @@ export function dayWindow(now = Date.now()): string {
   return new Date(now).toISOString().slice(0, 10);
 }
 
+/** The UTC hour, for limits that should recover within the hour. */
+export function hourWindow(now = Date.now()): string {
+  return new Date(now).toISOString().slice(0, 13);
+}
+
 async function increment(db: Db, rule: QuotaRule): Promise<boolean> {
   if (rule.limit <= 0) return false;
   const result = await db
@@ -23,14 +28,14 @@ async function increment(db: Db, rule: QuotaRule): Promise<boolean> {
       set: { count: sql`${quotaCounters.count} + 1` },
       setWhere: sql`${quotaCounters.count} < ${rule.limit}`,
     })
-    .run();
-  return result.meta.changes > 0;
+    .returning({ count: quotaCounters.count });
+  return result.length > 0;
 }
 
 async function decrement(db: Db, rule: QuotaRule) {
   await db
     .update(quotaCounters)
-    .set({ count: sql`max(${quotaCounters.count} - 1, 0)` })
+    .set({ count: sql`greatest(${quotaCounters.count} - 1, 0)` })
     .where(and(eq(quotaCounters.key, rule.key), eq(quotaCounters.window, rule.window)));
 }
 
@@ -58,6 +63,16 @@ export async function consumeQuota(db: Db, rules: QuotaRule[]): Promise<boolean>
     return false;
   }
   return true;
+}
+
+/**
+ * Deletes counters whose key starts with a prefix and whose window is before the given one (windows sort by time: a UTC date, or a
+ * date and hour). Counters are otherwise kept for good, which is fine for keys a site has few of and not for keys anyone can mint.
+ */
+export async function pruneQuota(db: Db, keyPrefix: string, beforeWindow: string): Promise<void> {
+  await db
+    .delete(quotaCounters)
+    .where(and(sql`starts_with(${quotaCounters.key}, ${keyPrefix})`, lt(quotaCounters.window, beforeWindow)));
 }
 
 /** Refunds one count, e.g. when a guest generation fails to submit. */

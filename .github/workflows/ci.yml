@@ -16,6 +16,21 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      # Lock and concurrency tests (test:pg) need a real Postgres; unit tests use in-memory PGlite.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
 
@@ -38,4 +53,17 @@ jobs:
 
       - run: pnpm --filter @shipwords/jobs check
 
+      - run: pnpm --filter @shipwords/core --filter @shipwords/jobs test:pg
+
       - run: pnpm --filter ./templates/ai-site check
+
+  images:
+    # The production images build from a clean checkout: the template's Dockerfile (install, build, launch checks, prod deploy)
+    # and the compose service.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: docker build -f templates/ai-site/Dockerfile -t shipwords-site .
+
+      - run: docker build -t shipwords-compose packages/jobs/compose

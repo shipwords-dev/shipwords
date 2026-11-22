@@ -1,17 +1,16 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import type { Core } from '@shipwords/core/server';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createJobs } from '../src/handlers';
 import { loadJob, markFailed, markSucceeded } from '../src/lifecycle';
 import type { ModelDefinition } from '../src/models';
-import { jobs } from '../src/schema';
+import { jobRuns, jobs } from '../src/schema';
+import { bucket } from './bucket';
+import { db } from './db';
 
 // Money paths of the plain (non-idempotent) create, cancel and stale healing. Idempotent create: idempotent-create.test.ts.
 
-const db = createDb(env.DB);
 const model: ModelDefinition = {
   id: 'paid',
   name: 'Paid',
@@ -28,8 +27,6 @@ const model: ModelDefinition = {
 async function setup(balance = 10) {
   const userId = crypto.randomUUID();
   await grantCredits(db, { userId, amount: balance, idemKey: userId, source: 'test' });
-  const dispatched: string[] = [];
-  let dispatchFails = false;
   const api = createJobs(
     {
       db,
@@ -38,16 +35,10 @@ async function setup(balance = 10) {
       log: () => {},
       env: {
         GUEST_COOKIE_SECRET: 'test-secret',
-        OUTPUTS: env.OUTPUTS,
-        GENERATION_WORKFLOW: {
-          create: async ({ id }: { id: string }) => {
-            if (dispatchFails) throw new Error('dispatch error');
-            dispatched.push(id);
-          },
-        },
       },
     } as unknown as Core,
     [model],
+    { store: bucket },
   );
   const request = (path: string, body?: unknown) =>
     new Request(`https://test.example${path}`, {
@@ -56,12 +47,15 @@ async function setup(balance = 10) {
     });
   return {
     userId,
-    dispatched,
-    failDispatch: () => {
-      dispatchFails = true;
-    },
+    /** Runs queued for this user's jobs. */
+    runs: () =>
+      db
+        .select({ id: jobRuns.id })
+        .from(jobRuns)
+        .innerJoin(jobs, eq(jobs.id, jobRuns.id))
+        .where(eq(jobs.userId, userId)),
     balance: async () => (await getBalance(db, userId)).available,
-    create: () => api.create(request('/api/jobs', { modelId: 'paid', prompt: 'a cat' })),
+    create: (prompt = 'a cat') => api.create(request('/api/jobs', { modelId: 'paid', prompt })),
     get: (jobId: string) => api.get(new Request(`https://test.example/api/jobs/${jobId}`), jobId),
     cancel: (jobId: string) => api.cancel(request(`/api/jobs/${jobId}/cancel`), jobId),
     file: (key: string) => api.file(new Request(`https://test.example/files/${key}`), key),
@@ -73,7 +67,7 @@ describe('GET /files', () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
     const key = `jobs/${jobId}/prep-backLeft-3.png`;
-    await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    await bucket.put(key, new Uint8Array([1]), { contentType: 'image/png' });
     expect((await ctx.file(key)).status).toBe(404);
     await db.update(jobs).set({ status: 'submitted' }).where(eq(jobs.id, jobId));
     const response = await ctx.file(key);
@@ -87,8 +81,7 @@ describe('GET /files', () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
     const keys = [`jobs/${jobId}/kept/prep-left-0.png`, `jobs/${jobId}/kept/uploads/up_a.png`];
-    for (const key of keys)
-      await env.OUTPUTS.put(key, new Uint8Array([1]), { httpMetadata: { contentType: 'image/png' } });
+    for (const key of keys) await bucket.put(key, new Uint8Array([1]), { contentType: 'image/png' });
     for (const status of ['queued', 'submitted', 'succeeded'] as const) {
       await db.update(jobs).set({ status }).where(eq(jobs.id, jobId));
       for (const key of keys) expect((await ctx.file(key)).status).toBe(404);
@@ -96,28 +89,25 @@ describe('GET /files', () => {
   });
   it('serves uploads uncached, so no copy outlives the lifecycle deletion; outputs stay cacheable', async () => {
     const ctx = await setup();
-    await env.OUTPUTS.put('uploads/up_cachetest.png', new Uint8Array([1]), {
-      httpMetadata: { contentType: 'image/png' },
-    });
+    await bucket.put('uploads/up_cachetest.png', new Uint8Array([1]), { contentType: 'image/png' });
     const upload = await ctx.file('uploads/up_cachetest.png');
     expect(upload.status).toBe(200);
     expect(upload.headers.get('cache-control')).toBe('no-store');
     await upload.arrayBuffer();
     const jobId = await createdId(await ctx.create());
     const output = `jobs/${jobId}/0.mp4`;
-    await env.OUTPUTS.put(output, new Uint8Array([1]), { httpMetadata: { contentType: 'video/mp4' } });
+    await bucket.put(output, new Uint8Array([1]), { contentType: 'video/mp4' });
     await markSucceeded(db, jobId, [{ key: output, mediaType: 'video/mp4' }]);
     const served = await ctx.file(output);
     expect(served.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
     await served.arrayBuffer();
   });
-
   it('serves an output replaced by hand under its new key, once the job succeeded', async () => {
     const ctx = await setup();
     const jobId = await createdId(await ctx.create());
     const replaced = `jobs/${jobId}/0-r1794301409744.mp4`;
-    await env.OUTPUTS.put(replaced, new Uint8Array([1, 2, 3]), {
-      httpMetadata: { contentType: 'video/mp4' },
+    await bucket.put(replaced, new Uint8Array([1, 2, 3]), {
+      contentType: 'video/mp4',
     });
     expect((await ctx.file(replaced)).status).toBe(404);
     await markSucceeded(db, jobId, [{ key: replaced, mediaType: 'video/mp4' }]);
@@ -131,24 +121,40 @@ async function createdId(response: Response) {
 }
 
 describe('job handlers: money paths', () => {
-  it('not enough credits: 402, no job row, nothing dispatched', async () => {
+  it('rejects a prompt with a NUL character before charging', async () => {
+    const ctx = await setup();
+    const response = await ctx.create('a\u0000cat');
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('invalid_prompt');
+    expect(await ctx.balance()).toBe(10);
+  });
+
+  it('not enough credits: 402, no job row, no run', async () => {
     const ctx = await setup(3);
     const response = await ctx.create();
     expect(response.status).toBe(402);
     expect(await db.select().from(jobs).where(eq(jobs.userId, ctx.userId))).toHaveLength(0);
-    expect(ctx.dispatched).toHaveLength(0);
+    expect(await ctx.runs()).toHaveLength(0);
     expect(await ctx.balance()).toBe(3);
   });
 
-  it('dispatch failure fails the job and refunds once, however often it is read', async () => {
+  it('queues the run in the charge transaction', async () => {
     const ctx = await setup();
-    ctx.failDispatch();
-    expect((await ctx.create()).status).toBe(503);
-    const [row] = await db.select().from(jobs).where(eq(jobs.userId, ctx.userId));
-    expect(row?.status).toBe('failed');
-    expect(row?.errorCode).toBe('dispatch_failed');
-    await ctx.get(row!.id);
-    await ctx.get(row!.id);
+    const jobId = await createdId(await ctx.create());
+    expect(await ctx.runs()).toEqual([{ id: jobId }]);
+    expect(await ctx.balance()).toBe(6);
+  });
+
+  it('a run insert that fails rolls back the charge and the job', async () => {
+    const ctx = await setup();
+    // A run row already holding the next job ID can't exist; simulate a failing run insert with a CHECK on this test database.
+    await db.execute(sql`alter table job_runs add constraint test_no_runs check (false) not valid`);
+    try {
+      await expect(ctx.create()).rejects.toThrow();
+    } finally {
+      await db.execute(sql`alter table job_runs drop constraint test_no_runs`);
+    }
+    expect(await db.select().from(jobs).where(eq(jobs.userId, ctx.userId))).toHaveLength(0);
     expect(await ctx.balance()).toBe(10);
   });
 

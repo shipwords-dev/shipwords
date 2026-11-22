@@ -1,3 +1,4 @@
+import type { ObjectStore } from './store';
 // Local mock: no upstream calls, no compose container, only fake outputs; for testing site flows (upload, charge, polling, storage, output, refund).
 // Only enabled when UPSTREAM_MOCK is set and either APP_URL points to localhost or every payment credential is in test mode
 // (a public demo), so a deploy that can take real money never serves fake outputs.
@@ -107,7 +108,7 @@ function mediaTypeOf(url: string): string {
  * Fake compose: no stitching, the output is just the first rendered segment (or the first base clip if none rendered); swap checks always pass.
  * With fixed (R2 keys, set by UPSTREAM_MOCK_RESULT on a public demo) every job returns the same finished video instead.
  */
-export function mockComposer(bucket: R2Bucket, fixed?: { song: string; silent: string }): Composer {
+export function mockComposer(bucket: ObjectStore, fixed?: { song: string; silent: string }): Composer {
   async function read(key: string) {
     const object = await bucket.get(key);
     if (!object) throw new Error(`mock result missing: ${key}`);

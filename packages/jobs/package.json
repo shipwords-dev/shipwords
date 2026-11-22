@@ -10,22 +10,25 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
-    "check": "pnpm typecheck && pnpm test"
+    "check": "pnpm typecheck && pnpm test",
+    "test:pg": "vitest run --config vitest.pg.config.ts"
   },
   "dependencies": {
     "@shipwords/core": "workspace:*",
-    "@yir-ai/sdk": "0.13.0",
+    "@yir-ai/sdk": "0.15.0",
+    "aws4fetch": "1.0.20",
     "drizzle-orm": "0.45.4"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.4.8",
-    "@cloudflare/workers-types": "5.20261027.1",
+    "@electric-sql/pglite": "0.5.16",
+    "@types/node": "26.6.6",
+    "@types/pg": "8.23.1",
+    "@types/react": "19.3.0",
     "drizzle-kit": "0.31.11",
-    "typescript": "6.0.3",
-    "vitest": "4.1.12",
-    "wrangler": "4.153.0",
+    "pg": "8.23.1",
     "react": "19.3.1",
-    "@types/react": "19.3.0"
+    "typescript": "6.0.3",
+    "vitest": "4.1.12"
   },
   "peerDependencies": {
     "react": "^19.0.0"

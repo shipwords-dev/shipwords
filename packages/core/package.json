@@ -10,11 +10,13 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
-    "check": "pnpm typecheck && pnpm test"
+    "check": "pnpm typecheck && pnpm test",
+    "test:pg": "vitest run --config vitest.pg.config.ts"
   },
   "dependencies": {
     "better-auth": "1.7.14",
     "drizzle-orm": "0.45.4",
+    "pg": "8.23.1",
     "stripe": "23.0.1",
     "zod": "4.6.7"
   },
@@ -22,13 +24,13 @@
     "react": "^19.0.0"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.4.8",
-    "@cloudflare/workers-types": "5.20261027.1",
+    "@electric-sql/pglite": "0.5.16",
+    "@types/node": "26.6.6",
+    "@types/pg": "8.23.1",
     "@types/react": "19.3.0",
     "drizzle-kit": "0.31.11",
     "react": "19.3.1",
     "typescript": "6.0.3",
-    "vitest": "4.1.12",
-    "wrangler": "4.153.0"
+    "vitest": "4.1.12"
   }
 }

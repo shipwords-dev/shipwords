@@ -1,19 +1,19 @@
 {
   "version": "7",
-  "dialect": "sqlite",
+  "dialect": "postgresql",
   "entries": [
     {
       "idx": 0,
-      "version": "6",
-      "when": 1793080005688,
-      "tag": "20261027054645_init",
+      "version": "7",
+      "when": 1795027405366,
+      "tag": "20261118184325_init",
       "breakpoints": true
     },
     {
       "idx": 1,
-      "version": "6",
-      "when": 1793198538461,
-      "tag": "20261028144218_little_mulholland_black",
+      "version": "7",
+      "when": 1795028969760,
+      "tag": "20261118190929_job_runs",
       "breakpoints": true
     }
   ]

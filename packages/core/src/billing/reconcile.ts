@@ -1,6 +1,6 @@
 import { and, eq, ne, type SQLWrapper, sql } from 'drizzle-orm';
 import { grantCredits, revokeCredits } from '../credits/ledger';
-import { type Db, newId } from '../db/client';
+import { type Db, newId, type Tx } from '../db/client';
 import { creditLots, orders, payments, subscriptions } from '../db/schema';
 import { findProduct, type SiteConfig } from '../site';
 import type { CheckoutFact, PaymentFact, PaymentProvider, SubscriptionFact, WebhookTarget } from './provider';
@@ -117,9 +117,9 @@ async function upsertPayment(db: Db, fact: MappedPayment): Promise<string> {
       target: [payments.provider, payments.paymentRef],
       set: {
         chargeRef: sql`coalesce(excluded.charge_ref, ${payments.chargeRef})`,
-        amountRefunded: sql`max(excluded.amount_refunded, ${payments.amountRefunded})`,
+        amountRefunded: sql`greatest(excluded.amount_refunded, ${payments.amountRefunded})`,
         disputeStatus: sql`case when ${disputeRank(sql`excluded.dispute_status`)} >= ${disputeRank(payments.disputeStatus)} then excluded.dispute_status else ${payments.disputeStatus} end`,
-        fetchedAt: sql`max(excluded.fetched_at, ${payments.fetchedAt})`,
+        fetchedAt: sql`greatest(excluded.fetched_at, ${payments.fetchedAt})`,
         updatedAt: Date.now(),
       },
     });
@@ -141,21 +141,6 @@ async function grantForPayment(
   paymentId: string,
   credits: NonNullable<ReturnType<typeof creditsFor>>,
 ) {
-  const markOrderPaid = fact.orderId
-    ? [
-        db
-          .update(orders)
-          .set({ status: 'paid', paidAt: fact.paidAt ?? Date.now() })
-          .where(
-            and(
-              eq(orders.id, fact.orderId),
-              eq(orders.userId, fact.userId),
-              eq(orders.productId, fact.productId),
-              eq(orders.status, 'pending'),
-            ),
-          ),
-      ]
-    : [];
   await grantCredits(
     db,
     {
@@ -166,10 +151,21 @@ async function grantForPayment(
       sourceRef: paymentId,
       expiresAt: credits.expiresAt,
     },
-    [
-      db.update(payments).set({ creditsGranted: credits.amount }).where(eq(payments.id, paymentId)),
-      ...markOrderPaid,
-    ],
+    async (tx) => {
+      await tx.update(payments).set({ creditsGranted: credits.amount }).where(eq(payments.id, paymentId));
+      if (fact.orderId)
+        await tx
+          .update(orders)
+          .set({ status: 'paid', paidAt: fact.paidAt ?? Date.now() })
+          .where(
+            and(
+              eq(orders.id, fact.orderId),
+              eq(orders.userId, fact.userId),
+              eq(orders.productId, fact.productId),
+              eq(orders.status, 'pending'),
+            ),
+          );
+    },
   );
 }
 
@@ -189,10 +185,11 @@ async function convergeRevoked(db: Db, paymentId: string, paymentRef: string) {
     if (target === current.creditsRevoked) return;
     const nextSeq = current.adjustSeq + 1;
     const idemKey = `adj:${current.id}:${nextSeq}`;
-    const bump = db
-      .update(payments)
-      .set({ creditsRevoked: target, adjustSeq: nextSeq, updatedAt: Date.now() })
-      .where(and(eq(payments.id, current.id), eq(payments.adjustSeq, current.adjustSeq)));
+    const bump = (tx: Tx) =>
+      tx
+        .update(payments)
+        .set({ creditsRevoked: target, adjustSeq: nextSeq, updatedAt: Date.now() })
+        .where(and(eq(payments.id, current.id), eq(payments.adjustSeq, current.adjustSeq)));
     // Applied or lost to a concurrent request, loop again: the re-read at the top returns once converged.
     if (target > current.creditsRevoked) {
       await revokeCredits(
@@ -204,7 +201,7 @@ async function convergeRevoked(db: Db, paymentId: string, paymentRef: string) {
           preferSourceRef: current.id,
           ref: current.id,
         },
-        [bump],
+        bump,
       );
     } else {
       // Dispute won or refund reversed: return over-clawed credits, with the same expiry as the lot this payment originally granted.
@@ -218,7 +215,7 @@ async function convergeRevoked(db: Db, paymentId: string, paymentRef: string) {
           sourceRef: current.id,
           expiresAt: await originalExpiry(db, current.id),
         },
-        [bump],
+        bump,
       );
     }
   }

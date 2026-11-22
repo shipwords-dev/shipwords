@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Usage: node ../../tools/check-site.mjs <site dir> (a site's pnpm check runs it after the build)
 // Checks that a site has the files, routes and policy pages needed to launch, that the browser bundle has no zh messages, no strings from
-// *.server.ts files and no .dev.vars values, and that the site imports no other site.
+// *.server.ts files and no .env values, and that the site imports no other site.
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseEnv } from 'node:util';
 
 const REQUIRED_FILES = [
   'README.md',
@@ -11,7 +12,8 @@ const REQUIRED_FILES = [
   'site.config.ts',
   'site.models.ts',
   'src/models.server.ts',
-  'wrangler.jsonc',
+  '.env.example',
+  'start.mjs',
   'src/server.ts',
 ];
 const REQUIRED_ROUTES = [
@@ -129,22 +131,14 @@ function serverTexts(dir) {
 }
 
 /**
- * Values from the local .dev.vars (absent in CI), read as dotenv does: optional export prefix, quoted values kept whole,
+ * Values from the local .env (absent in CI), read as dotenv does: optional export prefix, quoted values kept whole,
  * a # after whitespace starts a comment in unquoted ones. Only names are ever printed.
  */
-export function devVars(dir, name = '.dev.vars') {
+export function devVars(dir, name = '.env') {
   const file = path.join(dir, name);
   if (!fs.existsSync(file)) return [];
-  return fs
-    .readFileSync(file, 'utf8')
-    .split(/\r?\n/)
-    .map((line) => line.match(/^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/))
-    .filter(Boolean)
-    .map(([, key, raw]) => {
-      const quoted = raw.match(/^(['"`])([\s\S]*?)\1/);
-      return [key, quoted ? quoted[2] : raw.replace(/\s+#.*$/, '').trim()];
-    })
-    .filter(([, value]) => value.length >= 8);
+  // Parsed the way the app reads it (node --env-file), so the values scanned for are exactly the ones the server gets.
+  return Object.entries(parseEnv(fs.readFileSync(file, 'utf8'))).filter(([, value]) => value.length >= 8);
 }
 
 function checkBuild(dir) {
@@ -153,7 +147,7 @@ function checkBuild(dir) {
   if (!fs.existsSync(dist)) return [];
   const zh = zhMessages(dir);
   const server = serverTexts(dir);
-  // A public value (a site key, the app URL) may sit in .dev.vars and in the page; those are not secrets, so public config is allowed.
+  // A public value (a site key, the app URL) may sit in .env and in the page; those are not secrets, so public config is allowed.
   const secrets = devVars(dir).filter(
     ([key]) => !/^(APP_URL|EMAIL_FROM|.*_SITE_KEY|.*_CLIENT_ID|.*_PROJECT_ID)$/.test(key),
   );
@@ -172,7 +166,7 @@ function checkBuild(dir) {
         `Build output ${where} contains server-only text from ${from} ("${text.slice(0, 40)}…"); keep it out of files that pages import`,
       );
     for (const [key] of secrets.filter(([, value]) => source.includes(value)))
-      problems.push(`Build output ${where} contains the value of ${key} from .dev.vars`);
+      problems.push(`Build output ${where} contains the value of ${key} from .env`);
   }
   return problems;
 }
@@ -221,11 +215,19 @@ export function checkSite(dir) {
   for (const route of REQUIRED_ROUTES) {
     if (!fs.existsSync(path.join(dir, route))) problems.push(`Missing route ${route}`);
   }
-  if (!isTemplate && fs.existsSync(path.join(dir, 'wrangler.jsonc'))) {
-    const wrangler = fs.readFileSync(path.join(dir, 'wrangler.jsonc'), 'utf8');
-    if (wrangler.includes('ai-site-template')) problems.push('wrangler.jsonc still has the template name');
-    if (wrangler.includes('<set after wrangler d1 create'))
-      problems.push('wrangler.jsonc database_id is not set');
+  if (!isTemplate && fs.existsSync(path.join(dir, 'compose.yaml'))) {
+    const compose = fs.readFileSync(path.join(dir, 'compose.yaml'), 'utf8');
+    if (/^name: "?ai-site"?$/m.test(compose) || compose.includes('templates/ai-site'))
+      problems.push('compose.yaml still names the template');
+  }
+  if (!isTemplate && fs.existsSync(path.join(dir, '.env.example'))) {
+    // new-site without --domain writes noreply@<dir>.example.com.
+    if (
+      /^EMAIL_FROM=.*@(?:[a-z0-9-]+.)*example.coms*$/im.test(
+        fs.readFileSync(path.join(dir, '.env.example'), 'utf8'),
+      )
+    )
+      problems.push('.env.example still sends from an example.com address');
   }
   if (!isTemplate && fs.existsSync(path.join(dir, 'site.config.ts'))) {
     if (fs.readFileSync(path.join(dir, 'site.config.ts'), 'utf8').includes('example.com')) {

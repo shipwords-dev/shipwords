@@ -1,8 +1,8 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import { user } from '@shipwords/core/db/schema';
+import type { Mailer } from '@shipwords/core/email/mailer';
 import type { Core } from '@shipwords/core/server';
+import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createJobs } from '../src/handlers';
 import { loadJob } from '../src/lifecycle';
@@ -10,11 +10,13 @@ import { MockAdapter } from '../src/mock';
 import { defineModels, MAX_LYRICS, type ModelDefinition, musicParameters } from '../src/models';
 import { emailOnFinish } from '../src/notify';
 import { runGeneration, type StepRunner } from '../src/runner';
+import { jobs as jobRows, jobRuns } from '../src/schema';
 import type { PollResult, SubmitInput, UpstreamAdapter } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
+import { bucket } from './bucket';
+import { db } from './db';
 import { id3v2 } from './id3';
 
-const db = createDb(env.DB);
 const BASE = 'https://music.test';
 
 const song: ModelDefinition = {
@@ -50,20 +52,14 @@ const steps: StepRunner = { do: (_name, fn) => fn(), sleep: async () => {} };
 const mp3Fetcher: typeof fetch = async () =>
   new Response(new Uint8Array([0xff, 0xfb]), { headers: { 'content-type': 'audio/mpeg' } });
 
-/** The slice of Core that createJobs touches: a signed-in user (or a guest with a granted quota) and a Workflow that only records ids. */
+/** The slice of Core that createJobs touches: a signed-in user (or a guest with a granted quota); `queued` lists the user's queued runs. */
 function fakeCore(userId: string | null) {
-  const dispatched: string[] = [];
   const core = {
     db,
     site: { id: 'music', url: BASE },
     env: {
       APP_URL: BASE,
       GUEST_COOKIE_SECRET: 'secret',
-      GENERATION_WORKFLOW: {
-        create: async ({ id }: { id: string }) => {
-          dispatched.push(id);
-        },
-      },
     },
     getUser: async () => (userId ? { id: userId } : null),
     guest: {
@@ -71,7 +67,17 @@ function fakeCore(userId: string | null) {
     },
     log: () => {},
   } as unknown as Core;
-  return { jobs: createJobs(core, models), dispatched };
+  const queued = async () =>
+    userId
+      ? (
+          await db
+            .select({ id: jobRuns.id })
+            .from(jobRuns)
+            .innerJoin(jobRows, eq(jobRows.id, jobRuns.id))
+            .where(eq(jobRows.userId, userId))
+        ).map((row) => row.id)
+      : [];
+  return { jobs: createJobs(core, models), queued };
 }
 
 async function userWith(credits: number) {
@@ -104,9 +110,9 @@ describe('music models', () => {
 });
 
 describe('creating a music job', () => {
-  it('stores the lyrics and the style prompt, charges once, dispatches once', async () => {
+  it('stores the lyrics and the style prompt, charges once, queues one run', async () => {
     const userId = await userWith(3);
-    const { jobs, dispatched } = fakeCore(userId);
+    const { jobs, queued } = fakeCore(userId);
     const response = await jobs.create(
       post({
         modelId: 'song',
@@ -119,7 +125,7 @@ describe('creating a music job', () => {
     const job = await created(response);
     expect(job).toMatchObject({ kind: 'music', prompt: 'J-POP, 明るい', costCredits: 1, status: 'queued' });
     expect(JSON.parse(job.inputJson)).toEqual({ references: [], parameters: {}, lyrics: '[Verse]\n夏の空' });
-    expect(dispatched).toEqual([job.id]);
+    expect(await queued()).toEqual([job.id]);
     expect((await getBalance(db, userId)).available).toBe(2);
   });
 
@@ -141,13 +147,13 @@ describe('creating a music job', () => {
 
   it('rejects bad lyrics before charging', async () => {
     const userId = await userWith(3);
-    const { jobs, dispatched } = fakeCore(userId);
+    const { jobs, queued } = fakeCore(userId);
     for (const lyrics of ['あ'.repeat(MAX_LYRICS + 1), 42]) {
       const response = await jobs.create(post({ modelId: 'song', prompt: 'p', lyrics }));
       expect(response.status).toBe(400);
       expect(await response.json()).toMatchObject({ error: { code: 'invalid_lyrics' } });
     }
-    expect(dispatched).toEqual([]);
+    expect(await queued()).toEqual([]);
     expect((await getBalance(db, userId)).available).toBe(3);
   });
 
@@ -158,13 +164,13 @@ describe('creating a music job', () => {
     expect(JSON.parse(job.inputJson).lyrics).toBe('叫べ');
   });
 
-  it('insufficient credits: 402, no job, nothing dispatched', async () => {
+  it('insufficient credits: 402, no job, no run', async () => {
     const userId = await userWith(1);
-    const { jobs, dispatched } = fakeCore(userId);
+    const { jobs, queued } = fakeCore(userId);
     await created(await jobs.create(post({ modelId: 'song', prompt: 'a' })));
     const response = await jobs.create(post({ modelId: 'song', prompt: 'b' }));
     expect(response.status).toBe(402);
-    expect(dispatched).toHaveLength(1);
+    expect(await queued()).toHaveLength(1);
     expect((await getBalance(db, userId)).available).toBe(0);
   });
 });
@@ -178,7 +184,7 @@ describe('running a music job', () => {
   }
   const deps = (adapter: FakeAdapter) => ({
     db,
-    bucket: env.OUTPUTS,
+    bucket: bucket,
     models,
     adapters: { yir: adapter },
     fetcher: mp3Fetcher,
@@ -216,7 +222,7 @@ describe('running a music job', () => {
       { key: `jobs/${job.id}/0.mp3`, mediaType: 'audio/mpeg' },
       { key: `jobs/${job.id}/1.mp3`, mediaType: 'audio/mpeg' },
     ]);
-    expect(await env.OUTPUTS.get(`jobs/${job.id}/1.mp3`)).not.toBeNull();
+    expect(await bucket.get(`jobs/${job.id}/1.mp3`)).not.toBeNull();
     expect((await getBalance(db, userId)).available).toBe(2);
 
     // A replayed Workflow neither resubmits nor charges again.
@@ -234,7 +240,7 @@ describe('running a music job', () => {
     const fetcher: typeof fetch = async () =>
       new Response(tagged, { headers: { 'content-type': 'audio/mpeg' } });
     await runGeneration({ ...deps(adapter), fetcher }, job.id, steps);
-    const stored = await env.OUTPUTS.get(`jobs/${job.id}/0.mp3`);
+    const stored = await bucket.get(`jobs/${job.id}/0.mp3`);
     expect([...new Uint8Array(await stored!.arrayBuffer())]).toEqual([0xff, 0xfb, 0x90, 0x64]);
   });
 
@@ -260,7 +266,7 @@ describe('running a music job', () => {
       db,
       email: {
         send: async (message: { subject: string }) => void sent.push(message),
-      } as unknown as SendEmail,
+      } as unknown as Mailer,
       from: 'no-reply@music.test',
       site: { name: 'Music', defaultLocale: 'en' },
       baseURL: BASE,
@@ -275,7 +281,7 @@ describe('running a music job', () => {
       db,
       email: {
         send: async (message: { subject: string; text: string }) => void sent.push(message),
-      } as unknown as SendEmail,
+      } as unknown as Mailer,
       from: 'no-reply@music.test',
       site: { name: 'AI作曲', defaultLocale: 'ja' },
       baseURL: BASE,

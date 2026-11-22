@@ -1,9 +1,9 @@
 import { refundSpend } from '@shipwords/core/credits/ledger';
-import type { BatchItem, Db } from '@shipwords/core/db/client';
+import type { Db, Tx } from '@shipwords/core/db/client';
 import { quotaCounters } from '@shipwords/core/db/schema';
 import type { QuotaRule } from '@shipwords/core/quota/counters';
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
-import { type JobRow, jobs, TERMINAL } from './schema';
+import { and, eq, inArray, isNull, type SQL, sql } from 'drizzle-orm';
+import { type JobRow, jobRuns, jobs, TERMINAL } from './schema';
 import type { UpstreamAdapter } from './upstream';
 
 // Every write to job state goes through here. Each state change is a conditional UPDATE;
@@ -13,9 +13,28 @@ const ACTIVE: JobRow['status'][] = ['queued', 'submitted'];
 
 export const spendKey = (jobId: string) => `job:${jobId}`;
 
+/** Queue the job's run (worker.ts). Called in the transaction that creates the job; a second call is a no-op. */
+export async function enqueueRun(db: Db | Tx, jobId: string): Promise<void> {
+  await db.insert(jobRuns).values({ id: jobId }).onConflictDoNothing();
+}
+
 export async function loadJob(db: Db, jobId: string): Promise<JobRow | null> {
   const [row] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
   return row ?? null;
+}
+
+/**
+ * The run claim a write is made under (worker.ts). A write with a fence only applies while that claim still holds the run's lease,
+ * so a worker that lost its lease, but whose call is still running, can't change how the job ends. Handlers write without one.
+ */
+export interface Fence {
+  runId: string;
+  token: string;
+}
+
+function held(fence: Fence | undefined): SQL | undefined {
+  if (!fence) return undefined;
+  return sql`exists (select 1 from ${jobRuns} where ${jobRuns.id} = ${fence.runId} and ${jobRuns.lockedBy} = ${fence.token} and ${jobRuns.status} = 'pending' and ${jobRuns.lockedUntil} > ${Date.now()})`;
 }
 
 /** The job while it is still in progress; null once it has ended or is gone. */
@@ -24,13 +43,18 @@ export async function activeJob(db: Db, jobId: string): Promise<JobRow | null> {
   return job && !TERMINAL.includes(job.status) ? job : null;
 }
 
-export async function markSubmitted(db: Db, jobId: string, upstreamJobId: string): Promise<boolean> {
+export async function markSubmitted(
+  db: Db,
+  jobId: string,
+  upstreamJobId: string,
+  fence?: Fence,
+): Promise<boolean> {
   const result = await db
     .update(jobs)
     .set({ status: 'submitted', upstreamJobId, submittedAt: Date.now() })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'queued')))
-    .run();
-  return result.meta.changes > 0;
+    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'queued'), held(fence)))
+    .returning({ id: jobs.id });
+  return result.length > 0;
 }
 
 /** upstream_job_id stores upstream task IDs comma-separated in segment order; a single-part job has one ID. */
@@ -51,8 +75,9 @@ export async function appendUpstreamJob(
   jobId: string,
   index: number,
   upstreamJobId: string,
+  fence?: Fence,
 ): Promise<boolean> {
-  if (index === 0 && (await markSubmitted(db, jobId, upstreamJobId))) return true;
+  if (index === 0 && (await markSubmitted(db, jobId, upstreamJobId, fence))) return true;
   const job = await loadJob(db, jobId);
   if (index === 0) return job?.status === 'submitted' && upstreamIds(job)[0] === upstreamJobId;
   if (job?.status !== 'submitted') return false;
@@ -62,9 +87,20 @@ export async function appendUpstreamJob(
   const result = await db
     .update(jobs)
     .set({ upstreamJobId: [...ids, upstreamJobId].join(',') })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'submitted'), eq(jobs.upstreamJobId, job.upstreamJobId!)))
-    .run();
-  return result.meta.changes > 0;
+    .where(
+      and(
+        eq(jobs.id, jobId),
+        eq(jobs.status, 'submitted'),
+        eq(jobs.upstreamJobId, job.upstreamJobId!),
+        held(fence),
+      ),
+    )
+    .returning({ id: jobs.id });
+  if (result.length > 0) return true;
+  // Lost the race to another write. If that was the same submit replayed elsewhere (same idempotency key, same upstream ID),
+  // the segment is recorded: report success, or the caller would cancel a task the job needs.
+  const after = await loadJob(db, jobId);
+  return after?.status === 'submitted' && upstreamIds(after)[index] === upstreamJobId;
 }
 
 export interface StoredOutput {
@@ -72,32 +108,41 @@ export interface StoredOutput {
   mediaType: string;
 }
 
-export async function markSucceeded(db: Db, jobId: string, outputs: StoredOutput[]): Promise<boolean> {
+export async function markSucceeded(
+  db: Db,
+  jobId: string,
+  outputs: StoredOutput[],
+  fence?: Fence,
+): Promise<boolean> {
   const result = await db
     .update(jobs)
     .set({ status: 'succeeded', outputsJson: JSON.stringify(outputs), finishedAt: Date.now() })
-    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE)))
-    .run();
-  return result.meta.changes > 0;
+    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE), held(fence)))
+    .returning({ id: jobs.id });
+  return result.length > 0;
 }
 
 /**
  * Note on a delivered job that it needs a human look (error_message; error_code stays empty, so pages still show a plain success).
  * Only bookkeeping like recordUpstreamCost. Returns the job, or null if it isn't a success.
  */
-export async function markForReview(db: Db, jobId: string, note: string): Promise<JobRow | null> {
+export async function markForReview(
+  db: Db,
+  jobId: string,
+  note: string,
+  fence?: Fence,
+): Promise<JobRow | null> {
   await db
     .update(jobs)
     .set({ errorMessage: `needs review: ${note}`.slice(0, 500) })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'succeeded')))
-    .run();
+    .where(and(eq(jobs.id, jobId), eq(jobs.status, 'succeeded'), held(fence)));
   const job = await loadJob(db, jobId);
   return job?.status === 'succeeded' ? job : null;
 }
 
 /** Record the upstream charge of an ended job; only bookkeeping, it never touches state or credits, so a re-read simply overwrites it. */
 export async function recordUpstreamCost(db: Db, jobId: string, usd: string): Promise<void> {
-  await db.update(jobs).set({ upstreamCostUsd: usd }).where(eq(jobs.id, jobId)).run();
+  await db.update(jobs).set({ upstreamCostUsd: usd }).where(eq(jobs.id, jobId));
 }
 
 /** Move an in-progress job to failed or canceled, then settle the refund. If the job already ended the state isn't changed, but settlement still runs. */
@@ -107,11 +152,12 @@ export async function markFailed(
   status: 'failed' | 'canceled',
   code: string,
   message: string,
+  fence?: Fence,
 ): Promise<JobRow | null> {
   await db
     .update(jobs)
     .set({ status, errorCode: code, errorMessage: message.slice(0, 500), finishedAt: Date.now() })
-    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE)));
+    .where(and(eq(jobs.id, jobId), inArray(jobs.status, ACTIVE), held(fence)));
   const job = await loadJob(db, jobId);
   if (job) await settleFailure(db, job);
   return job;
@@ -153,20 +199,22 @@ export async function settleFailure(db: Db, job: JobRow): Promise<void> {
     });
   }
   if (job.status === 'failed' && job.quotaJson && !job.quotaReleased) {
-    // The quota decrements and the "returned" flag share one batch: each decrement is conditioned on the flag not being set,
-    // so repeated calls return once, and a partial failure can't leave "flag set, count not returned".
-    const notReleased = sql`exists (select 1 from ${jobs} where ${jobs.id} = ${job.id} and ${jobs.quotaReleased} = 0)`;
+    // Setting the "returned" flag and the decrements share one transaction. The flag is set with a conditional update first: it locks the
+    // job row, so a concurrent call waits, then finds the flag set and returns nothing; a partial failure rolls back both.
     const rules = JSON.parse(job.quotaJson) as QuotaRule[];
-    const decrements = rules.map((rule) =>
-      db
-        .update(quotaCounters)
-        .set({ count: sql`max(${quotaCounters.count} - 1, 0)` })
-        .where(and(eq(quotaCounters.key, rule.key), eq(quotaCounters.window, rule.window), notReleased)),
-    );
-    // The flag must come last: the decrements above are conditioned on it not being set.
-    const markReleased = db.update(jobs).set({ quotaReleased: true }).where(eq(jobs.id, job.id));
-    const items: BatchItem[] = [...decrements, markReleased];
-    await db.batch(items as [BatchItem, ...BatchItem[]]);
+    await db.transaction(async (tx) => {
+      const claimed = await tx
+        .update(jobs)
+        .set({ quotaReleased: true })
+        .where(and(eq(jobs.id, job.id), eq(jobs.quotaReleased, false)))
+        .returning({ id: jobs.id });
+      if (claimed.length === 0) return;
+      for (const rule of rules)
+        await tx
+          .update(quotaCounters)
+          .set({ count: sql`greatest(${quotaCounters.count} - 1, 0)` })
+          .where(and(eq(quotaCounters.key, rule.key), eq(quotaCounters.window, rule.window)));
+    });
   }
 }
 
@@ -175,8 +223,7 @@ export async function claimGuestJobs(db: Db, guestId: string, userId: string): P
   await db
     .update(jobs)
     .set({ userId })
-    .where(and(eq(jobs.guestId, guestId), isNull(jobs.userId)))
-    .run();
+    .where(and(eq(jobs.guestId, guestId), isNull(jobs.userId)));
 }
 
 /** Best-effort cancel of upstream tasks (prep placeholders skipped): a task left running keeps billing. */

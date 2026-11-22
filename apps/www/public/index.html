@@ -221,7 +221,7 @@
             <li>
               <div class="shot term" aria-hidden="true"><span class="dots"><i></i><i></i><i></i></span><span><em>$</em> pnpm new-site</span><span class="ok">✓ site ready</span></div>
               <b>Scaffold</b>
-              <p><code>pnpm new-site</code> copies the template and wires names, domain and database.</p>
+              <p><code>pnpm new-site</code> copies the template and wires names, domain and Docker files.</p>
             </li>
             <li>
               <div class="shot cfg" aria-hidden="true"><span class="f">site.config.ts</span><span><em>price</em>: { amount: <u>499</u> },</span><span><em>credits</em>: <u>200</u>,</span></div>
@@ -276,8 +276,8 @@
               <summary>What does it cost?</summary>
               <p>
                 The code is free and MIT-licensed, commercial use included. You pay for the domain (about $10 a year at
-                cost), your Cloudflare usage, Stripe or PayPal fees on each sale, and model fees on Yir per generation, which you cap per job in
-                <code>site.models.ts</code>. Video sites that stitch clips together need Cloudflare's Workers Paid plan.
+                cost), a machine that runs your sites in Docker, your Cloudflare usage (R2 storage and email), Stripe or PayPal fees on each sale, and model fees on Yir per generation, which you cap per job in
+                <code>src/models.server.ts</code>.
               </p>
             </details>
             <details>
@@ -285,13 +285,14 @@
               <p>
                 You work in a code repo, but a coding agent does most of the writing: give it the keyword and it builds
                 the pages, while sign-in and payments are already done. You should be comfortable running terminal
-                commands and setting up Stripe and Cloudflare accounts.
+                commands, running Docker on a server, and setting up Stripe and Cloudflare accounts.
               </p>
             </details>
             <details>
               <summary>Where does it run?</summary>
               <p>
-                On Cloudflare. Each site is deployed on its own, with its own database, file storage and payment account,
+                On your own machine: each site is a Node server in a Docker container with a Postgres database, behind
+                Cloudflare, with files in R2. Each site is deployed on its own, with its own database, file storage and payment account,
                 so you can launch or retire one without touching the rest.
               </p>
             </details>
@@ -314,7 +315,7 @@
           <div>
             <!-- biome-ignore lint/a11y/useAnchorContent: aria-label names the link; the wordmark is drawn in CSS -->
             <a class="brand" href="/" aria-label="shipwords"><span class="wordmark"></span></a>
-            <p class="blurb">Ship a money-making AI site for every new keyword. Open source, built on Cloudflare.</p>
+            <p class="blurb">Ship a money-making AI site for every new keyword. Open source, runs in Docker.</p>
           </div>
           <div>
             <h3>Project</h3>
@@ -342,7 +343,7 @@
           </div>
         </div>
         <div class="legal">
-          <span>shipwords · MIT licensed · Built on Cloudflare</span>
+          <span>shipwords · MIT licensed · Node, Postgres, Docker</span>
           <a href="/zh/" hreflang="zh-Hans" lang="zh-Hans">中文</a>
         </div>
       </div>

@@ -1,4 +1,3 @@
-import { env as workerEnv } from 'cloudflare:workers';
 import { createAuth } from './auth/server';
 import {
   activeSubscription,
@@ -16,6 +15,7 @@ import type { PaymentProvider } from './billing/provider';
 import { StripeProvider } from './billing/stripe';
 import { getBalance } from './credits/ledger';
 import { createDb, type Db } from './db/client';
+import { type Mailer, mailerFromEnv } from './email/mailer';
 import type { CoreEnv } from './env';
 import { errorResponse, json } from './http';
 import { authorizeGuest } from './quota/guest';
@@ -53,9 +53,16 @@ function createProvider(site: SiteConfig, env: CoreEnv): PaymentProvider {
   });
 }
 
-export function createCore(site: SiteConfig, options: { log?: Logger } = {}) {
+export interface CoreOptions {
+  log?: Logger;
+  mailer?: Mailer;
+  /** Settings and secrets; defaults to the process environment. */
+  env?: CoreEnv;
+}
+
+export function createCore(site: SiteConfig, options: CoreOptions = {}) {
   const log = options.log ?? defaultLog;
-  // env doesn't change within an isolate, so dependent objects are created lazily once and reused.
+  // The environment doesn't change while the process runs, so dependent objects are created lazily once and reused.
   let cached: {
     env: CoreEnv;
     db: Db;
@@ -66,10 +73,11 @@ export function createCore(site: SiteConfig, options: { log?: Logger } = {}) {
 
   function context() {
     if (cached) return cached;
-    const env = workerEnv as unknown as CoreEnv;
-    const db = createDb(env.DB);
+    const env = options.env ?? (process.env as unknown as CoreEnv);
+    const db = createDb(required(env, 'DATABASE_URL'));
     const baseURL = (env.APP_URL ?? site.url).replace(/\/$/, '');
-    const auth = createAuth({ db, env, site, baseURL, log });
+    const mailer = options.mailer ?? mailerFromEnv(env, log);
+    const auth = createAuth({ db, env, site, baseURL, log, mailer });
     const getUser = async (request: Request): Promise<SessionUser | null> => {
       const session = await auth.api.getSession({ headers: request.headers });
       return session ? { id: session.user.id, email: session.user.email, name: session.user.name } : null;

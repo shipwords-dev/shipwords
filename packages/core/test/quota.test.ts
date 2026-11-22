@@ -1,13 +1,11 @@
-import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { isDisposableEmail } from '../src/auth/disposable';
-import { createDb } from '../src/db/client';
 import { ipBucket, safeRelativePath } from '../src/http';
 import { consumeQuota, releaseQuota } from '../src/quota/counters';
 import { authorizeGuest, readGuestId } from '../src/quota/guest';
 import { verifyRecaptcha } from '../src/quota/recaptcha';
+import { db } from './db';
 
-const db = createDb(env.DB);
 const recaptcha = { siteKey: 'site', projectId: 'proj', apiKey: 'key' };
 const quota = { dailyPerDevice: 2, dailyPerIp: 3, dailySiteBudget: 100, minRecaptchaScore: 0.5 };
 

@@ -1,30 +1,46 @@
 import { sql } from 'drizzle-orm';
-import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import {
+  bigint,
+  boolean,
+  check,
+  index,
+  integer,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  uniqueIndex,
+} from 'drizzle-orm/pg-core';
 
-const now = sql`(cast(unixepoch('subsec') * 1000 as integer))`;
-const createdAt = () => integer('created_at', { mode: 'number' }).notNull().default(now);
-const updatedAt = () => integer('updated_at', { mode: 'number' }).notNull().default(now);
+/** Epoch milliseconds, the unit every business timestamp uses. clock_timestamp so rows written in one transaction still differ. */
+export const nowMs = sql`((extract(epoch from clock_timestamp()) * 1000)::bigint)`;
+/** Epoch milliseconds as a JS number (fits until year 275760). */
+const ms = (name: string) => bigint(name, { mode: 'number' });
+const createdAt = () => ms('created_at').notNull().default(nowMs);
+const updatedAt = () => ms('updated_at').notNull().default(nowMs);
+/** Better Auth reads and writes Date objects. */
+const authTime = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' });
 
 // ---- Better Auth core tables (field names follow Better Auth conventions, columns are snake_case) ----
 
-export const user = sqliteTable('user', {
+export const user = pgTable('user', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
   email: text('email').notNull().unique(),
-  emailVerified: integer('email_verified', { mode: 'boolean' }).notNull().default(false),
+  emailVerified: boolean('email_verified').notNull().default(false),
   image: text('image'),
-  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().default(now),
-  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(now),
+  createdAt: authTime('created_at').notNull().defaultNow(),
+  updatedAt: authTime('updated_at').notNull().defaultNow(),
 });
 
-export const session = sqliteTable(
+export const session = pgTable(
   'session',
   {
     id: text('id').primaryKey(),
-    expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+    expiresAt: authTime('expires_at').notNull(),
     token: text('token').notNull().unique(),
-    createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().default(now),
-    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(now),
+    createdAt: authTime('created_at').notNull().defaultNow(),
+    updatedAt: authTime('updated_at').notNull().defaultNow(),
     ipAddress: text('ip_address'),
     userAgent: text('user_agent'),
     userId: text('user_id')
@@ -34,7 +50,7 @@ export const session = sqliteTable(
   (t) => [index('session_user_idx').on(t.userId)],
 );
 
-export const account = sqliteTable(
+export const account = pgTable(
   'account',
   {
     id: text('id').primaryKey(),
@@ -46,31 +62,31 @@ export const account = sqliteTable(
     accessToken: text('access_token'),
     refreshToken: text('refresh_token'),
     idToken: text('id_token'),
-    accessTokenExpiresAt: integer('access_token_expires_at', { mode: 'timestamp_ms' }),
-    refreshTokenExpiresAt: integer('refresh_token_expires_at', { mode: 'timestamp_ms' }),
+    accessTokenExpiresAt: authTime('access_token_expires_at'),
+    refreshTokenExpiresAt: authTime('refresh_token_expires_at'),
     scope: text('scope'),
     password: text('password'),
-    createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().default(now),
-    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(now),
+    createdAt: authTime('created_at').notNull().defaultNow(),
+    updatedAt: authTime('updated_at').notNull().defaultNow(),
   },
   (t) => [index('account_user_idx').on(t.userId)],
 );
 
-export const verification = sqliteTable(
+export const verification = pgTable(
   'verification',
   {
     id: text('id').primaryKey(),
     identifier: text('identifier').notNull(),
     value: text('value').notNull(),
-    expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
-    createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().default(now),
-    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(now),
+    expiresAt: authTime('expires_at').notNull(),
+    createdAt: authTime('created_at').notNull().defaultNow(),
+    updatedAt: authTime('updated_at').notNull().defaultNow(),
   },
   (t) => [index('verification_identifier_idx').on(t.identifier)],
 );
 
 /** Sign-up attribution: first landing page and UTM, written once at sign-up. */
-export const userAttribution = sqliteTable('user_attribution', {
+export const userAttribution = pgTable('user_attribution', {
   userId: text('user_id')
     .primaryKey()
     .references(() => user.id, { onDelete: 'cascade' }),
@@ -84,23 +100,21 @@ export const userAttribution = sqliteTable('user_attribution', {
 });
 
 // ---- Credit ledger ----
-// Balance = sum of remaining over unexpired lots - debt. Every write happens in one D1 batch;
-// concurrency is handled by a per-user version optimistic lock (see credits/ledger.ts), with CHECK constraints (never negative) as a backstop.
+// Balance = sum of remaining over unexpired lots - debt. Every operation is one transaction that first locks the user's
+// credit_accounts row (see credits/ledger.ts), so one user's ledger writes run one at a time; CHECK constraints (never negative) are the backstop.
 
-export const creditAccounts = sqliteTable(
+export const creditAccounts = pgTable(
   'credit_accounts',
   {
     userId: text('user_id').primaryKey(),
     /** Amount a refund or chargeback clawback couldn't take from lots; later grants repay this first. */
     debt: integer('debt').notNull().default(0),
-    /** Optimistic lock version: incremented on every ledger write; if another operation slips in between read and write, the batch rolls back and retries. */
-    version: integer('version').notNull().default(0),
     updatedAt: updatedAt(),
   },
   (t) => [check('credit_accounts_debt_nonneg', sql`${t.debt} >= 0`)],
 );
 
-export const creditLots = sqliteTable(
+export const creditLots = pgTable(
   'credit_lots',
   {
     id: text('id').primaryKey(),
@@ -110,7 +124,7 @@ export const creditLots = sqliteTable(
     amount: integer('amount').notNull(),
     remaining: integer('remaining').notNull(),
     /** Millisecond timestamp; null means never expires. Expiry is checked on read, no cron job. */
-    expiresAt: integer('expires_at', { mode: 'number' }),
+    expiresAt: ms('expires_at'),
     createdAt: createdAt(),
   },
   (t) => [
@@ -120,7 +134,7 @@ export const creditLots = sqliteTable(
   ],
 );
 
-export const creditLedger = sqliteTable(
+export const creditLedger = pgTable(
   'credit_ledger',
   {
     id: text('id').primaryKey(),
@@ -138,7 +152,7 @@ export const creditLedger = sqliteTable(
 );
 
 /** How much each charge or clawback took from which lots, so refunded charges go back to the original lots. */
-export const creditAllocations = sqliteTable(
+export const creditAllocations = pgTable(
   'credit_allocations',
   {
     ledgerId: text('ledger_id').notNull(),
@@ -150,7 +164,7 @@ export const creditAllocations = sqliteTable(
 
 // ---- Billing ----
 
-export const billingCustomers = sqliteTable(
+export const billingCustomers = pgTable(
   'billing_customers',
   {
     userId: text('user_id').notNull(),
@@ -165,7 +179,7 @@ export const billingCustomers = sqliteTable(
 );
 
 /** One row per checkout started. Status is only for display and reconciliation; granting credits doesn't depend on it. */
-export const orders = sqliteTable(
+export const orders = pgTable(
   'orders',
   {
     id: text('id').primaryKey(),
@@ -179,13 +193,13 @@ export const orders = sqliteTable(
       .default('pending'),
     checkoutRef: text('checkout_ref'),
     createdAt: createdAt(),
-    paidAt: integer('paid_at', { mode: 'number' }),
+    paidAt: ms('paid_at'),
   },
   (t) => [index('orders_user_idx').on(t.userId, t.createdAt)],
 );
 
 /** One row per payment received: a one-time payment, or one subscription period. */
-export const payments = sqliteTable(
+export const payments = pgTable(
   'payments',
   {
     id: text('id').primaryKey(),
@@ -206,10 +220,10 @@ export const payments = sqliteTable(
     /** Credits already clawed back for refunds or chargebacks; adjustSeq increments on each adjustment and is part of the idempotency key. */
     creditsRevoked: integer('credits_revoked').notNull().default(0),
     adjustSeq: integer('adjust_seq').notNull().default(0),
-    periodStart: integer('period_start', { mode: 'number' }),
-    periodEnd: integer('period_end', { mode: 'number' }),
+    periodStart: ms('period_start'),
+    periodEnd: ms('period_end'),
     /** When the provider state was fetched; only newer snapshots are accepted. */
-    fetchedAt: integer('fetched_at', { mode: 'number' }).notNull().default(0),
+    fetchedAt: ms('fetched_at').notNull().default(0),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -220,7 +234,7 @@ export const payments = sqliteTable(
   ],
 );
 
-export const subscriptions = sqliteTable(
+export const subscriptions = pgTable(
   'subscriptions',
   {
     id: text('id').primaryKey(),
@@ -229,11 +243,11 @@ export const subscriptions = sqliteTable(
     userId: text('user_id').notNull(),
     productId: text('product_id').notNull(),
     status: text('status').notNull(),
-    currentPeriodStart: integer('current_period_start', { mode: 'number' }),
-    currentPeriodEnd: integer('current_period_end', { mode: 'number' }),
-    cancelAtPeriodEnd: integer('cancel_at_period_end', { mode: 'boolean' }).notNull().default(false),
+    currentPeriodStart: ms('current_period_start'),
+    currentPeriodEnd: ms('current_period_end'),
+    cancelAtPeriodEnd: boolean('cancel_at_period_end').notNull().default(false),
     /** When the provider state was fetched; only newer snapshots are accepted, so concurrent webhooks can't overwrite new state with old. */
-    fetchedAt: integer('fetched_at', { mode: 'number' }).notNull(),
+    fetchedAt: ms('fetched_at').notNull(),
     createdAt: createdAt(),
   },
   (t) => [
@@ -242,20 +256,20 @@ export const subscriptions = sqliteTable(
   ],
 );
 
-export const webhookEvents = sqliteTable(
+export const webhookEvents = pgTable(
   'webhook_events',
   {
     provider: text('provider').notNull(),
     eventId: text('event_id').notNull(),
     type: text('type').notNull(),
-    processedAt: integer('processed_at', { mode: 'number' }).notNull(),
+    processedAt: ms('processed_at').notNull(),
   },
   (t) => [primaryKey({ columns: [t.provider, t.eventId] })],
 );
 
 // ---- Quota counters ----
 
-export const quotaCounters = sqliteTable(
+export const quotaCounters = pgTable(
   'quota_counters',
   {
     key: text('key').notNull(),
@@ -266,9 +280,9 @@ export const quotaCounters = sqliteTable(
 );
 
 /** Better Auth rate-limit counters. Workers are stateless and in-memory limits don't work, so they live in the database. */
-export const rateLimit = sqliteTable('rate_limit', {
+export const rateLimit = pgTable('rate_limit', {
   id: text('id').primaryKey(),
   key: text('key').notNull().unique(),
   count: integer('count').notNull(),
-  lastRequest: integer('last_request', { mode: 'number' }).notNull(),
+  lastRequest: ms('last_request').notNull(),
 });

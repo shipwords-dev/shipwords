@@ -1,6 +1,4 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits, spendCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
 import type {
@@ -15,10 +13,11 @@ import { appendUpstreamJob, loadJob, markFailed, spendKey } from '../src/lifecyc
 import { defineModels, type EffectSegment, effectParts, type ModelDefinition } from '../src/models';
 import { KEEP_TIMEOUT_MS, PREP_HEDGE_MS, runGeneration, type StepRunner } from '../src/runner';
 import { jobs } from '../src/schema';
+import type { ObjectStore } from '../src/store';
 import { type PollResult, type SubmitInput, type UpstreamAdapter, UpstreamError } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
-
-const db = createDb(env.DB);
+import { bucket } from './bucket';
+import { db } from './db';
 
 const effectModel: ModelDefinition = {
   id: 'demo',
@@ -304,8 +303,8 @@ async function effectJob(slots: Record<string, string>, overrides: Partial<typeo
   const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
   const parts = effectParts(effectModel, slots, upload, asset)!;
   await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-  await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-    db.insert(jobs).values({
+  await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+    tx.insert(jobs).values({
       id: jobId,
       userId,
       modelId: 'demo',
@@ -316,13 +315,13 @@ async function effectJob(slots: Record<string, string>, overrides: Partial<typeo
       upstream: 'yir',
       ...overrides,
     }),
-  ]);
+  );
   return { userId, jobId };
 }
 
 const deps = (adapter: FakeAdapter) => ({
   db,
-  bucket: env.OUTPUTS,
+  bucket: bucket,
   models,
   adapters: { yir: adapter },
   fetcher: outputFetcher,
@@ -434,12 +433,18 @@ describe('multi-part effect jobs', () => {
   });
 
   it('timeout: past the deadline later segments are not submitted, submitted ones are canceled and refunded', async () => {
-    const { userId, jobId } = await effectJob(
-      { left: '/files/uploads/up_a.png' },
-      { createdAt: Date.now() - 21 * 60_000 },
-    );
+    const { userId, jobId } = await effectJob({ left: '/files/uploads/up_a.png' });
     const adapter = new FakeAdapter();
-    await runGeneration(deps(adapter), jobId, durableSteps());
+    // The deadline passes right after the first segment is submitted.
+    const start = Date.now();
+    adapter.onSubmit = async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(start + 21 * 60_000);
+    };
+    try {
+      await runGeneration(deps(adapter), jobId, durableSteps());
+    } finally {
+      vi.restoreAllMocks();
+    }
     expect(await loadJob(db, jobId)).toMatchObject({ status: 'failed', errorCode: 'timeout' });
     expect(adapter.submits.map((s) => s.key)).toEqual([`${jobId}:left`]);
     expect(adapter.cancelled).toEqual([`up_${jobId}:left`]);
@@ -564,7 +569,7 @@ describe('effect compose', () => {
       { key: `jobs/${jobId}/2.mp4`, mediaType: 'video/mp4' },
       { key: `jobs/${jobId}/3.mp4`, mediaType: 'video/mp4' },
     ]);
-    expect(new Uint8Array(await (await env.OUTPUTS.get(`jobs/${jobId}/3.mp4`))!.arrayBuffer())).toEqual(
+    expect(new Uint8Array(await (await bucket.get(`jobs/${jobId}/3.mp4`))!.arrayBuffer())).toEqual(
       new Uint8Array([2]),
     );
     expect((await getBalance(db, userId)).available).toBe(40);
@@ -1002,8 +1007,8 @@ describe('effect compose', () => {
       const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
       const parts = effectParts(repairModel, slotPhotos, upload, asset)!;
       await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-        db.insert(jobs).values({
+      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+        tx.insert(jobs).values({
           id: jobId,
           userId,
           modelId: 'demo-repair',
@@ -1013,7 +1018,7 @@ describe('effect compose', () => {
           costCredits: 10,
           upstream: 'yir',
         }),
-      ]);
+      );
       const adapter = new FakeAdapter();
       adapter.polls.set(`up_${jobId}`, [succeeded('band')]);
       for (const round of [0, 1, 2])
@@ -1026,7 +1031,7 @@ describe('effect compose', () => {
       composer,
       fileUrl,
     });
-    const bytesOf = async (key: string) => new Uint8Array(await (await env.OUTPUTS.get(key))!.arrayBuffer());
+    const bytesOf = async (key: string) => new Uint8Array(await (await bucket.get(key))!.arrayBuffer());
 
     describe('photoView: repair and likeness use a face view while the segment sends a composite', () => {
       // solo is prepped into a two-panel composite (main view, sent to the video model) and a plain face (view 1).
@@ -1052,8 +1057,8 @@ describe('effect compose', () => {
         const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
         const parts = effectParts(viewModel, slotPhotos, upload, asset)!;
         await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-        await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-          db.insert(jobs).values({
+        await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+          tx.insert(jobs).values({
             id: jobId,
             userId,
             modelId: 'demo-repair-views',
@@ -1063,7 +1068,7 @@ describe('effect compose', () => {
             costCredits: 10,
             upstream: 'yir',
           }),
-        ]);
+        );
         const adapter = new FakeAdapter();
         const image = (url: string): PollResult => ({
           state: 'succeeded',
@@ -1148,8 +1153,8 @@ describe('effect compose', () => {
         };
         const parts = effectParts(twinModel, photos, upload, asset)!;
         await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-        await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-          db.insert(jobs).values({
+        await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+          tx.insert(jobs).values({
             id: jobId,
             userId,
             modelId: 'demo-repair-twin',
@@ -1159,7 +1164,7 @@ describe('effect compose', () => {
             costCredits: 10,
             upstream: 'yir',
           }),
-        ]);
+        );
         const adapter = new FakeAdapter();
         const image = (url: string): PollResult => ({
           state: 'succeeded',
@@ -1469,8 +1474,8 @@ describe('effect compose', () => {
       const parts = effectParts(models[0]!, slotPhotos, upload, asset)!;
       expect(parts.map((p) => p.id)).toEqual(['prep-front', 'prep-edge', 'prep-solo', 'band']);
       await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-        db.insert(jobs).values({
+      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+        tx.insert(jobs).values({
           id: jobId,
           userId,
           modelId: 'demo-repair',
@@ -1480,7 +1485,7 @@ describe('effect compose', () => {
           costCredits: 10,
           upstream: 'yir',
         }),
-      ]);
+      );
       const adapter = new FakeAdapter();
       for (const slot of ['front', 'edge', 'solo'])
         adapter.polls.set(`up_${jobId}:prep-${slot}`, [
@@ -2134,8 +2139,8 @@ describe('prep and reference audio', () => {
     const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
     const parts = effectParts(prepModel, slots, upload, asset)!;
     await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-      db.insert(jobs).values({
+    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+      tx.insert(jobs).values({
         id: jobId,
         userId,
         modelId: 'demo-prep',
@@ -2145,7 +2150,7 @@ describe('prep and reference audio', () => {
         costCredits: 10,
         upstream: 'yir',
       }),
-    ]);
+    );
     return { userId, jobId };
   }
 
@@ -2255,8 +2260,8 @@ describe('prep and reference audio', () => {
       `jobs/${jobId}/1.mp4`,
     ]);
     // The prep image is kept in R2 to look back at, as a copy of what the upstream returned; it is not an output.
-    const kept = await env.OUTPUTS.get(`jobs/${jobId}/kept/prep-left.png`);
-    expect(kept?.httpMetadata?.contentType).toBe('image/png');
+    const kept = await bucket.get(`jobs/${jobId}/kept/prep-left.png`);
+    expect(kept?.contentType).toBe('image/png');
     expect((await getBalance(db, userId)).available).toBe(40);
   });
 
@@ -2277,29 +2282,27 @@ describe('prep and reference audio', () => {
 
     it("copies each of this site's uploads before the first submit; the upload itself stays for the lifecycle rule", async () => {
       const { jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
-      await env.OUTPUTS.put('uploads/up_a.png', new Uint8Array([7, 7]), {
-        httpMetadata: { contentType: 'image/png' },
-      });
+      await bucket.put('uploads/up_a.png', new Uint8Array([7, 7]), { contentType: 'image/png' });
       const adapter = finished(jobId);
       let atFirstSubmit: boolean | undefined;
       adapter.onSubmit = async () => {
-        atFirstSubmit ??= Boolean(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_a.png`));
+        atFirstSubmit ??= Boolean(await bucket.head(`jobs/${jobId}/kept/uploads/up_a.png`));
       };
       const names: string[] = [];
       await runGeneration(keepDeps(adapter), jobId, durableSteps(new Map(), names));
       expect(names.slice(0, 2)).toEqual(['load', 'keep:uploads']);
       expect(atFirstSubmit).toBe(true);
-      const kept = await env.OUTPUTS.get(`jobs/${jobId}/kept/uploads/up_a.png`);
+      const kept = await bucket.get(`jobs/${jobId}/kept/uploads/up_a.png`);
       expect(new Uint8Array(await kept!.arrayBuffer())).toEqual(new Uint8Array([7, 7]));
-      expect(kept!.httpMetadata?.contentType).toBe('image/png');
-      expect(await env.OUTPUTS.head('uploads/up_a.png')).not.toBeNull();
+      expect(kept!.contentType).toBe('image/png');
+      expect(await bucket.head('uploads/up_a.png')).not.toBeNull();
       expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
     });
 
     it("a missing upload is logged and skipped; another host's URL that looks like an upload is never copied", async () => {
       const { jobId } = await prepJob({ left: '/files/uploads/up_gone.png' });
       // A preset's media on another host whose path happens to look like one of our uploads, and that name exists locally.
-      await env.OUTPUTS.put('uploads/up_z.png', new Uint8Array([1]));
+      await bucket.put('uploads/up_z.png', new Uint8Array([1]));
       const row = (await loadJob(db, jobId))!;
       const input = JSON.parse(row.inputJson) as { parts: { references: { url: string; role: string }[] }[] };
       input.parts.at(-1)!.references.push({
@@ -2317,8 +2320,8 @@ describe('prep and reference audio', () => {
         durableSteps(),
       );
       expect(logs).toContain('upload copy failed');
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_gone.png`)).toBeNull();
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_z.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_gone.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_z.png`)).toBeNull();
       expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
     });
 
@@ -2328,13 +2331,13 @@ describe('prep and reference audio', () => {
       const { fileUrl: _, ...noOrigin } = keepDeps(finished(jobId));
       await runGeneration({ ...noOrigin, log: (event) => logs.push(event) }, jobId, durableSteps());
       expect(logs).toContain('upload copy failed');
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
       expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
     });
 
     it('off by default: a model without keepUploads copies nothing and runs no extra step', async () => {
       const { jobId } = await prepJob({ left: '/files/uploads/up_a.png' });
-      await env.OUTPUTS.put('uploads/up_a.png', new Uint8Array([7]));
+      await bucket.put('uploads/up_a.png', new Uint8Array([7]));
       const names: string[] = [];
       await runGeneration(
         { ...prepDeps(finished(jobId)), fileUrl: (key: string) => `https://site/files/${key}` },
@@ -2342,7 +2345,7 @@ describe('prep and reference audio', () => {
         durableSteps(new Map(), names),
       );
       expect(names).not.toContain('keep:uploads');
-      expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
+      expect(await bucket.head(`jobs/${jobId}/kept/uploads/up_a.png`)).toBeNull();
     });
   });
 
@@ -2362,7 +2365,7 @@ describe('prep and reference audio', () => {
     await runGeneration({ ...prepDeps(adapter), fetcher }, jobId, durableSteps(new Map(), names));
     expect(downloads.filter((url) => url.includes('left-prep'))).toHaveLength(1);
     expect(names.filter((n) => n === 'keep:0')).toHaveLength(1);
-    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-left.png`)).toBeNull();
+    expect(await bucket.head(`jobs/${jobId}/kept/prep-left.png`)).toBeNull();
     expect(adapter.submits.map((s) => s.key)).toEqual([
       `${jobId}:prep-left`,
       `${jobId}:left`,
@@ -2388,7 +2391,7 @@ describe('prep and reference audio', () => {
     } finally {
       vi.useRealTimers();
     }
-    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-left.png`)).toBeNull();
+    expect(await bucket.head(`jobs/${jobId}/kept/prep-left.png`)).toBeNull();
     expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded' });
   });
 
@@ -2410,8 +2413,8 @@ describe('prep and reference audio', () => {
       asset,
     )!;
     await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-      db.insert(jobs).values({
+    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+      tx.insert(jobs).values({
         id: jobId,
         userId,
         modelId: 'demo-prep',
@@ -2421,7 +2424,7 @@ describe('prep and reference audio', () => {
         costCredits: 10,
         upstream: 'yir',
       }),
-    ]);
+    );
     const adapter = new FakeAdapter();
     adapter.polls.set(`up_${jobId}:prep-left`, [image('https://up/left-prep.png')]);
     adapter.polls.set(`up_${jobId}:prep-right`, [image('https://up/right-prep.png')]);
@@ -2451,8 +2454,8 @@ describe('prep and reference audio', () => {
       durableSteps(),
     );
     expect(most).toBe(1);
-    expect((await env.OUTPUTS.get(`jobs/${jobId}/kept/prep-left.png`))?.size).toBe(3);
-    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-right.png`)).toBeNull();
+    expect((await bucket.get(`jobs/${jobId}/kept/prep-left.png`))?.size).toBe(3);
+    expect(await bucket.head(`jobs/${jobId}/kept/prep-right.png`)).toBeNull();
     expect(logs.find(([message]) => message === 'prep copy failed')?.[1]).toEqual({
       jobId,
       failed: [{ part: 'prep-right', error: 'Error: download failed: 403' }],
@@ -2479,8 +2482,8 @@ describe('prep and reference audio', () => {
       asset,
     )!;
     await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-      db.insert(jobs).values({
+    await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+      tx.insert(jobs).values({
         id: jobId,
         userId,
         modelId: 'demo-prep',
@@ -2490,7 +2493,7 @@ describe('prep and reference audio', () => {
         costCredits: 10,
         upstream: 'yir',
       }),
-    ]);
+    );
     const adapter = new FakeAdapter();
     adapter.polls.set(`up_${jobId}:prep-left`, [image('https://up/left-prep.png')]);
     const poll = adapter.poll.bind(adapter);
@@ -2506,7 +2509,7 @@ describe('prep and reference audio', () => {
       durableSteps(new Map(), names),
     );
     expect(names).toContain('keep:0');
-    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-left.png`)).not.toBeNull();
+    expect(await bucket.head(`jobs/${jobId}/kept/prep-left.png`)).not.toBeNull();
     expect(adapter.submits.map((s) => s.key)).toEqual([`${jobId}:prep-left`, `${jobId}:prep-right`]);
     expect(await loadJob(db, jobId)).toMatchObject({ status: 'canceled' });
   });
@@ -2550,8 +2553,8 @@ describe('prep and reference audio', () => {
         asset,
       )!;
       await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-        db.insert(jobs).values({
+      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+        tx.insert(jobs).values({
           id: jobId,
           userId,
           modelId: 'demo-subjects',
@@ -2561,7 +2564,7 @@ describe('prep and reference audio', () => {
           costCredits: 10,
           upstream: 'yir',
         }),
-      ]);
+      );
       const adapter = new FakeAdapter();
       adapter.polls.set(`up_${jobId}:group`, [succeeded('group')]);
       return { userId, jobId, adapter };
@@ -3016,8 +3019,8 @@ describe('prep and reference audio', () => {
         asset,
       )!;
       await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, [
-        db.insert(jobs).values({
+      await spendCredits(db, { userId, amount: 10, idemKey: spendKey(jobId) }, (tx) =>
+        tx.insert(jobs).values({
           id: jobId,
           userId,
           modelId: both.id,
@@ -3027,7 +3030,7 @@ describe('prep and reference audio', () => {
           costCredits: 10,
           upstream: 'yir',
         }),
-      ]);
+      );
       const adapter = new FakeAdapter();
       adapter.polls.set(`up_${jobId}:prep-left`, [{ state: 'running' }, { state: 'running' }]);
       adapter.polls.set(`up_${jobId}:prep-right`, [{ state: 'running' }, { state: 'running' }]);
@@ -3131,10 +3134,10 @@ describe('four-view sheets', () => {
   it('retries a partial crop write without submitting another image task', async () => {
     const { jobId, adapter, split, runDeps } = await setup();
     let interrupted = false;
-    const bucket = new Proxy(env.OUTPUTS, {
+    const flaky = new Proxy(bucket, {
       get(target, key) {
         if (key === 'put')
-          return async (...args: Parameters<R2Bucket['put']>) => {
+          return async (...args: Parameters<ObjectStore['put']>) => {
             if (args[0].endsWith('prep-left-1.png') && !interrupted) {
               interrupted = true;
               throw new Error('write interrupted');
@@ -3146,7 +3149,7 @@ describe('four-view sheets', () => {
       },
     });
     const steps = durableSteps();
-    await runGeneration({ ...runDeps, bucket }, jobId, {
+    await runGeneration({ ...runDeps, bucket: flaky }, jobId, {
       ...steps,
       async do(name, fn) {
         if (name.startsWith('split:'))
@@ -3165,7 +3168,7 @@ describe('four-view sheets', () => {
     expect(adapter.submits).toHaveLength(2);
     expect((await loadJob(db, jobId))?.status).toBe('succeeded');
     for (let view = 0; view < 4; view++) {
-      const object = await env.OUTPUTS.get(`jobs/${jobId}/prep-left-${view}.png`);
+      const object = await bucket.get(`jobs/${jobId}/prep-left-${view}.png`);
       expect(new Uint8Array(await object!.arrayBuffer())).toEqual(new Uint8Array([view + 1]));
     }
   });
@@ -3229,7 +3232,7 @@ describe('four-view sheets', () => {
       jobId,
       durableSteps(),
     );
-    expect(await env.OUTPUTS.head(`jobs/${jobId}/kept/prep-right.png`)).not.toBeNull();
+    expect(await bucket.head(`jobs/${jobId}/kept/prep-right.png`)).not.toBeNull();
     // The job itself fails and refunds as before, with no video spending.
     expect(adapter.submits.map((s) => s.key)).toEqual([`${jobId}:prep-left`, `${jobId}:prep-right`]);
     expect((await getBalance(db, userId)).available).toBe(50);

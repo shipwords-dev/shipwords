@@ -1,10 +1,12 @@
-import { env } from 'cloudflare:test';
 import { getBalance, grantCredits, spendCredits } from '@shipwords/core/credits/ledger';
-import { createDb } from '@shipwords/core/db/client';
 import { user } from '@shipwords/core/db/schema';
+import type { Mailer } from '@shipwords/core/email/mailer';
 import { consumeQuota } from '@shipwords/core/quota/counters';
+import { YirSubmissionUncertainError } from '@yir-ai/sdk/server';
+import { isDemoJobID } from '@yir-ai/sdk/shared';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it, vi } from 'vitest';
+import { yirDemo } from '../src/adapters';
 import { sumUsd } from '../src/cost';
 import { ALERT_LIST, FAILURE_STREAK, failureStreak } from '../src/failures';
 import { cancelQueued, loadJob, markFailed, markSubmitted, markSucceeded, spendKey } from '../src/lifecycle';
@@ -20,8 +22,8 @@ import {
   UpstreamError,
 } from '../src/upstream';
 import { buildYirRequest, YirAdapter } from '../src/yir';
-
-const db = createDb(env.DB);
+import { bucket } from './bucket';
+import { db } from './db';
 
 const models = defineModels([
   {
@@ -80,8 +82,8 @@ async function paidJob(cost = 10, overrides: Partial<typeof jobs.$inferInsert> =
   const userId = `u_${crypto.randomUUID().slice(0, 10)}`;
   const jobId = `job_${crypto.randomUUID().replaceAll('-', '')}`;
   await grantCredits(db, { userId, amount: 50, idemKey: `g:${userId}`, source: 'test' });
-  await spendCredits(db, { userId, amount: cost, idemKey: spendKey(jobId) }, [
-    db.insert(jobs).values({
+  await spendCredits(db, { userId, amount: cost, idemKey: spendKey(jobId) }, (tx) =>
+    tx.insert(jobs).values({
       id: jobId,
       userId,
       modelId: 'fast',
@@ -92,13 +94,13 @@ async function paidJob(cost = 10, overrides: Partial<typeof jobs.$inferInsert> =
       upstream: 'yir',
       ...overrides,
     }),
-  ]);
+  );
   return { userId, jobId };
 }
 
 const deps = (adapter: FakeAdapter) => ({
   db,
-  bucket: env.OUTPUTS,
+  bucket: bucket,
   models,
   adapters: { yir: adapter },
   fetcher: outputFetcher,
@@ -121,7 +123,7 @@ describe('generation jobs', () => {
     expect(job?.status).toBe('succeeded');
     const [output] = JSON.parse(job!.outputsJson!);
     expect(output).toEqual({ key: `jobs/${jobId}/0.png`, mediaType: 'image/png' });
-    expect(await env.OUTPUTS.get(output.key)).not.toBeNull();
+    expect(await bucket.get(output.key)).not.toBeNull();
     expect((await getBalance(db, userId)).available).toBe(40);
   });
 
@@ -134,7 +136,7 @@ describe('generation jobs', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     const notify = emailOnFinish({
       db,
       email,
@@ -199,7 +201,7 @@ describe('generation jobs', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     const notify = emailOnFinish({
       db,
       email,
@@ -253,12 +255,83 @@ describe('generation jobs', () => {
   });
 
   it('timeout: cancels the upstream task and refunds', async () => {
-    const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
+    const { userId, jobId } = await paidJob();
     const adapter = new FakeAdapter();
-    await runGeneration(deps(adapter), jobId, immediateSteps());
+    // The deadline passes while the task runs upstream (a job already past it is never submitted).
+    const start = Date.now();
+    adapter.onSubmit = async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(start + 11 * 60_000);
+    };
+    try {
+      await runGeneration(deps(adapter), jobId, immediateSteps());
+    } finally {
+      vi.restoreAllMocks();
+    }
     const job = await loadJob(db, jobId);
     expect(job).toMatchObject({ status: 'failed', errorCode: 'timeout' });
     expect(adapter.cancelled).toEqual([`up_${jobId}`]);
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
+  it('a late rejection from one submit attempt does not fail a job another attempt already submitted', async () => {
+    const { userId, jobId } = await paidJob();
+    const adapter = new FakeAdapter();
+    adapter.polls = [{ state: 'succeeded', files: [{ url: 'https://up/x.png', mediaType: 'image/png' }] }];
+    adapter.submitError = new UpstreamError('YIR_INVALID_REQUEST', 'late', false);
+    const real = adapter.submit.bind(adapter);
+    adapter.submit = async (input, key) => {
+      // Another attempt got through and recorded its task before this one's error came back.
+      await markSubmitted(db, jobId, 'up_real');
+      return real(input, key);
+    };
+    await runGeneration(deps(adapter), jobId, immediateSteps());
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded', upstreamJobId: 'up_real' });
+    expect((await getBalance(db, userId)).available).toBe(40);
+  });
+
+  it('a submit whose record is refused while the slot is still empty retries instead of canceling or ending', async () => {
+    const { jobId } = await paidJob();
+    const adapter = new FakeAdapter();
+    // The run lost the job between submit and record: the fenced write is refused and the slot stays empty.
+    const deps2 = { ...deps(adapter), fence: { runId: jobId, token: 'not-the-holder' } };
+    await expect(
+      runGeneration(deps2, jobId, {
+        do: async (name, fn) => {
+          if (name === 'abort' || name === 'settle') throw new Error('stop here');
+          return fn();
+        },
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow('stop here');
+    expect(adapter.submits).toHaveLength(1);
+    expect(adapter.cancelled).toEqual([]);
+    expect((await loadJob(db, jobId))?.status).toBe('queued');
+  });
+
+  it('a submit replayed past the deadline recovers the task an earlier attempt may have placed, then cancels it', async () => {
+    const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
+    const adapter = new FakeAdapter();
+    const names: string[] = [];
+    const replay: StepRunner = {
+      do: (name, fn) => {
+        names.push(name);
+        return fn({ attempt: name === 'submit' ? 2 : 1 });
+      },
+      sleep: async () => {},
+    };
+    await runGeneration(deps(adapter), jobId, replay);
+    expect(adapter.submits.map((s) => s.key)).toEqual([jobId]);
+    expect(adapter.cancelled).toEqual([`up_${jobId}`]);
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'failed', errorCode: 'timeout' });
+    expect((await getBalance(db, userId)).available).toBe(50);
+  });
+
+  it('a job already past its deadline is failed and refunded without being submitted', async () => {
+    const { userId, jobId } = await paidJob(10, { createdAt: Date.now() - 11 * 60_000 });
+    const adapter = new FakeAdapter();
+    await runGeneration(deps(adapter), jobId, immediateSteps());
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'failed', errorCode: 'timeout' });
+    expect(adapter.submits).toHaveLength(0);
     expect((await getBalance(db, userId)).available).toBe(50);
   });
 
@@ -438,7 +511,7 @@ describe('Yir errors', () => {
     expect((await getBalance(db, userId)).available).toBe(50);
   });
 
-  it('only a rate limit stays retryable; network errors are final', async () => {
+  it('only a rate limit and an uncertain submit stay retryable; other network errors are final', async () => {
     await expect(
       rejecting({ status: 429, code: 'YIR_RATE_LIMITED', message: 'slow' }).adapter.submit(input, 'k1'),
     ).rejects.toMatchObject({ code: 'YIR_RATE_LIMITED', retryable: true });
@@ -446,6 +519,125 @@ describe('Yir errors', () => {
       code: 'yir_error',
       retryable: false,
     });
+    await expect(
+      rejecting(new YirSubmissionUncertainError('k3', new TypeError('socket hang up'))).adapter.submit(
+        input,
+        'k3',
+      ),
+    ).rejects.toMatchObject({
+      code: 'submission_outcome_uncertain',
+      message: 'socket hang up',
+      retryable: true,
+    });
+  });
+
+  it('an uncertain submit is retried with the same key and recovers the Job: no failure, no refund', async () => {
+    const { userId, jobId } = await paidJob();
+    const keys: string[] = [];
+    const client = {
+      submitImage: async (_request: unknown, key: string) => {
+        keys.push(key);
+        if (keys.length === 1) throw new YirSubmissionUncertainError(key, new TypeError('socket hang up'));
+        return { id: 'yir_job_1' };
+      },
+      getJobStatus: async () => ({ status: 'succeeded' }),
+      getJob: async () => ({
+        result: { availability: 'available', files: [{ url: 'https://up/x.png', media_type: 'image/png' }] },
+      }),
+    };
+    // Steps rethrow like the worker does and run again (the worker retries with backoff).
+    const retrying: StepRunner = {
+      async do(_name, fn) {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await fn();
+          } catch (error) {
+            if (attempt >= 3) throw error;
+          }
+        }
+      },
+      async sleep() {},
+    };
+    await runGeneration(
+      { ...deps(new FakeAdapter()), adapters: { yir: new YirAdapter({ apiKey: 'k' }, client as never) } },
+      jobId,
+      retrying,
+    );
+    expect(keys).toEqual([jobId, jobId]);
+    expect(await loadJob(db, jobId)).toMatchObject({ status: 'succeeded', upstreamJobId: 'yir_job_1' });
+    expect((await getBalance(db, userId)).available).toBe(40);
+  });
+
+  it('cancel: a finished Job (resolved since SDK 0.14) and an unfinished demo Job are not errors', async () => {
+    const cancelling = (cancelJob: () => Promise<unknown>) =>
+      new YirAdapter({ apiKey: 'k' }, { cancelJob } as never).cancel('j');
+    await expect(cancelling(async () => ({ id: 'j', status: 'succeeded' }))).resolves.toBeUndefined();
+    await expect(
+      cancelling(async () => {
+        throw new Error('demo_cancel_unsupported');
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      cancelling(async () => {
+        throw { status: 404, code: 'YIR_JOB_NOT_FOUND', message: 'gone' };
+      }),
+    ).rejects.toMatchObject({ code: 'YIR_JOB_NOT_FOUND' });
+  });
+});
+
+describe('Yir demo mode', () => {
+  it('only the site env turns it on, never a stray YIR_DEMO in the process environment', () => {
+    expect(yirDemo({ YIR_DEMO: '1' })).toBe(true);
+    expect(yirDemo({ YIR_DEMO: ' TRUE ' })).toBe(true);
+    expect(yirDemo({ YIR_DEMO: '0' })).toBe(false);
+    expect(yirDemo({})).toBe(false);
+  });
+
+  it('demo submits are quoted, not submitted, and finish locally with a free DEMO result', async () => {
+    const paths: string[] = [];
+    vi.stubGlobal('fetch', async (request: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(request instanceof Request ? request.url : String(request));
+      paths.push(`${init?.method ?? (request instanceof Request ? request.method : 'GET')} ${url.pathname}`);
+      if (url.pathname === '/v1/images/quotes') {
+        const body = JSON.parse(String(init?.body));
+        return Response.json({
+          object: 'quote',
+          model: body.model,
+          operation: 'generate_image',
+          input_mode: body.input.type,
+          parameters: { aspect_ratio: '1:1', n: 1 },
+          currency: 'USD',
+          expires_at: 1900000000,
+          primary: { kind: 'fixed', amount: '0.04' },
+          official: { kind: 'fixed', amount: '0.08' },
+          supply: { available: true, issues: [] },
+        });
+      }
+      return Response.json({ error: { code: 'UNEXPECTED', message: url.pathname } }, { status: 500 });
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const adapter = new YirAdapter({ apiKey: 'k', demo: true });
+      const { upstreamJobId } = await adapter.submit(
+        {
+          upstreamModel: 'openai/gpt-image-2',
+          kind: 'image',
+          prompt: 'p',
+          references: [],
+          parameters: { aspect_ratio: '1:1' },
+        },
+        'k-demo',
+      );
+      expect(isDemoJobID(upstreamJobId)).toBe(true);
+      expect(paths).toEqual(['POST /v1/images/quotes']);
+      // Answered locally, no request: still running right after submit, nothing charged (settles when it ends).
+      expect(await adapter.poll(upstreamJobId, 0)).toEqual({ state: 'running' });
+      expect(await adapter.cost(upstreamJobId)).toEqual({ usd: '0', settled: false });
+      expect(paths).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+      warn.mockRestore();
+    }
   });
 });
 
@@ -874,7 +1066,7 @@ describe('failure streak alerts', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     await emailFailures({
       email,
       from: 'noreply@example.com',
@@ -902,7 +1094,7 @@ describe('failure streak alerts', () => {
         sent.push(message);
         return { messageId: 'm1' };
       },
-    } as unknown as SendEmail;
+    } as unknown as Mailer;
     await emailFailures({
       email,
       from: 'noreply@example.com',

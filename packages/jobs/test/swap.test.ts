@@ -1,5 +1,12 @@
+import type { Mailer } from '@shipwords/core/email/mailer';
 import { describe, expect, it } from 'vitest';
-import { DESCRIBE_MODEL, workersAiDescribe } from '../src/describe';
+import {
+  AI_GATEWAY_URL,
+  aiGatewayDescribe,
+  chooseDescribe,
+  DESCRIBE_MODEL,
+  workersAiDescribe,
+} from '../src/describe';
 import {
   defineModels,
   type EffectRepair,
@@ -345,24 +352,26 @@ describe('repair planning by shot groups', () => {
 });
 
 describe('describe and review helpers', () => {
-  it('sends the image as a data URL with the instruction and returns the answer', async () => {
-    const calls: unknown[] = [];
-    const ai = {
-      run: async (model: string, input: unknown) => {
-        calls.push([model, input]);
-        return { response: 'a man in a red shirt' };
-      },
-    } as unknown as Ai;
-    const fetcher = (async () =>
-      new Response(new Uint8Array([1, 2, 3]), {
-        headers: { 'content-type': 'image/png' },
-      })) as unknown as typeof fetch;
-    const describe = workersAiDescribe(ai, { fetcher });
+  it('sends the image as a data URL with the instruction to Workers AI and returns the answer', async () => {
+    const calls: { url: string; auth: string | null; body: unknown }[] = [];
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === 'https://up/front.png')
+        return new Response(new Uint8Array([1, 2, 3]), { headers: { 'content-type': 'image/png' } });
+      calls.push({
+        url,
+        auth: new Headers(init?.headers).get('authorization'),
+        body: JSON.parse(String(init?.body)),
+      });
+      return Response.json({ success: true, result: { response: 'a man in a red shirt' } });
+    }) as typeof fetch;
+    const describe = workersAiDescribe({ accountId: 'acc', apiToken: 'tok' }, { fetcher });
     expect(await describe('https://up/front.png', 'who is this')).toBe('a man in a red shirt');
     expect(calls).toEqual([
-      [
-        DESCRIBE_MODEL,
-        {
+      {
+        url: `https://api.cloudflare.com/client/v4/accounts/acc/ai/run/${DESCRIBE_MODEL}`,
+        auth: 'Bearer tok',
+        body: {
           messages: [
             {
               role: 'user',
@@ -374,17 +383,151 @@ describe('describe and review helpers', () => {
           ],
           max_tokens: 80,
         },
-      ],
+      },
     ]);
-    const broken = workersAiDescribe(ai, {
-      fetcher: (async () => new Response('', { status: 404 })) as unknown as typeof fetch,
-    });
+    const broken = workersAiDescribe(
+      { accountId: 'acc', apiToken: 'tok' },
+      { fetcher: (async () => new Response('', { status: 404 })) as unknown as typeof fetch },
+    );
     await expect(broken('https://up/x.png', 'x')).rejects.toThrow(/404/);
+    const refused = workersAiDescribe(
+      { accountId: 'acc', apiToken: 'tok' },
+      {
+        fetcher: (async (input: RequestInfo | URL) =>
+          String(input).startsWith('https://up/')
+            ? new Response(new Uint8Array([1]), { headers: { 'content-type': 'image/png' } })
+            : new Response('{"success":false}', { status: 403 })) as typeof fetch,
+      },
+    );
+    await expect(refused('https://up/x.png', 'x')).rejects.toThrow(/403/);
+  });
+
+  it('sends the image and instruction to the site model on the AI Gateway and returns the answer', async () => {
+    const calls: { url: string; auth: string | null; body: unknown }[] = [];
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === 'https://up/front.png')
+        return new Response(new Uint8Array([1, 2, 3]), { headers: { 'content-type': 'image/png' } });
+      calls.push({
+        url,
+        auth: new Headers(init?.headers).get('authorization'),
+        body: JSON.parse(String(init?.body)),
+      });
+      return Response.json({
+        choices: [{ message: { role: 'assistant', content: 'Man in his 30s, navy blazer' } }],
+      });
+    }) as typeof fetch;
+    const describe = aiGatewayDescribe({ apiKey: 'vck' }, { fetcher });
+    expect(await describe('https://up/front.png', 'who is this', 'openai/gpt-6.2-sol')).toBe(
+      'Man in his 30s, navy blazer',
+    );
+    expect(calls).toEqual([
+      {
+        url: `${AI_GATEWAY_URL}/chat/completions`,
+        auth: 'Bearer vck',
+        body: {
+          model: 'openai/gpt-6.2-sol',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'who is this' },
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+              ],
+            },
+          ],
+          max_tokens: 300,
+        },
+      },
+    ]);
+    await expect(describe('https://up/front.png', 'x')).rejects.toThrow(/no AI Gateway model/);
+    // One timeout covers the image download and the model call; a failed call reports its status and code, never the body.
+    const signals: (AbortSignal | undefined)[] = [];
+    const echoing = aiGatewayDescribe(
+      { apiKey: 'vck' },
+      {
+        fetcher: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          signals.push(init?.signal ?? undefined);
+          return String(input).startsWith('https://up/')
+            ? new Response(new Uint8Array([1]), { headers: { 'content-type': 'image/png' } })
+            : Response.json(
+                {
+                  error: { code: 'invalid_request', message: 'bad image data:image/png;base64,AQ== key vck' },
+                },
+                { status: 400 },
+              );
+        }) as typeof fetch,
+      },
+    );
+    const failure = await echoing('https://up/x.png', 'secret instruction', 'm').catch(
+      (error: Error) => error,
+    );
+    expect(String(failure)).toBe('Error: describe failed: 400 invalid_request');
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(signals[1]).toBe(signals[0]);
+    const refused = aiGatewayDescribe(
+      { apiKey: 'vck' },
+      {
+        fetcher: (async (input: RequestInfo | URL) =>
+          String(input).startsWith('https://up/')
+            ? new Response(new Uint8Array([1]), { headers: { 'content-type': 'image/png' } })
+            : new Response('{"error":{"message":"bad key"}}', { status: 401 })) as typeof fetch,
+      },
+    );
+    await expect(refused('https://up/x.png', 'x', 'm')).rejects.toThrow(/401/);
+  });
+
+  it('routes a site model to the gateway and the rest to Workers AI; no describer when neither is configured', async () => {
+    const calls: string[] = [];
+    const gateway = async (_url: string, _instruction: string, model?: string) => {
+      calls.push(`gateway ${model}`);
+      return 'g';
+    };
+    const workersAi = async () => {
+      calls.push('workers-ai');
+      return 'w';
+    };
+    const both = chooseDescribe(gateway, workersAi)!;
+    expect(await both('u', 'i', 'openai/gpt-6.2-sol')).toBe('g');
+    expect(await both('u', 'i')).toBe('w');
+    expect(await chooseDescribe(undefined, workersAi)!('u', 'i', 'openai/gpt-6.2-sol')).toBe('w');
+    await expect(chooseDescribe(gateway, undefined)!('u', 'i')).rejects.toThrow(/no Workers AI/);
+    expect(calls).toEqual(['gateway openai/gpt-6.2-sol', 'workers-ai', 'workers-ai']);
+    expect(chooseDescribe(undefined, undefined)).toBeUndefined();
+  });
+
+  it('the describe model rides along in the segment part; an empty model is a config error', () => {
+    const withModel: ModelDefinition = {
+      ...swapModel,
+      effect: {
+        ...swapModel.effect!,
+        describe: { instruction: 'say', view: 1, model: 'openai/gpt-6.2-sol' },
+      },
+    };
+    const parts = effectParts(withModel, { lead: '/files/uploads/up_l.png' }, upload, asset)!;
+    expect(parts.find((part) => part.id === 'full')!.describe).toMatchObject({
+      instruction: 'say',
+      model: 'openai/gpt-6.2-sol',
+    });
+    expect(
+      effectParts(swapModel, { lead: '/files/uploads/up_l.png' }, upload, asset)!.find(
+        (p) => p.id === 'full',
+      )!.describe,
+    ).not.toHaveProperty('model');
+    expect(() =>
+      defineModels([
+        {
+          ...swapModel,
+          effect: { ...swapModel.effect!, describe: { instruction: 'say', view: 1, model: ' ' } },
+        },
+      ]),
+    ).toThrow(/describe needs/);
   });
 
   it('emails the owner which job needs a look, why and where the result is', async () => {
     const sent: { to: string; subject: string; text: string; html: string }[] = [];
-    const email = { send: async (message: never) => void sent.push(message) } as unknown as SendEmail;
+    const email = { send: async (message: never) => void sent.push(message) } as unknown as Mailer;
     const review = emailReview({
       email,
       from: 'noreply@site.example',

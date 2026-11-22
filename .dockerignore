@@ -1,0 +1,22 @@
+# Build context for site images (templates/ai-site/Dockerfile, sites/*/Dockerfile): source and lockfile only.
+# Secrets must never reach an image: every .env file is excluded, examples aside.
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars
+**/.dev.vars.*
+
+**/node_modules
+**/dist
+**/.output
+**/.preview
+**/.wrangler
+**/.tanstack
+**/.data
+**/*.tsbuildinfo
+**/src/paraglide
+**/routeTree.gen.ts
+.git
+.tmp
+.claude
+private-assets

@@ -1,17 +1,6 @@
-import path from 'node:path';
-import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-plugin';
 import { defineConfig } from 'vitest/config';
 
-// Tests run in workerd with a fresh in-memory D1 per test file, so parallel worktrees don't interfere.
-export default defineConfig(async () => {
-  const migrations = await readD1Migrations(path.join(import.meta.dirname, 'test/migrations'));
-  return {
-    plugins: [
-      cloudflareTest({
-        wrangler: { configPath: './wrangler.test.jsonc' },
-        miniflare: { bindings: { TEST_MIGRATIONS: migrations } },
-      }),
-    ],
-    test: { include: ['test/**/*.test.ts'], setupFiles: ['./test/apply-migrations.ts'] },
-  };
+// Tests run in Node; each test file gets its own in-memory Postgres (test/db.ts), so parallel worktrees don't interfere.
+export default defineConfig({
+  test: { include: ['test/**/*.test.ts'], environment: 'node' },
 });

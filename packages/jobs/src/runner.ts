@@ -6,6 +6,7 @@ import {
   activeJob,
   appendUpstreamJob,
   cancelAll,
+  type Fence,
   loadJob,
   markFailed,
   markForReview,
@@ -28,20 +29,26 @@ import { composeOutputs, storeOutputs } from './outputs';
 import { checkPoints, checkWindows, judgeCheck } from './repair';
 import { type RepairContext, repairOutputs, type SegmentCheck } from './repair-steps';
 import type { JobRow } from './schema';
+import type { ObjectStore } from './store';
 import type { PollResult, SubmitInput, UpstreamAdapter } from './upstream';
 import { UpstreamError } from './upstream';
 
-// The full execution of one generation job. The Workflow persists each step's result and resumes after interruption;
-// this only depends on the StepRunner interface, so tests pass an implementation that runs directly.
+// The full execution of one generation job. The step runner (worker.ts) persists each step's result and resumes after
+// interruption; this only depends on the StepRunner interface, so tests pass an implementation that runs directly.
+
+export interface StepInfo {
+  /** 1 on a step's first attempt; higher when an earlier attempt failed or its process died mid-step (its effects are unknown). */
+  attempt: number;
+}
 
 export interface StepRunner {
-  do<T>(name: string, fn: () => Promise<T>): Promise<T>;
+  do<T>(name: string, fn: (info?: StepInfo) => Promise<T>): Promise<T>;
   sleep(name: string, ms: number): Promise<void>;
 }
 
 export interface RunnerDeps {
   db: Db;
-  bucket: R2Bucket;
+  bucket: ObjectStore;
   models: readonly ModelDefinition[];
   adapters: Record<string, UpstreamAdapter>;
   /** Effect compose (effect.compose); empty when the site binds no container, and jobs that need compose fail with a refund. */
@@ -58,7 +65,7 @@ export interface RunnerDeps {
    * Describe a person in an image (effect.describe), e.g. with a vision model: a short phrase that goes into the video prompt. Errors
    * and empty answers leave the description out; without it describe placeholders are dropped.
    */
-  describe?: (imageUrl: string, instruction: string) => Promise<string>;
+  describe?: (imageUrl: string, instruction: string, model?: string) => Promise<string>;
   /**
    * Tell someone a delivered job needs a human look (people the repair passes couldn't swap, a face on the wrong person). The job is
    * delivered either way; errors are only logged.
@@ -70,6 +77,8 @@ export interface RunnerDeps {
    */
   failures?: (failed: readonly JobRow[]) => Promise<void>;
   log?: (message: string, details: Record<string, unknown>) => void;
+  /** The worker's claim on this run; job outcome writes apply only while it holds the lease (lifecycle.ts Fence). */
+  fence?: Fence;
 }
 
 const POLL_WAIT_SECONDS = 20;
@@ -88,7 +97,7 @@ const PREP_EXTENSIONS: Readonly<Record<string, string>> = {
 };
 
 /**
- * Each Workflow step retries on its own; once retries are exhausted step.do throws. This fallback marks the job failed and refunds,
+ * Each step retries on its own; once retries are exhausted step.do throws. This fallback marks the job failed and refunds,
  * otherwise the job would stay in progress forever and the user's credits would never come back.
  */
 export async function runGeneration(deps: RunnerDeps, jobId: string, step: StepRunner): Promise<void> {
@@ -102,7 +111,7 @@ export async function runGeneration(deps: RunnerDeps, jobId: string, step: StepR
       const job = await activeJob(deps.db, jobId);
       const adapter = job ? deps.adapters[job.upstream] : undefined;
       if (job && adapter) await cancelAll(adapter, upstreamIds(job));
-      await markFailed(deps.db, jobId, 'failed', 'internal_error', message);
+      await markFailed(deps.db, jobId, 'failed', 'internal_error', message, deps.fence);
       return true;
     });
   }
@@ -238,6 +247,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
         'failed',
         'model_removed',
         `model ${setup.missingModel} is no longer configured`,
+        deps.fence,
       );
       return true;
     });
@@ -282,9 +292,11 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
               if (await deps.bucket.head(target)) continue;
               const source = await deps.bucket.get(key);
               if (!source) throw new Error('upload missing');
-              await deps.bucket.put(target, await source.arrayBuffer(), {
-                httpMetadata: source.httpMetadata ?? {},
-              });
+              await deps.bucket.put(
+                target,
+                await source.arrayBuffer(),
+                source.contentType ? { contentType: source.contentType } : {},
+              );
             } catch (error) {
               failed.push({ key, error: String(error) });
             }
@@ -315,7 +327,14 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   const adapter = deps.adapters[setup.upstream];
   if (!adapter) {
     await step.do('fail:upstream_missing', async () => {
-      await markFailed(deps.db, jobId, 'failed', 'upstream_missing', `no adapter for ${setup.upstream}`);
+      await markFailed(
+        deps.db,
+        jobId,
+        'failed',
+        'upstream_missing',
+        `no adapter for ${setup.upstream}`,
+        deps.fence,
+      );
       return true;
     });
     return;
@@ -330,12 +349,12 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     step.do(stepName, async () => {
       const job = await loadJob(deps.db, jobId);
       if (job) await cancelAll(adapter, upstreamIds(job));
-      await markFailed(deps.db, jobId, 'failed', code, message);
+      await markFailed(deps.db, jobId, 'failed', code, message, deps.fence);
       return true;
     });
   const fail = (code: string, message: string) => stop(`fail:${code}`, code, message);
 
-  // Timeout counts from job creation and is only checked inside a step: on Workflow replay, code outside steps runs again.
+  // Timeout counts from job creation and is only checked inside a step: on replay, code outside steps runs again.
   const deadline = setup.createdAt + setup.timeoutMinutes * 60_000;
   const prepCount = setup.prep ?? 0;
   /** Prep results: prep segment ID → image URL returned by the upstream; video segments' prep:<slot> placeholders are replaced with it at submit. */
@@ -394,7 +413,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           } catch (error) {
             if (!(error instanceof UpstreamError) || error.retryable) throw error;
             await cancelAll(adapter, upstreamIds(job));
-            await markFailed(deps.db, jobId, 'failed', error.code, error.message);
+            await markFailed(deps.db, jobId, 'failed', error.code, error.message, deps.fence);
             return false;
           }
         });
@@ -475,11 +494,14 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
       for (const partId of polled.hedge) {
         hedged.add(partId);
         const part = pending.find((candidate) => candidate.partId === partId)!;
-        // Best effort and no Workflow retries: if the copy can't be placed, keep waiting on the original.
-        const copy = await step.do(`hedge:${partId}`, async () => {
+        // Best effort and no step retries: if the copy can't be placed, keep waiting on the original.
+        const copy = await step.do(`hedge:${partId}`, async (info) => {
           const job = await activeJob(deps.db, jobId);
-          // A replay can resume here past the deadline: a copy then could never be used.
-          if (!job || Date.now() > deadline) return null;
+          if (!job) return null;
+          // A replay can resume here past the deadline: a copy then could never be used, so a first attempt places none. A later
+          // attempt may follow one the upstream accepted: it submits with the same key to recover that copy, which the prep
+          // poll's timeout then cancels.
+          if (Date.now() > deadline && (info?.attempt ?? 1) === 1) return null;
           try {
             const { upstreamJobId } = await adapter.submit(
               submitInput(job, part.index),
@@ -487,6 +509,8 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
             );
             return upstreamJobId;
           } catch (error) {
+            // Recovering a copy an earlier attempt may have placed: retry, or its ID (needed to cancel it) would be lost.
+            if (Date.now() > deadline && (info?.attempt ?? 1) > 1) throw error;
             deps.log?.('prep hedge failed', { jobId, part: partId, error: String(error) });
             return null;
           }
@@ -598,7 +622,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           const response = await (deps.fetcher ?? fetch)(url, { signal: AbortSignal.timeout(ms) });
           if (!response.ok) throw new Error(`download failed: ${response.status}`);
           const image = await response.arrayBuffer();
-          await deps.bucket.put(key, image, { httpMetadata: { contentType: mediaType } });
+          await deps.bucket.put(key, image, { contentType: mediaType });
         };
         const failed: { part: string; error: string }[] = [];
         for (const image of kept) {
@@ -648,7 +672,9 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
                 try {
                   return [
                     slot,
-                    cleanDescription(await deps.describe!(resolve(partId, image), ask.instruction)),
+                    cleanDescription(
+                      await deps.describe!(resolve(partId, image), ask.instruction, ask.model),
+                    ),
                   ];
                 } catch (error) {
                   deps.log?.('describe failed', { jobId, part: partId, slot, error: String(error) });
@@ -665,31 +691,49 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
           });
         descriptions.set(partId, described);
       }
-      const submitted = await step.do(name('submit', partId), async () => {
+      /**
+       * Records this segment's upstream ID. When the slot was filled meanwhile (the same submit replayed elsewhere), the recorded ID
+       * wins and a different task this call placed is canceled; when the job has ended, the task is canceled and the job is done.
+       */
+      const record = async (upstreamJobId: string) => {
+        if (await appendUpstreamJob(deps.db, jobId, index, upstreamJobId, deps.fence))
+          return { upstreamJobId };
+        const now = await activeJob(deps.db, jobId);
+        const recorded = now ? upstreamIds(now)[index] : undefined;
+        // Still active with an empty slot: this run may no longer hold the job (its write was fenced off), and whoever does may be
+        // recovering this very task with the same key. Leave the task alone and retry the step instead of ending it.
+        if (now && !recorded)
+          throw new Error(`could not record upstream task ${upstreamJobId} for segment ${index}`);
+        if (recorded !== upstreamJobId && !upstreamJobId.startsWith(SKIPPED))
+          await adapter.cancel(upstreamJobId).catch(() => undefined);
+        return recorded ? { upstreamJobId: recorded } : { done: true as const };
+      };
+      const submitted = await step.do(name('submit', partId), async (info) => {
         const job = await activeJob(deps.db, jobId);
         if (!job) return { done: true as const };
         const existing = upstreamIds(job)[index];
         if (existing) return { upstreamJobId: existing };
-        // Prep may have used up the time: submitting video segments now would just waste upstream spend.
-        if (index > 0 && Date.now() > deadline) return { timeout: true as const };
+        // Prep may have used up the time, or the run started late (a backlog, a worker outage): submitting now would just waste
+        // upstream spend on a job that times out anyway. Only on a first attempt, though: after a failed or interrupted one the
+        // upstream may already hold the task, and submitting again with the same key is how its ID is recovered, so the timeout
+        // that follows cancels it instead of leaving it running unseen.
+        if (Date.now() > deadline && (info?.attempt ?? 1) === 1) return { timeout: true as const };
         try {
           const { upstreamJobId } = await adapter.submit(
             submitInput(job, index),
             single ? jobId : `${jobId}:${partId}`,
           );
-          if (!(await appendUpstreamJob(deps.db, jobId, index, upstreamJobId))) {
-            // The job was canceled during submit: nobody needs the task just placed, cancel it.
-            await adapter.cancel(upstreamJobId).catch(() => undefined);
-            return { done: true as const };
-          }
-          return { upstreamJobId };
+          return await record(upstreamJobId);
         } catch (error) {
+          // A late error from an attempt another one already got past must not fail or refund the job.
+          const latest = await activeJob(deps.db, jobId);
+          if (!latest) return { done: true as const };
+          const recorded = upstreamIds(latest)[index];
+          if (recorded) return { upstreamJobId: recorded };
           if (error instanceof UpstreamError && !error.retryable && index < prepCount) {
             // Prep rejected (e.g. a celebrity photo): don't fail, record a placeholder and fall back to the original photo.
             deps.log?.('prep rejected, using original photo', { jobId, part: partId, code: error.code });
-            const skipped = `${SKIPPED}${partId}`;
-            if (!(await appendUpstreamJob(deps.db, jobId, index, skipped))) return { done: true as const };
-            return { upstreamJobId: skipped };
+            return await record(`${SKIPPED}${partId}`);
           }
           if (error instanceof UpstreamError && !error.retryable) {
             deps.log?.('upstream rejected job', {
@@ -699,7 +743,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
               message: error.message,
             });
             await cancelAll(adapter, upstreamIds(job));
-            await markFailed(deps.db, jobId, 'failed', error.code, error.message);
+            await markFailed(deps.db, jobId, 'failed', error.code, error.message, deps.fence);
             return { done: true as const };
           }
           throw error;
@@ -800,7 +844,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
                 if (images.length !== 4 || images.some((image) => !image.byteLength))
                   throw new Error('sheet must produce four images');
                 for (const [view, key] of keys.entries())
-                  await deps.bucket.put(key, images[view]!, { httpMetadata: { contentType: 'image/png' } });
+                  await deps.bucket.put(key, images[view]!, { contentType: 'image/png' });
               }
               return keys.map((key) => deps.fileUrl!(key));
             });
@@ -830,7 +874,7 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
   }
   let finalOutputs = outputs;
   if (setup.compose) {
-    // Compose failures throw: once Workflow retries run out the fallback fails the job with a full refund. Retries write the same keys, so it's idempotent.
+    // Compose failures throw: once step retries run out the fallback fails the job with a full refund. Retries write the same keys, so it's idempotent.
     const composed = await step.do('compose', () => composeOutputs(deps, jobId, partKeys, outputs.length));
     if (!composed) return;
     finalOutputs = composed;
@@ -872,14 +916,14 @@ async function runSteps(deps: RunnerDeps, jobId: string, step: StepRunner): Prom
     }
   }
   await step.do('finish', async () => {
-    await markSucceeded(deps.db, jobId, finalOutputs);
+    await markSucceeded(deps.db, jobId, finalOutputs, deps.fence);
     return true;
   });
   if (reviews.length > 0) {
     // Best effort, after delivery: the note is kept on the job (error_message, which pages never show) and sent to deps.review.
     await step
       .do('review', async () => {
-        const job = await markForReview(deps.db, jobId, reviews.join('; '));
+        const job = await markForReview(deps.db, jobId, reviews.join('; '), deps.fence);
         if (job) await deps.review?.(job, reviews);
         return true;
       })

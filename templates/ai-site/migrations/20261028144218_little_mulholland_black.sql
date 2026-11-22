@@ -1,1 +1,0 @@
-ALTER TABLE `jobs` ADD `upstream_cost_usd` text;

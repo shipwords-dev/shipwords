@@ -1,0 +1,76 @@
+# One machine running this site: the site itself, its Postgres and the compose service (video stitching; only effect sites need it).
+# Settings and secrets come from .env next to this file (see .env.example), which also sets POSTGRES_PASSWORD for the database here.
+#
+#   docker compose up -d --build                     start or update everything
+#   docker compose run --rm site node migrate.mjs    apply migrations (before starting a version with schema changes)
+#   docker compose logs -f site
+#
+# Several sites on one machine share one Postgres (a database and a role of its own per site) and one compose service: set
+# SITE_DATABASE_URL and SITE_COMPOSE_URL in .env, and delete the db and compose services, the site's depends_on and the db volume
+# (docker compose config --quiet must pass). Site and migrations read the same settings.
+
+name: ai-site
+
+services:
+  site:
+    build:
+      # The workspace root: the site depends on packages next to it.
+      context: ../..
+      dockerfile: templates/ai-site/Dockerfile
+      args:
+        SITE: templates/ai-site
+    env_file: .env
+    environment:
+      DATABASE_URL: ${SITE_DATABASE_URL:-postgres://site:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/site}
+      COMPOSE_URL: ${SITE_COMPOSE_URL:-http://compose:8080}
+      PORT: "3000"
+    ports:
+      # Put a reverse proxy (or Cloudflare in front of one) on the public side; only accept Cloudflare's address ranges there (a
+      # firewall, not a header rule), since guest quotas trust the cf-connecting-ip header.
+      - 127.0.0.1:3000:3000
+    volumes:
+      # Uploads and results when STORAGE_DIR points here instead of an S3 bucket: kept when the container is rebuilt.
+      - files:/app/.data
+    depends_on:
+      db:
+        condition: service_healthy
+      # Started first and stopped last, so a stitch in flight isn't cut off while the site shuts down.
+      compose:
+        condition: service_healthy
+    # On docker stop the job worker finishes the steps in flight and hands its runs back; give it time before the kill.
+    stop_grace_period: 90s
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: site
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: site
+    volumes:
+      - db:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U site -d site]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  compose:
+    build: ../../packages/jobs/compose
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  db: {}
+  files: {}
