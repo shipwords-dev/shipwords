@@ -110,7 +110,7 @@ Agent 会克隆仓库、生成站点并在本地跑起来。它遵守的规则�
 | `packages/jobs`            | 基于 Postgres 的生成任务运行时（任务中断后可续跑）：单向任务状态机、自动退款、上游适配接口、Yir 适配（`@yir-ai/sdk`）、本地开发用的模拟上游、S3/R2 文件存储、可选的 ffmpeg 拼接服务 |
 | `templates/ai-site`        | 一个完整可用的 AI 图像站，由 `pnpm new-site` 复制：首页、定价、账户、登录、政策页、`sitemap.xml`、`robots.txt`、`llms.txt`，以及它的 `Dockerfile` 和 `compose.yaml`                 |
 | `sites/<site>`             | 你的站，一个关键词一个，各自单独部署                                                                                                                                                |
-| `sites/tinydeskai-example` | tinydeskai.io 的完整源码（视频特效：照片槽位、整段一次编辑、结果检查、ffmpeg 拼接、内容页）；迁移之前仍是 `v0.2.0` 版的 Cloudflare Workers 部署方式                                 |
+| `sites/tinydeskai-example` | tinydeskai.io 的完整源码（视频特效：照片槽位、整段一次编辑、结果检查、补修、ffmpeg 拼接、内容页），含 Dockerfile 和生成契约测试                                                     |
 | `apps/<sidecar>`           | 可选的小型 Worker，不属于任何单个站                                                                                                                                                 |
 | `tools/`                   | `new-site` 脚手架、`check-site` 上线检查、`list-sites`、worktree 初始化、dev 端口、Stripe webhook 转发、D1 导入（只用 Node 内置模块，带测试）                                       |
 | `docs/`                    | 架构、本地开发、上线手册（英文）                                                                                                                                                    |

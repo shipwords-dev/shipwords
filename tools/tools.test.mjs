@@ -236,6 +236,17 @@ test('new site: names that look like YAML keywords or contain the template name,
   assert.ok(!checkSite(target).includes('compose.yaml still names the template'));
   // Without --domain the sender is noreply@null.example.com, which still needs replacing before launch.
   assert.ok(checkSite(target).includes('.env.example still sends from an example.com address'));
+  // A published example site keeps its placeholders on purpose: "example": true in package.json skips these three checks only.
+  const pkg = path.join(target, 'package.json');
+  fs.writeFileSync(pkg, JSON.stringify({ ...JSON.parse(fs.readFileSync(pkg, 'utf8')), example: true }));
+  fs.writeFileSync(
+    path.join(target, 'src', 'site', 'legal.tsx'),
+    "export const SUPPORT_EMAIL = 'support@example.com';\n",
+  );
+  const example = checkSite(target);
+  assert.ok(!example.some((p) => /example\.com|SUPPORT_EMAIL/.test(p)), example.join('\n'));
+  fs.rmSync(path.join(target, 'src', 'routes', 'dmca.tsx'));
+  assert.ok(checkSite(target).includes('Missing policy page src/routes/dmca.tsx'));
 
   assert.throws(() => make('ai-site'), /template's name/);
 });

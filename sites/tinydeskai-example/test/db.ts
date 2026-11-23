@@ -1,0 +1,11 @@
+import { fileURLToPath } from 'node:url';
+import { PGlite } from '@electric-sql/pglite';
+import { type Db, schema } from '@shipwords/core/db/client';
+import { drizzle } from 'drizzle-orm/pglite';
+import { migrate } from 'drizzle-orm/pglite/migrator';
+
+// One in-memory Postgres per test file (vitest isolates modules per file), with this site's migrations applied. Tests use fresh IDs and share it within a file.
+const pglite = drizzle({ client: new PGlite(), schema });
+await migrate(pglite, { migrationsFolder: fileURLToPath(new URL('../migrations', import.meta.url)) });
+
+export const db = pglite as unknown as Db;

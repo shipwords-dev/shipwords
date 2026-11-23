@@ -1,10 +1,14 @@
-import { env } from 'cloudflare:workers';
+import type { Db } from '@shipwords/core/db/client';
+import type { ObjectStore } from '@shipwords/jobs/store';
+import { and, asc, count, eq, gt, lt } from 'drizzle-orm';
+import { handoffItems, handoffs } from './schema';
 
-// Relay for uploading photos from a phone by QR code: desktop opens a pairing code, the phone uploads via /api/uploads as usual and registers the path under the code;
-// desktop polls and fills empty slots. Stored in R2 (OUTPUTS) under handoff/<code>/: meta holds the creation time, and each photo is an empty object
-// with the path encoded in its key, so one prefix list returns everything, with no object reads and no concurrent writes to one object.
+// Relay for uploading photos from a phone by QR code: desktop opens a pairing code, the phone uploads via /api/uploads as usual and
+// registers the path under the code; desktop polls and fills empty slots. Codes and registered paths live in this site's database
+// (handoffs, handoff_items); the photos themselves stay under uploads/ in storage as usual.
 
 const TTL_MS = 30 * 60 * 1000;
+const CLEANUP_AFTER_MS = 24 * 60 * 60 * 1000;
 const MAX_ITEMS = 20;
 const TOKEN = /^[a-f0-9]{32}$/;
 const UPLOAD_PATH = /^\/files\/uploads\/(up_[a-z0-9]+\.(?:png|jpg|webp))$/;
@@ -16,48 +20,63 @@ const json = (body: unknown, status = 200) =>
   });
 const fail = (status: number, code: string) => json({ error: { code, message: code } }, status);
 
-async function expiresAt(token: string): Promise<number | null> {
-  if (!TOKEN.test(token)) return null;
-  const meta = await env.OUTPUTS.head(`handoff/${token}/meta`);
-  const created = Number(meta?.customMetadata?.created ?? 0);
-  return created && Date.now() - created < TTL_MS ? created + TTL_MS : null;
-}
+export function createHandoffApi(db: () => Db, store: () => ObjectStore, now = () => Date.now()) {
+  /** Expiry time of a live pairing code; null if it expired or does not exist. */
+  async function expiresAt(token: string): Promise<number | null> {
+    if (!TOKEN.test(token)) return null;
+    const [row] = await db()
+      .select({ createdAt: handoffs.createdAt })
+      .from(handoffs)
+      .where(and(eq(handoffs.token, token), gt(handoffs.createdAt, now() - TTL_MS)));
+    return row ? row.createdAt + TTL_MS : null;
+  }
 
-async function items(token: string): Promise<string[]> {
-  const list = await env.OUTPUTS.list({ prefix: `handoff/${token}/i-`, limit: MAX_ITEMS });
-  return list.objects
-    .map((object) =>
-      object.key
-        .split('/')
-        .at(-1)!
-        .replace(/^i-\d+-/, ''),
-    )
-    .map((name) => `/files/uploads/${name}`);
-}
+  async function items(token: string): Promise<string[]> {
+    const rows = await db()
+      .select({ path: handoffItems.path })
+      .from(handoffItems)
+      .where(eq(handoffItems.token, token))
+      .orderBy(asc(handoffItems.createdAt), asc(handoffItems.path))
+      .limit(MAX_ITEMS);
+    return rows.map((row) => row.path);
+  }
 
-/** POST /api/handoff: desktop opens a pairing code. */
-export async function createHandoff(): Promise<Response> {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  const token = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
-  const created = Date.now();
-  await env.OUTPUTS.put(`handoff/${token}/meta`, '', { customMetadata: { created: String(created) } });
-  return json({ token, expiresAt: created + TTL_MS }, 201);
-}
+  return {
+    /**
+     * POST /api/handoff: desktop opens a pairing code. Also deletes codes older than a day: only long-expired ones, so a phone
+     * registering into a code that just expired doesn't lose the parent row and hit a foreign-key 500.
+     */
+    async create(): Promise<Response> {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      const token = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+      const created = now();
+      await db()
+        .delete(handoffs)
+        .where(lt(handoffs.createdAt, created - CLEANUP_AFTER_MS));
+      await db().insert(handoffs).values({ token, createdAt: created });
+      return json({ token, expiresAt: created + TTL_MS }, 201);
+    },
 
-/** GET /api/handoff/<code>: photo paths sent from the phone, in upload order. */
-export async function readHandoff(token: string): Promise<Response> {
-  const expires = await expiresAt(token);
-  if (!expires) return fail(404, 'handoff_expired');
-  return json({ paths: await items(token), expiresAt: expires });
-}
+    /** GET /api/handoff/<code>: photo paths sent from the phone, in registration order. */
+    async read(token: string): Promise<Response> {
+      const expires = await expiresAt(token);
+      if (!expires) return fail(404, 'handoff_expired');
+      return json({ paths: await items(token), expiresAt: expires });
+    },
 
-/** POST /api/handoff/<code> {path}: phone registers a photo it just uploaded. */
-export async function addToHandoff(request: Request, token: string): Promise<Response> {
-  if (!(await expiresAt(token))) return fail(404, 'handoff_expired');
-  const body = (await request.json().catch(() => null)) as { path?: unknown } | null;
-  const name = typeof body?.path === 'string' ? UPLOAD_PATH.exec(body.path)?.[1] : undefined;
-  if (!name || !(await env.OUTPUTS.head(`uploads/${name}`))) return fail(400, 'invalid_path');
-  if ((await items(token)).length >= MAX_ITEMS) return fail(429, 'handoff_full');
-  await env.OUTPUTS.put(`handoff/${token}/i-${String(Date.now()).padStart(13, '0')}-${name}`, '');
-  return json({ ok: true }, 201);
+    /** POST /api/handoff/<code> {path}: phone registers a photo it just uploaded; registering the same one twice counts once. */
+    async add(request: Request, token: string): Promise<Response> {
+      if (!(await expiresAt(token))) return fail(404, 'handoff_expired');
+      const body = (await request.json().catch(() => null)) as { path?: unknown } | null;
+      const name = typeof body?.path === 'string' ? UPLOAD_PATH.exec(body.path)?.[1] : undefined;
+      if (!name || !(await store().head(`uploads/${name}`))) return fail(400, 'invalid_path');
+      const [row] = await db().select({ n: count() }).from(handoffItems).where(eq(handoffItems.token, token));
+      if ((row?.n ?? 0) >= MAX_ITEMS) return fail(429, 'handoff_full');
+      await db()
+        .insert(handoffItems)
+        .values({ token, path: `/files/uploads/${name}`, createdAt: now() })
+        .onConflictDoNothing();
+      return json({ ok: true }, 201);
+    },
+  };
 }

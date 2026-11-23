@@ -72,7 +72,7 @@
   "home_faq_fail_q": "失败了或效果不对怎么办？",
   "home_faq_fail_a": "出不了片会自动退还积分。如果有人还是原片里的样子，我们会在交付前自动补换，不额外收费。如果成片明显有问题，7 天内发邮件给我们，我们退还积分；见退款政策。效果是很像，不是一模一样。",
   "home_faq_photos_q": "我的照片会怎么处理？",
-  "home_faq_photos_a": "只用来生成你的视频，为此会发给我们的 AI 视频服务商，并在 2 天内从我们的存储中删除。",
+  "home_faq_photos_a": "只用来生成你的视频，为此会发给我们的 AI 视频服务商。照片会在 2 天内从网站上删除；我们会随订单保留一份不公开的副本，用于客服和质量复核，你随时可以要求删除。",
   "home_faq_npr_q": "这和 NPR 或 Tiny Desk 有关系吗？",
   "home_faq_npr_a": "没有。{name} 是做恶搞视频的独立粉丝工具，与 NPR、Tiny Desk Concerts、Charlie Wilson 或 The Gap Band 无关，也未获其认可。Tiny Desk 是 NPR 的商标。",
   "home_sound_on": "打开声音",

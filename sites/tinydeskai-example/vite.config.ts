@@ -1,5 +1,4 @@
 import { fileURLToPath } from 'node:url';
-import { cloudflare } from '@cloudflare/vite-plugin';
 import { paraglideVitePlugin } from '@inlang/paraglide-js';
 import tailwindcss from '@tailwindcss/vite';
 import { tanstackStart } from '@tanstack/react-start/plugin/vite';
@@ -29,7 +28,6 @@ export default defineConfig(({ command }) => ({
         ? { project: './project.inlang', outdir: './src/paraglide', strategy: ['cookie', 'baseLocale'] }
         : { project: './project.en.inlang', outdir: PARAGLIDE_BUILD, strategy: ['baseLocale'] },
     ),
-    cloudflare({ viteEnvironment: { name: 'ssr' } }),
     tailwindcss(),
     tanstackStart(),
     viteReact(),

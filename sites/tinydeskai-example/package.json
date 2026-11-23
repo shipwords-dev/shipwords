@@ -3,35 +3,38 @@
   "private": true,
   "type": "module",
   "devPort": 5020,
+  "example": true,
   "scripts": {
-    "dev": "node ../../tools/dev-port.mjs vite dev",
+    "dev": "node --env-file-if-exists=.env ../../tools/dev-port.mjs vite dev",
     "build": "vite build",
-    "preview": "vite build --outDir .preview && node ../../tools/dev-port.mjs vite preview --outDir .preview",
-    "typecheck": "paraglide-js compile --project ./project.inlang --outdir ./src/paraglide && tsr generate && wrangler types && tsc --noEmit",
-    "check": "pnpm typecheck && pnpm build && node ../../tools/check-site.mjs .",
+    "start": "node --env-file-if-exists=.env start.mjs",
+    "preview": "vite build && node --env-file-if-exists=.env ../../tools/dev-port.mjs node start.mjs",
+    "typecheck": "paraglide-js compile --project ./project.inlang --outdir ./src/paraglide && tsr generate && tsc --noEmit",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm check:site",
     "db:generate": "drizzle-kit generate",
-    "db:migrate:local": "wrangler d1 migrations apply DB --local",
-    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
-    "deploy": "vite build && node ../../tools/check-site.mjs . && wrangler deploy",
-    "deploy:preview": "vite build && node ../../tools/check-site.mjs . && wrangler versions upload"
+    "db:migrate": "node --env-file-if-exists=.env migrate.mjs",
+    "check:site": "node ../../tools/check-site.mjs ."
   },
   "dependencies": {
-    "@cloudflare/containers": "0.3.7",
     "@shipwords/core": "workspace:*",
     "@shipwords/jobs": "workspace:*",
     "@tanstack/react-router": "1.170.46",
     "@tanstack/react-start": "1.169.4",
     "better-auth": "1.7.14",
+    "drizzle-orm": "0.45.4",
+    "pg": "8.23.1",
     "react": "19.3.1",
     "react-dom": "19.3.1",
+    "srvx": "1.0.8",
     "uqr": "0.1.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.65.0",
-    "@cloudflare/workers-types": "5.20261027.1",
+    "@electric-sql/pglite": "0.5.16",
     "@inlang/paraglide-js": "2.27.0",
     "@tailwindcss/vite": "4.3.3",
     "@tanstack/router-cli": "1.167.46",
+    "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.1.2",
@@ -39,6 +42,6 @@
     "tailwindcss": "4.3.3",
     "typescript": "6.0.3",
     "vite": "8.3.5",
-    "wrangler": "4.153.0"
+    "vitest": "4.1.12"
   }
 }

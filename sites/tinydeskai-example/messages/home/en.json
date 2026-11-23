@@ -72,7 +72,7 @@
   "home_faq_fail_q": "What if it fails or doesn't look right?",
   "home_faq_fail_a": "If a video can't be made, its credits come back on their own. If someone still looks like the original performer, we re-render them automatically at no extra cost before you get the video. If a finished video is clearly broken, email us within 7 days and we return the credits; see the refund policy. Expect a strong likeness, not a twin.",
   "home_faq_photos_q": "What happens to my photos?",
-  "home_faq_photos_a": "We use them only to make your video, send them to our AI video provider for that, and delete them from our storage within 2 days.",
+  "home_faq_photos_a": "We use them only to make your video and send them to our AI video provider for that. They leave the site within 2 days; we keep a private copy with your order for support and quality checks, and delete it whenever you ask.",
   "home_faq_npr_q": "Is this affiliated with NPR or Tiny Desk?",
   "home_faq_npr_a": "No. {name} is an independent fan tool for parody videos, not affiliated with or endorsed by NPR, Tiny Desk Concerts, Charlie Wilson or The Gap Band. Tiny Desk is a trademark of NPR.",
   "home_sound_on": "Turn sound on",

@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { createHandoff } from '~/site/handoff.server';
+import { handoffApi } from '~/core.server';
 
 export const Route = createFileRoute('/api/handoff/')({
-  server: { handlers: { POST: () => createHandoff() } },
+  server: { handlers: { POST: () => handoffApi.create() } },
 });

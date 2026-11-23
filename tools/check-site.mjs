@@ -171,7 +171,7 @@ function checkBuild(dir) {
   return problems;
 }
 
-function checkLegal(dir, isTemplate) {
+function checkLegal(dir, isTemplate, isExample) {
   const problems = [];
   for (const page of LEGAL_PAGES) {
     if (!fs.existsSync(path.join(dir, `src/routes/${page}.tsx`)))
@@ -181,7 +181,7 @@ function checkLegal(dir, isTemplate) {
     return [...problems, `Missing ${LEGAL_FILE} (SUPPORT_EMAIL)`];
   if (isTemplate) return problems;
   const email = fs.readFileSync(path.join(dir, LEGAL_FILE), 'utf8').match(/SUPPORT_EMAIL = '([^']*)'/)?.[1];
-  if (!email || email.endsWith('example.com'))
+  if (!isExample && (!email || email.endsWith('example.com')))
     problems.push(`${LEGAL_FILE} SUPPORT_EMAIL is still a placeholder`);
   // Every shipped locale counts, so a site whose base locale is not English is checked too; zh is the dev-only review copy.
   for (const block of ['legal', 'common']) {
@@ -194,6 +194,11 @@ function checkLegal(dir, isTemplate) {
     }
   }
   return problems;
+}
+
+function readPackage(dir) {
+  const file = path.join(dir, 'package.json');
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null;
 }
 
 /** A relative import that resolves outside the site directory: shared code comes from packages by name, never by path. */
@@ -209,6 +214,9 @@ function escapesSite(dir, file, source) {
 export function checkSite(dir) {
   const problems = [];
   const isTemplate = path.resolve(dir).split(path.sep).includes('templates');
+  // A published example site ("example": true in package.json) keeps placeholder domain and emails on purpose; a fork removes the
+  // flag before launch, and these checks block it again until the placeholders are replaced.
+  const isExample = readPackage(dir)?.example === true;
   for (const file of isTemplate ? REQUIRED_FILES.filter((f) => !f.endsWith('.md')) : REQUIRED_FILES) {
     if (!fs.existsSync(path.join(dir, file))) problems.push(`Missing ${file}`);
   }
@@ -220,7 +228,7 @@ export function checkSite(dir) {
     if (/^name: "?ai-site"?$/m.test(compose) || compose.includes('templates/ai-site'))
       problems.push('compose.yaml still names the template');
   }
-  if (!isTemplate && fs.existsSync(path.join(dir, '.env.example'))) {
+  if (!isTemplate && !isExample && fs.existsSync(path.join(dir, '.env.example'))) {
     // new-site without --domain writes noreply@<dir>.example.com.
     if (
       /^EMAIL_FROM=.*@(?:[a-z0-9-]+.)*example.coms*$/im.test(
@@ -229,12 +237,12 @@ export function checkSite(dir) {
     )
       problems.push('.env.example still sends from an example.com address');
   }
-  if (!isTemplate && fs.existsSync(path.join(dir, 'site.config.ts'))) {
+  if (!isTemplate && !isExample && fs.existsSync(path.join(dir, 'site.config.ts'))) {
     if (fs.readFileSync(path.join(dir, 'site.config.ts'), 'utf8').includes('example.com')) {
       problems.push('site.config.ts url is still example.com');
     }
   }
-  problems.push(...checkLegal(dir, isTemplate), ...checkBuild(dir));
+  problems.push(...checkLegal(dir, isTemplate, isExample), ...checkBuild(dir));
   for (const file of fs.existsSync(path.join(dir, 'src')) ? walk(path.join(dir, 'src')) : []) {
     const source = fs.readFileSync(file, 'utf8');
     if (escapesSite(dir, file, source) || /@shipwords\/(site|template)-/.test(source)) {

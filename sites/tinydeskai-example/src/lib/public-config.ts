@@ -1,6 +1,6 @@
 import { createServerFn } from '@tanstack/react-start';
 
-// Public config the browser needs (reCAPTCHA site key, Google client ID). Values come from wrangler vars or .dev.vars, not the build.
+// Public config the browser needs (reCAPTCHA site key, Google client ID). Values come from the server's environment (.env), not baked into the build.
 export const getPublicConfig = createServerFn({ method: 'GET' }).handler(async () => {
   const { core } = await import('~/core.server');
   const env = core.env;

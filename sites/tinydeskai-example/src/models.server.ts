@@ -160,11 +160,15 @@ export default serverModels(catalog, {
     // up to 5 passes at 0.40 each (an 8 s wide shot costs about $0.24).
     // Once Kling has charged, credits are not refunded: if someone is still missed after the repairs, the version with the fewest misses is delivered and REVIEW_EMAIL gets a review alert.
     // Prep: two images per person (two-panel and face), five people cost $0.085, capped at $0.15; a slow one gets no hedge copy (prep.hedge: false),
-    // since two copies could look different. Caps add up to Kling 3.40 + repair 5×0.40 + prep 0.15 = 5.55.
+    // since two copies could look different. Describing each person through the Vercel AI Gateway with GPT 6.2 Sol costs about $0.006 per person.
+    // Caps add up to Kling 3.40 + repair 5×0.40 + prep 0.15 = 5.55.
     // The job cap of 5.60 stays below the net per video of the cheapest pack (10 for $59.99, about 5.80 after fees), so even a fully repaired job breaks even.
     maxCost: '5.60',
     // Usually about 8 minutes (6 to generate, 2 for the face check and compose); each repair round adds a few minutes, plus room for upstream queues.
     timeoutMinutes: 45,
+    // Order materials are kept: when a job starts, the engine copies the customer's photos to jobs/<id>/kept/uploads/ in storage (/files never serves it).
+    // uploads/ is still deleted after 2 days, so public links expire; the privacy policy says a private copy stays with the order until the customer asks to delete it.
+    keepUploads: true,
     effect: {
       slots: catalog
         .find((model) => model.id === 'tiny-desk')!
@@ -176,11 +180,22 @@ export default serverModels(catalog, {
         maxCost: '0.015',
         hedge: false,
       },
-      // Describe the two-panel image (view 0): it shows both face and clothes. The instruction says both panels are one individual, so the
-      // answer doesn't read 'a man shown twice' or 'a headless torso' inside the video prompt. Tested with Llama 4 Scout: it names the hairstyle, glasses, jersey colors and number.
+      // Describe the two-panel image (view 0): it shows both face and clothes. Uses GPT 6.2 Sol through the Vercel AI Gateway (compared on 2026-11-20):
+      // the old instruction asked for a team name, and Llama 4 Scout and Haiku made up school and team names from logos; this constrained instruction
+      // asks only for what is in the image, and Sol reads it accurately. About 4 s and $0.006 per image.
+      // Without AI_GATEWAY_API_KEY it falls back to Workers AI; on failure or an empty answer there is no description and the job runs on.
       describe: {
-        instruction:
-          'Describe the person or animal in this photo in one short phrase of at most 20 words. If the photo has two panels, both show the same single individual (a face close-up and their outfit from the neck down): describe that one individual, not the panels. For a person give their gender, approximate age, hair, facial hair, glasses and outfit with its colors, team name, logos and numbers; for an animal its species, breed and colors. No names and no guesses about who it is. Output only the phrase.',
+        model: 'openai/gpt-6.2-sol',
+        instruction: [
+          'Write one short phrase, at most 20 words, that tells this person or animal apart from other people in a band. It is pasted into a video prompt, so every word must be true of the image.',
+          'If the image has two panels, both show the same single individual (a face close-up and the outfit from the neck down): describe that one individual. Never mention panels, the background, the pose or a missing head.',
+          'For a person, in this order: gender; age as a decade such as "in his 30s" or "in her 30s"; hair colour, length and style (or bald); facial hair; glasses; then the main garments with their colours.',
+          'End with the one most distinctive detail, if any: a number or words printed on the clothing, a logo described by its shape and colour, or a standout accessory.',
+          'Copy printed numbers and words exactly, and only when they are clearly readable. Never add a team, school, brand or place name that is not printed in the image: do not infer one from a logo, symbol or colours.',
+          'Leave out anything you are not sure of; leaving a detail out is better than guessing it.',
+          'For an animal: species, breed only if obvious, and colours.',
+          'No names and no guesses about who it is. Output only the phrase, with no full stop.',
+        ].join(' '),
         view: 0,
       },
       segments: [
@@ -233,9 +248,12 @@ export default serverModels(catalog, {
               ['sax', 'keys'],
               ['keys', 'backLeft', 'backRight'],
             ],
-            // Also repair a lead close-up unlike the photo or more like someone else: in six jobs on 10-30/31 the lead scored 0.44–0.66 vs the prepped photo; 0.44 drew a "can't recognize him" complaint.
-            // The sax is a side view while playing (always 0.33–0.36) and faces in the wide shots are small, so those scores are unreliable and have no threshold.
-            likeness: { lead: 0.5 },
+            // Also repair a face unlike the photo, or clearly more like another customer in that seat (the engine takes the face by position; another
+            // photo must score 0.2 higher). Thresholds come from replaying 24 stored Kling outputs on 11-18: the right lead scores 0.44–0.74, a wrong
+            // person ≤0.21, and the old 0.5 would have repaired about a third needlessly. Keys in the wide shots: the right person 0.61–0.78, a wrong
+            // or unrecognizable one ≤0.29, 0.37 after a Pruna repair; only the two wide shots count, not the half face in the sax close-up's corner.
+            // No threshold for back left (the same person scores 0.15–0.53 across jobs), the sax profile (0.11–0.55, overlapping wrong people) or that corner.
+            likeness: { lead: 0.4, keys: { min: 0.35, shots: [0, 3] } },
             // Repair and the likeness check use the second prep image (front chest-up), not the two-panel image sent to Kling.
             photoView: 1,
           },

@@ -71,5 +71,5 @@ Then walk the human through the launch handbook below.
 
 - [GitHub](https://github.com/shipwords-dev/shipwords)
 - [Discussions](https://github.com/shipwords-dev/shipwords/discussions): search Q&A before asking; post setup questions in Q&A and launched sites in Show and tell
-- [Tiny Desk AI](https://tinydeskai.io/?utm_source=shipwords&utm_medium=llms): a live site built with shipwords; its source is in [sites/tinydeskai-example](https://github.com/shipwords-dev/shipwords/tree/main/sites/tinydeskai-example) (still on the Workers setup of release v0.2.0 until it is moved over)
+- [Tiny Desk AI](https://tinydeskai.io/?utm_source=shipwords&utm_medium=llms): a live site built with shipwords; its source is in [sites/tinydeskai-example](https://github.com/shipwords-dev/shipwords/tree/main/sites/tinydeskai-example), on the same Node + Postgres + Docker setup as every site
 - [Yir](https://yir.ai/?utm_source=shipwords&utm_medium=llms): default generation API, one key for GPT Image, Nano Banana, Seedream, FLUX, Seedance, Veo, Kling, Wan and more
