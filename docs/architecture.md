@@ -13,9 +13,10 @@ shipwords is a monorepo for running one AI tool site per keyword. All sites shar
 
 Until release `v0.2.0` every site was a Cloudflare Worker with D1, Workflows and Containers; since 2026-11-22 it is a Node process and Postgres ([migrating a site](migrating-from-workers.md)). Why:
 
-- **Money code.** D1 has no interactive transactions, only atomic batches, so the ledger needed a version lock and a deliberate CHECK violation to roll a batch back. Postgres transactions and row locks say the same thing directly.
-- **No Durable Objects.** Anything stateful on Workers is one. The compose container was, and its `sleepAfter` never guaranteed a stop: 984 idle instance-hours before anyone noticed. A long-running process on a fixed-price machine has no such failure mode, and a machine has a price cap where usage-billed products don't.
-- **Debuggable.** The whole stack, ffmpeg included, runs locally and logs to stdout.
+- **Video sites need ffmpeg, and Workers can't run it.** A Worker can't start a native program, and ffmpeg compiled to WebAssembly doesn't fit a video job into 128 MB of memory and the CPU time limit. So stitching and output checks ran in Cloudflare Containers.
+- **Containers can run up a bill quietly.** A container is a Durable Object, and its `sleepAfter` is not a stop guarantee (the upstream issues [cloudflare/containers#242](https://github.com/cloudflare/containers/issues/242) and [#264](https://github.com/cloudflare/containers/issues/264) are still open). On one live site, idle instances ran about 984 instance-hours before anyone noticed; left for a month, that is a bill of a few hundred dollars.
+- **Workers saves ops, not money.** It is a good fit for light sites. A media site pays per use for Containers, Workflows and D1, while a fixed-price server has a price cap. AI coding agents now do most of the server work (deploys, backups, firewall rules), so the ops Workers saves no longer outweighs what it costs.
+- **D1 gets hard as a site grows.** It has atomic batches but no interactive transactions, and one writer per database: the credit ledger needed a version lock and a deliberate CHECK violation to roll a batch back. Postgres transactions and row locks say the same thing directly.
 
 There is one runtime, not two: the Workers code paths were deleted, not kept behind an adapter. Porting to another platform starts from the seams that remain: the step runner (§6.1), `ObjectStore`, the mailer and the describe and compose dependencies.
 
