@@ -46,6 +46,26 @@ def faces(image):
     return result
 
 
+def read_frames(path, indices):
+    """{index: image} for the given frame indices, decoded in order from the start.
+    Never seeks: model outputs can have a keyframe or two in a whole clip (Kling: frames 0 and 330 of 433), and OpenCV's frame seek on
+    them returns the same wrong frame for every index in between, so a check would never see the shot it is looking at."""
+    wanted = set(indices)
+    result = {}
+    if not wanted:
+        return result
+    capture = cv2.VideoCapture(path)
+    last = max(wanted)
+    index = 0
+    while index <= last and capture.grab():
+        if index in wanted:
+            ok, image = capture.retrieve()
+            if ok:
+                result[index] = image
+        index += 1
+    return result
+
+
 def frames(path, seconds, count):
     """(image, seconds) for count frames spread over the first `seconds` of the video."""
     capture = cv2.VideoCapture(path)
@@ -53,14 +73,9 @@ def frames(path, seconds, count):
     fps = capture.get(cv2.CAP_PROP_FPS)
     if fps > 0:
         end = min(end, int(seconds * fps))
-    result = []
-    for i in range(count):
-        index = int(end * (i + 0.5) / count)
-        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, image = capture.read()
-        if ok:
-            result.append((image, index / fps if fps > 0 else 0.0))
-    return result
+    indices = [int(end * (i + 0.5) / count) for i in range(count)]
+    images = read_frames(path, indices)
+    return [(images[index], index / fps if fps > 0 else 0.0) for index in indices if index in images]
 
 
 def original_frame(path, seconds):
@@ -86,21 +101,8 @@ def likeness(output, people):
     capture = cv2.VideoCapture(output)
     fps = capture.get(cv2.CAP_PROP_FPS) or 24
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    found = {}
-
-    def faces_at(index):
-        if index not in found:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, image = capture.read()
-            found[index] = faces(image) if ok else None
-        return found[index]
-
-    scores = []
+    plans = []
     for person in people:
-        image = cv2.imread(person['photo'])
-        # A prep photo shows one person filling the frame: its first face is them.
-        in_photo = faces(image) if image is not None else []
-        target = in_photo[0][2] if in_photo else None
         spots = person.get('spots')
         frames = []
         for i, (start, end) in enumerate(person['ranges']):
@@ -110,6 +112,21 @@ def likeness(output, people):
             count = max(1, 8 // len(person['ranges']), round((end - start) * SAMPLES_PER_SECOND))
             if last > first:
                 frames += [(first + int((last - first) * (k + 0.5) / count), spots[i] if spots else None) for k in range(count)]
+        plans.append(frames)
+    images = read_frames(output, [index for frames in plans for index, _ in frames])
+    found = {}
+
+    def faces_at(index):
+        if index not in found:
+            found[index] = faces(images[index]) if index in images else None
+        return found[index]
+
+    scores = []
+    for person, frames in zip(people, plans):
+        image = cv2.imread(person['photo'])
+        # A prep photo shows one person filling the frame: its first face is them.
+        in_photo = faces(image) if image is not None else []
+        target = in_photo[0][2] if in_photo else None
         best = []
         for index, spot in frames:
             seen = faces_at(index)

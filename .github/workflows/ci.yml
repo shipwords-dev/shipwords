@@ -67,3 +67,6 @@ jobs:
       - run: docker build -f templates/ai-site/Dockerfile -t shipwords-site .
 
       - run: docker build -t shipwords-compose packages/jobs/compose
+
+      # The swap and likeness checks must read the frames they ask for on model outputs with sparse keyframes (faces_test.py).
+      - run: docker run --rm -v "$PWD/packages/jobs/compose:/t" --entrypoint python3 shipwords-compose /t/faces_test.py
