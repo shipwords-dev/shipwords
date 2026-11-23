@@ -26,9 +26,21 @@ export async function freshDatabase(): Promise<{ db: Db; close: () => Promise<vo
   return {
     db: db as unknown as Db,
     async close() {
+      // pool.end() only starts closing its connections. Dropping the database "with (force)" while one is still open makes the
+      // server send that client FATAL 57P01, which surfaces as an unhandled error and fails the run (it did, every time, in CI).
+      // So wait until the server has no session on it left, and keep force only for one that never goes away.
       await pool.end();
       const cleanup = new Client({ connectionString: adminUrl });
       await cleanup.connect();
+      const until = Date.now() + 5_000;
+      for (;;) {
+        const { rows } = await cleanup.query(
+          'select count(*)::int as n from pg_stat_activity where datname = $1',
+          [name],
+        );
+        if (rows[0].n === 0 || Date.now() > until) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       await cleanup.query(`drop database if exists ${name} with (force)`);
       await cleanup.end();
     },
