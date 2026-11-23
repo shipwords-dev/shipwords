@@ -18,6 +18,8 @@
 
 shipwords 是一套免费、MIT 开源的新词站群框架，基于 Node、Postgres 和 Docker，用来同时运营很多个 AI 图像和视频站，一个新词一个站。不变的共享：账户、支付、积分和 AI 生成只写一次，所有站共用。变的独立：每个站有自己的页面、外观和域名。官网：[shipwords.dev](https://shipwords.dev/zh/)。
 
+> **还在用 `v0.2.0` 或更早的版本（Cloudflare Workers）？** 2026-11-22 起 `main` 改为跑在 Node、Postgres 和 Docker 上，Workers 运行时已经删除。这是不兼容更新，不能原地升级。`v0.2.0` 标签保留，照旧能用，但不再修 bug。已经有用户的站按[迁移手册](docs/migrating-from-workers.md)搬过来，用户、积分、订单和文件都能带上；还没有用户的站，直接用现在的模板重建更快。为什么换：[架构 §1](docs/architecture.md#1-goals)（英文）。
+
 ## 为什么用 shipwords
 
 **为新词站群而生。** 每个新词上一个站，起量的继续迭代，没起来的放着不管。公共核心有 bug，修一处，所有站下次部署就能更新。每个站单独部署，有自己的数据库、文件存储和收款账户，上线或下线一个站都不影响其他站。

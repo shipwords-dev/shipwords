@@ -18,6 +18,8 @@
 
 shipwords is a free, MIT-licensed framework for running a fleet of new-keyword AI image and video sites on Node, Postgres and Docker, one site per keyword. What stays the same is shared: accounts, payments, credits and AI generation are written once. What changes is each site's own: pages, look and domain. Website: [shipwords.dev](https://shipwords.dev/).
 
+> **Coming from `v0.2.0` or earlier (Cloudflare Workers)?** Since 2026-11-22 `main` runs on Node, Postgres and Docker, and the Workers runtime is gone. This is a breaking change with no in-place upgrade. `v0.2.0` stays tagged and keeps working as it is, but it gets no more fixes. A site with users moves over with the [migration guide](docs/migrating-from-workers.md), which carries over users, credits, orders and files. A site without users is quicker to recreate from the current template. Why we moved: [architecture §1](docs/architecture.md#1-goals).
+
 ## Why shipwords
 
 **Built for a fleet of new-keyword sites.** Put up a site for every new keyword, keep improving the ones that take off, and leave the rest alone. Fix a bug in the shared core once, and every site can take the update on its next deploy. Each site deploys on its own, with its own database, storage and payment account, so launching or retiring one never touches the others.

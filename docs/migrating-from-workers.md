@@ -4,6 +4,14 @@ For a site built on shipwords v0.2.0 or earlier, which runs as a Cloudflare Work
 
 Steps marked **(confirm)** touch production, create credentials or cost money; an AI agent must get explicit confirmation before running them. Read the [site launch handbook](site-launch.md) first: this page only covers what is different for a site that already has users, orders and files.
 
+## Which path
+
+- **Staying on Workers for now.** Pin your copy to the `v0.2.0` tag (`git checkout v0.2.0` in a submodule, or keep your fork's branch there) and don't pull `main`: everything after `v0.2.0` assumes the new runtime. `v0.2.0` keeps working as it is but gets no fixes, so plan the move.
+- **A site with no users or orders yet.** Recreating it is quicker than migrating it: `pnpm new-site` on the current template, then copy over your pages and components, `DESIGN.md`, `messages/`, `site.config.ts`, `site.models.ts` and `src/models.server.ts`, and follow the [site launch handbook](site-launch.md). Your own tables, if any, need the schema change in section 2, step 6.
+- **A site with users, credits, orders or files.** The rest of this page. Plan a rehearsal (section 4) and a few minutes of downtime (section 5).
+
+If something here doesn't fit your setup, ask in [GitHub Discussions](https://github.com/shipwords-dev/shipwords/discussions/categories/q-a).
+
 ## What changes and what stays
 
 | Part                  | Workers (v0.2.0)                     | Now                                                                    |
