@@ -56,6 +56,35 @@ def main():
             index = round(at * 24)
             assert numpy.array_equal(image, truth[index]), f'frames() at {at:.2f}s is not frame {index}'
             assert at < 18
+
+        # keep runs on each decoded frame; only its result is held.
+        shapes = faces.read_frames(path, [5, 200], keep=lambda image: image.shape)
+        assert shapes == {5: truth[5].shape, 200: truth[200].shape}, shapes
+
+        # Indices past the end are left out, not filled with another frame.
+        assert sorted(faces.read_frames(path, [10, 431, 432, 5000])) == [10, 431], 'past-the-end indices'
+
+        # A decode that stops halfway (a broken frame) still reads the indices after it, by seeking, instead of dropping them.
+        real = cv2.VideoCapture
+
+        class Broken:
+            def __init__(self, *args):
+                self.capture, self.grabs = real(*args), 0
+
+            def grab(self):
+                self.grabs += 1
+                return False if self.grabs == 101 else self.capture.grab()
+
+            def __getattr__(self, name):
+                return getattr(self.capture, name)
+
+        faces.cv2.VideoCapture = Broken
+        try:
+            after = faces.read_frames(path, [20, 150, 400])
+        finally:
+            faces.cv2.VideoCapture = real
+        assert sorted(after) == [20, 150, 400], sorted(after)
+        assert numpy.array_equal(after[20], truth[20])
     print('faces_test: ok')
 
 

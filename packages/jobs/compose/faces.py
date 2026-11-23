@@ -46,10 +46,12 @@ def faces(image):
     return result
 
 
-def read_frames(path, indices):
-    """{index: image} for the given frame indices, decoded in order from the start.
-    Never seeks: model outputs can have a keyframe or two in a whole clip (Kling: frames 0 and 330 of 433), and OpenCV's frame seek on
-    them returns the same wrong frame for every index in between, so a check would never see the shot it is looking at."""
+def read_frames(path, indices, keep=lambda image: image):
+    """{index: keep(image)} for the given frame indices, decoded in order from the start.
+    Doesn't seek: model outputs can have a keyframe or two in a whole clip (Kling: frames 0 and 330 of 433), and OpenCV's frame seek on
+    them returns the same wrong frame for every index in between, so a check would never see the shot it is looking at.
+    keep runs as each frame is decoded (pass faces to hold features, not whole frames). If decoding stops before the last index (a broken
+    frame, not the end), the indices left are read by seeking, as before, rather than dropped: a check must not pass on frames it never saw."""
     wanted = set(indices)
     result = {}
     if not wanted:
@@ -61,21 +63,26 @@ def read_frames(path, indices):
         if index in wanted:
             ok, image = capture.retrieve()
             if ok:
-                result[index] = image
+                result[index] = keep(image)
         index += 1
+    for left in sorted(i for i in wanted if i >= index):
+        capture.set(cv2.CAP_PROP_POS_FRAMES, left)
+        ok, image = capture.read()
+        if ok:
+            result[left] = keep(image)
     return result
 
 
-def frames(path, seconds, count):
-    """(image, seconds) for count frames spread over the first `seconds` of the video."""
+def frames(path, seconds, count, keep=lambda image: image):
+    """(keep(image), seconds) for count frames spread over the first `seconds` of the video."""
     capture = cv2.VideoCapture(path)
     end = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = capture.get(cv2.CAP_PROP_FPS)
     if fps > 0:
         end = min(end, int(seconds * fps))
     indices = [int(end * (i + 0.5) / count) for i in range(count)]
-    images = read_frames(path, indices)
-    return [(images[index], index / fps if fps > 0 else 0.0) for index in indices if index in images]
+    read = read_frames(path, indices, keep)
+    return [(read[index], index / fps if fps > 0 else 0.0) for index in indices if index in read]
 
 
 def original_frame(path, seconds):
@@ -113,13 +120,11 @@ def likeness(output, people):
             if last > first:
                 frames += [(first + int((last - first) * (k + 0.5) / count), spots[i] if spots else None) for k in range(count)]
         plans.append(frames)
-    images = read_frames(output, [index for frames in plans for index, _ in frames])
-    found = {}
+    # Faces are found as each frame is decoded and only their features kept: no frame is held for later.
+    found = read_frames(output, [index for frames in plans for index, _ in frames], faces)
 
     def faces_at(index):
-        if index not in found:
-            found[index] = faces(images[index]) if index in images else None
-        return found[index]
+        return found.get(index)
 
     scores = []
     for person, frames in zip(people, plans):
@@ -160,10 +165,10 @@ def main():
         nearest = min(originals, key=lambda f: (f[0] - x) ** 2 + (f[1] - y) ** 2, default=None)
         # Only trust a face that is actually near the configured point.
         targets.append(nearest[2] if nearest and (nearest[0] - x) ** 2 + (nearest[1] - y) ** 2 < 0.15 ** 2 else None)
-    sampled = frames(output, seconds, max(SAMPLES, round(seconds * SAMPLES_PER_SECOND)))
+    sampled = frames(output, seconds, max(SAMPLES, round(seconds * SAMPLES_PER_SECOND)), faces)
     if not sampled:
         raise SystemExit('cannot read the output')
-    found = [(at, face[2]) for image, at in sampled for face in faces(image)]
+    found = [(at, face[2]) for seen, at in sampled for face in seen]
     scores = []
     for i, target in enumerate(targets):
         if target is None:
